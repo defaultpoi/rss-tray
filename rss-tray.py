@@ -19,7 +19,8 @@ import time as time_module
 CONFIG_DIR = os.path.expanduser('~/.config/rss-tray')
 FEEDS_FILE = os.path.join(CONFIG_DIR, 'feeds.conf')
 STATE_FILE = os.path.join(CONFIG_DIR, 'state.json')
-CHECK_INTERVAL = 600  # 10 minutes
+CHECK_INTERVAL = 600  # default per-feed interval (seconds) when none is set in feeds.conf
+SCHEDULER_TICK_SECONDS = 60  # how often we check whether any feed is due
 MAX_LIST_ITEMS = 40
 MAX_TITLE_LEN = 60
 MAX_ITEM_AGE_SECONDS = 24 * 3600  # ignore entries older than this on first sight
@@ -32,17 +33,19 @@ def ensure_config():
     if not os.path.exists(FEEDS_FILE):
         with open(FEEDS_FILE, 'w') as f:
             f.write(
-                "# Format: URL|custom display name (optional)|pkgfeed flag (optional)\n"
-                "# Add 'pkgfeed' in the third field to enable Void package-update\n"
-                "# detection for that feed's entries.\n"
+                "# Format: URL|custom display name (optional)|check interval in minutes (optional)|pkgfeed flag (optional)\n"
+                "# All fields after the URL are optional but positional — leave a field empty\n"
+                "# to skip it while still setting a later one, e.g. URL||5|pkgfeed\n"
+                "# The interval overrides the default 10-minute check for that feed only.\n"
                 "# https://example.com/feed.xml\n"
                 "# https://example.com/feed.xml|My Blog\n"
-                "# https://github.com/void-linux/void-packages/commits/master.atom|void-package|pkgfeed\n"
+                "# https://example.com/feed.xml|My Blog|5\n"
+                "# https://github.com/void-linux/void-packages/commits/master.atom|void-package|30|pkgfeed\n"
             )
 
 
 def load_feeds():
-    """Returns list of (url, is_pkgfeed, custom_name)."""
+    """Returns list of (url, is_pkgfeed, custom_name, interval_seconds)."""
     feeds = []
     if os.path.exists(FEEDS_FILE):
         with open(FEEDS_FILE) as f:
@@ -53,8 +56,14 @@ def load_feeds():
                 parts = [p.strip() for p in line.split('|')]
                 url = parts[0]
                 custom_name = parts[1] if len(parts) > 1 and parts[1] else None
-                is_pkgfeed = len(parts) > 2 and parts[2].lower() == 'pkgfeed'
-                feeds.append((url, is_pkgfeed, custom_name))
+                interval_seconds = CHECK_INTERVAL
+                if len(parts) > 2 and parts[2]:
+                    try:
+                        interval_seconds = max(1, int(parts[2])) * 60
+                    except ValueError:
+                        pass
+                is_pkgfeed = len(parts) > 3 and parts[3].lower() == 'pkgfeed'
+                feeds.append((url, is_pkgfeed, custom_name, interval_seconds))
     return feeds
 
 
@@ -159,7 +168,7 @@ class RssTray:
         self.update_icon()
 
         GLib.timeout_add_seconds(1, self.initial_check)
-        GLib.timeout_add_seconds(CHECK_INTERVAL, self.periodic_check)
+        GLib.timeout_add_seconds(SCHEDULER_TICK_SECONDS, self.periodic_check)
         GLib.timeout_add(800, self.maybe_auto_show_startup)
 
     def maybe_auto_show_startup(self):
@@ -168,26 +177,34 @@ class RssTray:
         return False
 
     def initial_check(self):
-        self.start_check_thread()
+        self.start_check_thread(force=True)
         return False
 
     def periodic_check(self):
         self.start_check_thread()
         return True
 
-    def start_check_thread(self):
-        threading.Thread(target=self.check_feeds, daemon=True).start()
+    def start_check_thread(self, force=False):
+        threading.Thread(target=self.check_feeds, args=(force,), daemon=True).start()
 
-    def check_feeds(self):
+    def check_feeds(self, force=False):
         feeds = load_feeds()
         new_items = []
+        now = time_module.time()
         with self.lock:
             seen = set(self.state.get('seen', []))
-        for url, is_pkgfeed, _custom_name in feeds:
+            last_checked = dict(self.state.get('last_checked', {}))
+        due_urls = []
+        for url, is_pkgfeed, _custom_name, interval_seconds in feeds:
+            last = last_checked.get(url, 0)
+            if force or (now - last) >= interval_seconds:
+                due_urls.append((url, is_pkgfeed))
+        for url, is_pkgfeed in due_urls:
             try:
                 parsed = feedparser.parse(url)
             except Exception:
                 continue
+            last_checked[url] = now
             for entry in parsed.entries:
                 eid = entry_id(entry)
                 if eid in seen:
@@ -207,6 +224,7 @@ class RssTray:
                 })
         with self.lock:
             self.state['seen'] = list(seen)
+            self.state['last_checked'] = last_checked
             if new_items:
                 self.state['unread'] = new_items + self.state.get('unread', [])
             save_state(self.state)
@@ -263,7 +281,7 @@ class RssTray:
         return Gdk.pixbuf_get_from_surface(surface, 0, 0, size, size)
 
     def feed_name_for(self, url):
-        for feed_url, _is_pkgfeed, custom_name in load_feeds():
+        for feed_url, _is_pkgfeed, custom_name, _interval in load_feeds():
             if feed_url == url:
                 return custom_name or feed_url
         return url
@@ -317,7 +335,7 @@ class RssTray:
         edit_btn.connect('clicked', lambda *_a: edit_feeds_file())
         footer.pack_start(edit_btn, True, True, 0)
         refresh_btn = Gtk.Button(label='Refresh')
-        refresh_btn.connect('clicked', lambda *_a: self.start_check_thread())
+        refresh_btn.connect('clicked', lambda *_a: self.start_check_thread(force=True))
         footer.pack_start(refresh_btn, True, True, 0)
         mark_all_btn = Gtk.Button(label='Mark all read')
         mark_all_btn.connect('clicked', self.on_mark_all_read)
