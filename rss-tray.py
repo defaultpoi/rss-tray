@@ -388,8 +388,21 @@ class RssTray:
             if self.popup:
                 self.popup.hide()
         else:
-            for entry in unread[:MAX_LIST_ITEMS]:
-                self.listbox.add(self.build_row(entry))
+            shown = unread[:MAX_LIST_ITEMS]
+            groups = {}
+            order = []
+            for entry in shown:
+                feed_name = self.feed_name_for(entry.get('feed_url', ''))
+                if feed_name not in groups:
+                    groups[feed_name] = []
+                    order.append(feed_name)
+                groups[feed_name].append(entry)
+
+            for feed_name in order:
+                self.listbox.add(self.build_header_row(feed_name))
+                for entry in groups[feed_name]:
+                    self.listbox.add(self.build_row(entry))
+
             if len(unread) > MAX_LIST_ITEMS:
                 row = Gtk.ListBoxRow()
                 row.set_selectable(False)
@@ -398,6 +411,19 @@ class RssTray:
                 row.add(lbl)
                 self.listbox.add(row)
         self.listbox.show_all()
+
+    def build_header_row(self, feed_name):
+        row = Gtk.ListBoxRow()
+        row.set_selectable(False)
+        row.set_activatable(False)
+        label = Gtk.Label()
+        label.set_markup(f'<small><b>{GLib.markup_escape_text(feed_name)}</b></small>')
+        label.set_xalign(0)
+        label.set_margin_start(3)
+        label.set_margin_top(4)
+        label.set_margin_bottom(1)
+        row.add(label)
+        return row
 
     def build_row(self, entry):
         row = Gtk.ListBoxRow()
@@ -423,16 +449,12 @@ class RssTray:
         mark_btn.connect('clicked', self.on_mark_read_clicked, entry['id'])
         box.pack_start(mark_btn, False, False, 0)
 
-        feed_name = self.feed_name_for(entry.get('feed_url', ''))
         full_title = entry['title']
         truncated = len(full_title) > MAX_TITLE_LEN
         title = full_title[:MAX_TITLE_LEN - 1] + '…' if truncated else full_title
-        text = GLib.markup_escape_text(f"[{feed_name}] {title}")
+        text = GLib.markup_escape_text(title)
         label = Gtk.Label()
-        if row.pkg_match:
-            label.set_markup(f"<b>{text}</b>")
-        else:
-            label.set_markup(text)
+        label.set_markup(f'<span foreground="#000000"><b>{text}</b></span>')
         label.set_xalign(0)
         label.set_ellipsize(Pango.EllipsizeMode.END)
         label.set_hexpand(True)
