@@ -416,13 +416,29 @@ class RssTray:
         row = Gtk.ListBoxRow()
         row.set_selectable(False)
         row.set_activatable(False)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        box.set_margin_start(4)
+        box.set_margin_end(4)
+        box.set_margin_top(5)
+        box.set_margin_bottom(3)
+
+        left_sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        left_sep.set_hexpand(True)
+        left_sep.set_valign(Gtk.Align.CENTER)
+        box.pack_start(left_sep, True, True, 0)
+
         label = Gtk.Label()
-        label.set_markup(f'<small><b>{GLib.markup_escape_text(feed_name)}</b></small>')
-        label.set_xalign(0)
-        label.set_margin_start(3)
-        label.set_margin_top(4)
-        label.set_margin_bottom(1)
-        row.add(label)
+        label.set_markup(f'<span size="larger" weight="bold">{GLib.markup_escape_text(feed_name)}</span>')
+        label.set_xalign(0.5)
+        box.pack_start(label, False, False, 0)
+
+        right_sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        right_sep.set_hexpand(True)
+        right_sep.set_valign(Gtk.Align.CENTER)
+        box.pack_start(right_sep, True, True, 0)
+
+        row.add(box)
         return row
 
     def build_row(self, entry):
