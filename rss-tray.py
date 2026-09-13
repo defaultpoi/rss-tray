@@ -9,12 +9,15 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import threading
 import webbrowser
 import hashlib
 import calendar
 import time as time_module
+
+socket.setdefaulttimeout(15)  # avoid feed fetches hanging indefinitely on slow/broken servers
 
 CONFIG_DIR = os.path.expanduser('~/.config/rss-tray')
 FEEDS_FILE = os.path.join(CONFIG_DIR, 'feeds.conf')
@@ -157,6 +160,7 @@ class RssTray:
         ensure_config()
         self.state = load_state()
         self.lock = threading.Lock()
+        self._check_lock = threading.Lock()  # prevents overlapping check_feeds runs
         self.popup = None
         self.listbox = None
 
@@ -185,7 +189,15 @@ class RssTray:
         return True
 
     def start_check_thread(self, force=False):
-        threading.Thread(target=self.check_feeds, args=(force,), daemon=True).start()
+        if not self._check_lock.acquire(blocking=False):
+            return  # a check is already in flight — skip this tick rather than overlap
+        threading.Thread(target=self._check_feeds_guarded, args=(force,), daemon=True).start()
+
+    def _check_feeds_guarded(self, force):
+        try:
+            self.check_feeds(force)
+        finally:
+            self._check_lock.release()
 
     def check_feeds(self, force=False):
         feeds = load_feeds()
@@ -223,10 +235,19 @@ class RssTray:
                     'pkg_match': pkg_match,
                 })
         with self.lock:
-            self.state['seen'] = list(seen)
-            self.state['last_checked'] = last_checked
+            # Merge rather than overwrite: another check could have run concurrently
+            # in a rare case (e.g. this run was force-started while a scheduled one
+            # was still finishing), so combine instead of clobbering.
+            merged_seen = set(self.state.get('seen', [])) | seen
+            merged_last_checked = dict(self.state.get('last_checked', {}))
+            merged_last_checked.update(last_checked)
+            self.state['seen'] = list(merged_seen)
+            self.state['last_checked'] = merged_last_checked
             if new_items:
-                self.state['unread'] = new_items + self.state.get('unread', [])
+                existing_ids = {e['id'] for e in self.state.get('unread', [])}
+                new_items = [e for e in new_items if e['id'] not in existing_ids]
+                if new_items:
+                    self.state['unread'] = new_items + self.state.get('unread', [])
             save_state(self.state)
         if new_items:
             GLib.idle_add(self.on_new_items)
@@ -280,7 +301,9 @@ class RssTray:
         surface.flush()
         return Gdk.pixbuf_get_from_surface(surface, 0, 0, size, size)
 
-    def feed_name_for(self, url):
+    def feed_name_for(self, url, feeds_map=None):
+        if feeds_map is not None:
+            return feeds_map.get(url, url)
         for feed_url, _is_pkgfeed, custom_name, _interval in load_feeds():
             if feed_url == url:
                 return custom_name or feed_url
@@ -394,6 +417,10 @@ class RssTray:
             self.listbox.remove(child)
         with self.lock:
             unread = list(self.state.get('unread', []))
+
+        # Load feeds.conf once for this refresh instead of once per row/header.
+        feeds_map = {url: (custom_name or url) for url, _is_pkgfeed, custom_name, _interval in load_feeds()}
+
         if not unread:
             row = Gtk.ListBoxRow()
             row.set_selectable(False)
@@ -410,16 +437,17 @@ class RssTray:
             groups = {}
             order = []
             for entry in shown:
-                feed_name = self.feed_name_for(entry.get('feed_url', ''))
-                if feed_name not in groups:
-                    groups[feed_name] = []
-                    order.append(feed_name)
-                groups[feed_name].append(entry)
+                feed_url = entry.get('feed_url', '')
+                if feed_url not in groups:
+                    groups[feed_url] = []
+                    order.append(feed_url)
+                groups[feed_url].append(entry)
 
-            for i, feed_name in enumerate(order):
-                self.listbox.add(self.build_header_row(feed_name, is_first=(i == 0)))
-                for entry in groups[feed_name]:
-                    self.listbox.add(self.build_row(entry))
+            for i, feed_url in enumerate(order):
+                feed_name = feeds_map.get(feed_url, feed_url)
+                self.listbox.add(self.build_header_row(feed_url, feed_name, is_first=(i == 0)))
+                for entry in groups[feed_url]:
+                    self.listbox.add(self.build_row(entry, feeds_map))
 
             if len(unread) > MAX_LIST_ITEMS:
                 row = Gtk.ListBoxRow()
@@ -430,11 +458,11 @@ class RssTray:
                 self.listbox.add(row)
         self.listbox.show_all()
 
-    def build_header_row(self, feed_name, is_first=False):
+    def build_header_row(self, feed_url, feed_name, is_first=False):
         row = Gtk.ListBoxRow()
         row.set_selectable(False)
         row.set_activatable(True)
-        row.header_feed_name = feed_name
+        row.header_feed_url = feed_url
         row.set_tooltip_text(f"Mark all '{feed_name}' items as read")
 
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
@@ -456,7 +484,7 @@ class RssTray:
         row.add(box)
         return row
 
-    def build_row(self, entry):
+    def build_row(self, entry, feeds_map=None):
         row = Gtk.ListBoxRow()
         row.entry_id = entry['id']
         row.link = entry['link']
@@ -501,7 +529,6 @@ class RssTray:
             label.set_tooltip_text(tooltip_text)
 
         box.pack_start(label, True, True, 0)
-
         row.add(box)
         return row
 
@@ -510,26 +537,45 @@ class RssTray:
             self.state['unread'] = [e for e in self.state.get('unread', []) if e['id'] != item_id]
             save_state(self.state)
 
+    def _confirm_update(self, pkgname):
+        dialog = Gtk.MessageDialog(
+            transient_for=self.popup,
+            flags=0,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.YES_NO,
+            text=f"Update package '{pkgname}'?",
+        )
+        dialog.format_secondary_text(
+            "This will run xbps-install with elevated privileges. Continue?"
+        )
+        response = dialog.run()
+        dialog.destroy()
+        return response == Gtk.ResponseType.YES
+
     def on_row_activated(self, _listbox, row):
-        if hasattr(row, 'header_feed_name'):
-            self.mark_feed_read(row.header_feed_name)
+        if hasattr(row, 'header_feed_url'):
+            self.mark_feed_read(row.header_feed_url)
             return
         if not hasattr(row, 'entry_id'):
             return
         item_id, link, pkg_match = row.entry_id, row.link, row.pkg_match
-        self._remove_unread(item_id)
         if pkg_match:
+            if not self._confirm_update(pkg_match):
+                return
+            self._remove_unread(item_id)
             update_package(pkg_match)
-        elif link:
-            webbrowser.open(link)
+        else:
+            self._remove_unread(item_id)
+            if link:
+                webbrowser.open(link)
         self.update_icon()
         self.refresh_list()
 
-    def mark_feed_read(self, feed_name):
+    def mark_feed_read(self, feed_url):
         with self.lock:
             self.state['unread'] = [
                 e for e in self.state.get('unread', [])
-                if self.feed_name_for(e.get('feed_url', '')) != feed_name
+                if e.get('feed_url', '') != feed_url
             ]
             save_state(self.state)
         self.update_icon()
