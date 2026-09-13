@@ -391,19 +391,29 @@ class RssTray:
         box.pack_start(mark_btn, False, False, 0)
 
         feed_name = self.feed_name_for(entry.get('feed_url', ''))
-        title = entry['title']
-        if len(title) > MAX_TITLE_LEN:
-            title = title[:MAX_TITLE_LEN - 1] + '…'
+        full_title = entry['title']
+        truncated = len(full_title) > MAX_TITLE_LEN
+        title = full_title[:MAX_TITLE_LEN - 1] + '…' if truncated else full_title
         text = GLib.markup_escape_text(f"[{feed_name}] {title}")
         label = Gtk.Label()
         if row.pkg_match:
             label.set_markup(f"<b>{text}</b>")
-            row.set_tooltip_text(f"Matches installed package '{row.pkg_match}' — click to update")
         else:
             label.set_markup(text)
         label.set_xalign(0)
         label.set_ellipsize(Pango.EllipsizeMode.END)
         label.set_hexpand(True)
+
+        tooltip_parts = []
+        if row.pkg_match:
+            tooltip_parts.append(f"Matches installed package '{row.pkg_match}' — click to update")
+        if truncated:
+            tooltip_parts.append(full_title)
+        if tooltip_parts:
+            tooltip_text = "\n".join(tooltip_parts)
+            row.set_tooltip_text(tooltip_text)
+            label.set_tooltip_text(tooltip_text)
+
         box.pack_start(label, True, True, 0)
 
         row.add(box)
