@@ -39,8 +39,8 @@ PRIVILEGE_CMD = ['sudo']  # change to ['doas'] if that's what you use; requires 
 WINDOW_WIDTH = 456  # 380 * 1.2
 UPDATE_TIMEOUT_SECONDS = 300
 NOTIFICATION_SOUND_CANDIDATES = [
-    '/usr/share/sounds/alsa/Front_Center.wav',
-    '/usr/share/sounds/alsa/Front_Left.wav',
+    os.path.join(CONFIG_DIR, 'notification.wav'),  # QuiteRSS's notification sound, if present
+    '/usr/share/sounds/alsa/Front_Center.wav',      # fallback if the above is missing
 ]
 
 
