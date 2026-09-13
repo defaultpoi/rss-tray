@@ -272,8 +272,8 @@ class RssTray:
 
     def _apply_compact_css(self):
         css = b"""
-        list row { padding: 0px 2px; min-height: 0px; }
-        button { padding: 0px; }
+        list row { padding: 2px 4px; min-height: 0px; }
+        button { padding: 2px; }
         """
         provider = Gtk.CssProvider()
         provider.load_from_data(css)
@@ -405,11 +405,11 @@ class RssTray:
         row.link = entry['link']
         row.pkg_match = entry.get('pkg_match')
 
-        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
-        box.set_margin_start(3)
-        box.set_margin_end(3)
-        box.set_margin_top(0)
-        box.set_margin_bottom(0)
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        box.set_margin_start(4)
+        box.set_margin_end(4)
+        box.set_margin_top(1)
+        box.set_margin_bottom(1)
 
         if row.pkg_match:
             img = Gtk.Image.new_from_icon_name('software-update-available-symbolic', Gtk.IconSize.SMALL_TOOLBAR)
