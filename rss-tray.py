@@ -339,8 +339,8 @@ class RssTray:
 
         scroller = Gtk.ScrolledWindow()
         scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        scroller.set_max_content_height(420)
         scroller.set_propagate_natural_height(True)
+        self.scroller = scroller
         self.listbox = Gtk.ListBox()
         self.listbox.set_selection_mode(Gtk.SelectionMode.NONE)
         self.listbox.connect('row-activated', self.on_row_activated)
@@ -371,6 +371,18 @@ class RssTray:
         win.add(outer)
         self.popup = win
 
+    def _update_scroller_max_height(self):
+        try:
+            display = Gdk.Display.get_default()
+            monitor = display.get_primary_monitor() or display.get_monitor(0)
+            screen_height = monitor.get_geometry().height
+        except Exception:
+            screen_height = 1080  # reasonable fallback if monitor lookup fails
+        # Leave headroom for the footer buttons, panel, and window decorations;
+        # this comfortably fits well beyond 20 compact rows on typical displays.
+        max_height = int(screen_height * 0.75)
+        self.scroller.set_max_content_height(max_height)
+
     def on_popup_key(self, widget, event):
         if event.keyval == Gdk.KEY_Escape:
             widget.hide()
@@ -385,6 +397,7 @@ class RssTray:
     def show_popup(self):
         if self.popup is None:
             self.build_popup_window()
+        self._update_scroller_max_height()
         self.refresh_list()
         self.position_popup()
         self.popup.show_all()
