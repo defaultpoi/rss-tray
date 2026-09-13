@@ -136,6 +136,8 @@ class RssTray:
         self.popup = None
         self.listbox = None
 
+        self._apply_compact_css()
+
         self.status_icon = Gtk.StatusIcon()
         self.status_icon.connect('activate', self.toggle_popup)
         self.status_icon.connect('popup-menu', self.toggle_popup)
@@ -249,6 +251,19 @@ class RssTray:
         return url
 
     # --- popup window ---
+
+    def _apply_compact_css(self):
+        css = b"""
+        list row { padding: 0px 2px; min-height: 0px; }
+        button { padding: 0px; }
+        """
+        provider = Gtk.CssProvider()
+        provider.load_from_data(css)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(),
+            provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        )
 
     def build_popup_window(self):
         win = Gtk.Window(type=Gtk.WindowType.POPUP)
@@ -372,14 +387,14 @@ class RssTray:
         row.link = entry['link']
         row.pkg_match = entry.get('pkg_match')
 
-        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
-        box.set_margin_start(4)
-        box.set_margin_end(4)
-        box.set_margin_top(1)
-        box.set_margin_bottom(1)
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+        box.set_margin_start(3)
+        box.set_margin_end(3)
+        box.set_margin_top(0)
+        box.set_margin_bottom(0)
 
         if row.pkg_match:
-            img = Gtk.Image.new_from_icon_name('software-update-available-symbolic', Gtk.IconSize.MENU)
+            img = Gtk.Image.new_from_icon_name('software-update-available-symbolic', Gtk.IconSize.SMALL_TOOLBAR)
             box.pack_start(img, False, False, 0)
 
         mark_btn = Gtk.Button()
