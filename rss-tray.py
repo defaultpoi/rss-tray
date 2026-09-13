@@ -28,8 +28,11 @@ MAX_LIST_ITEMS = 40
 MAX_TITLE_LEN = 60
 MAX_ITEM_AGE_SECONDS = 24 * 3600  # ignore entries older than this on first sight
 SEEN_RETENTION_SECONDS = 30 * 24 * 3600  # prune seen-item records older than this
-PRIVILEGE_CMD = ['sudo']  # change to ['doas'] if that's what you use
+PRIVILEGE_CMD = ['sudo']  # change to ['doas'] if that's what you use; requires a
+                          # passwordless (NOPASSWD) rule for xbps-install, since
+                          # updates now run headlessly with no terminal/tty attached
 WINDOW_WIDTH = 456  # 380 * 1.2
+UPDATE_TIMEOUT_SECONDS = 300
 
 
 def ensure_config():
@@ -130,14 +133,17 @@ def find_installed_match(title):
     return None
 
 
-def update_package(pkgname):
-    cmd = PRIVILEGE_CMD + ['xbps-install', '-Su', pkgname]
-    if shutil.which('xfce4-terminal'):
-        subprocess.Popen(['xfce4-terminal', '--hold', '-x'] + cmd)
-    elif shutil.which('x-terminal-emulator'):
-        subprocess.Popen(['x-terminal-emulator', '-e'] + cmd)
-    else:
-        print(f"No terminal emulator found — run manually: {' '.join(cmd)}")
+def get_installed_version(pkgname):
+    try:
+        result = subprocess.run(
+            ['xbps-query', '-p', 'pkgver', pkgname],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            return result.stdout.strip() or None
+    except Exception:
+        pass
+    return None
 
 
 def edit_feeds_file():
@@ -239,8 +245,6 @@ class RssTray:
                     'pkg_match': pkg_match,
                 })
         with self.lock:
-            # Merge rather than overwrite: guards against the rare case of two
-            # check cycles running close together.
             merged_seen = dict(self.state.get('seen', {}))
             for eid in newly_seen_ids:
                 merged_seen.setdefault(eid, now)
@@ -339,7 +343,7 @@ class RssTray:
             monitor = display.get_primary_monitor() or display.get_monitor(0)
             screen_height = monitor.get_geometry().height
         except Exception:
-            screen_height = 1080  # reasonable fallback if monitor lookup fails
+            screen_height = 1080
         max_height = int(screen_height * 0.75)
         self.scroller.set_max_content_height(max_height)
 
@@ -538,7 +542,7 @@ class RssTray:
 
         tooltip_parts = []
         if row.pkg_match:
-            tooltip_parts.append(f"Matches installed package '{row.pkg_match}' — click to update")
+            tooltip_parts.append(f"Matches installed package '{row.pkg_match}' — click to check for an update")
         if truncated:
             tooltip_parts.append(full_title)
         if tooltip_parts:
@@ -561,14 +565,63 @@ class RssTray:
             flags=0,
             message_type=Gtk.MessageType.QUESTION,
             buttons=Gtk.ButtonsType.YES_NO,
-            text=f"Update package '{pkgname}'?",
+            text=f"Check for and install an update for '{pkgname}'?",
         )
         dialog.format_secondary_text(
-            "This will run xbps-install with elevated privileges. Continue?"
+            "This runs xbps-install with elevated privileges in the background. "
+            "The item will stay unread unless the package actually gets updated."
         )
         response = dialog.run()
         dialog.destroy()
         return response == Gtk.ResponseType.YES
+
+    def start_update(self, item_id, pkgname):
+        threading.Thread(target=self._run_update, args=(item_id, pkgname), daemon=True).start()
+
+    def _run_update(self, item_id, pkgname):
+        before = get_installed_version(pkgname)
+        cmd = PRIVILEGE_CMD + ['xbps-install', '-Su', pkgname]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=UPDATE_TIMEOUT_SECONDS)
+            output = (result.stdout or '') + (result.stderr or '')
+            returncode = result.returncode
+        except Exception as e:
+            output = str(e)
+            returncode = -1
+        after = get_installed_version(pkgname)
+        GLib.idle_add(self._on_update_finished, item_id, pkgname, before, after, returncode, output)
+
+    def _on_update_finished(self, item_id, pkgname, before, after, returncode, output):
+        updated = bool(before and after and before != after)
+        if updated:
+            self._remove_unread(item_id)
+            summary = f"Updated '{pkgname}': {before} → {after}"
+            msg_type = Gtk.MessageType.INFO
+        elif returncode != 0:
+            summary = f"Update check for '{pkgname}' failed (exit code {returncode})."
+            msg_type = Gtk.MessageType.WARNING
+        else:
+            summary = f"No newer build available yet for '{pkgname}' (still {before or 'unknown'})."
+            msg_type = Gtk.MessageType.WARNING
+
+        dialog = Gtk.MessageDialog(
+            transient_for=self.popup,
+            flags=0,
+            message_type=msg_type,
+            buttons=Gtk.ButtonsType.OK,
+            text=summary,
+        )
+        trimmed_output = output.strip()
+        if trimmed_output:
+            if len(trimmed_output) > 2000:
+                trimmed_output = trimmed_output[-2000:]
+            dialog.format_secondary_text(trimmed_output)
+        dialog.run()
+        dialog.destroy()
+
+        self.update_icon()
+        self.refresh_list()
+        return False
 
     def on_row_activated(self, _listbox, row):
         if hasattr(row, 'header_feed_url'):
@@ -580,14 +633,15 @@ class RssTray:
         if pkg_match:
             if not self._confirm_update(pkg_match):
                 return
-            self._remove_unread(item_id)
-            update_package(pkg_match)
+            self.start_update(item_id, pkg_match)
+            # Row stays unread until _on_update_finished confirms a real version
+            # change — no premature dismissal if the build hasn't landed yet.
         else:
             self._remove_unread(item_id)
             if link:
                 webbrowser.open(link)
-        self.update_icon()
-        self.refresh_list()
+            self.update_icon()
+            self.refresh_list()
 
     def mark_feed_read(self, feed_url):
         with self.lock:
