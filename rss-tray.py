@@ -417,26 +417,21 @@ class RssTray:
         row.set_selectable(False)
         row.set_activatable(False)
 
-        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         box.set_margin_start(4)
         box.set_margin_end(4)
-        box.set_margin_top(5)
-        box.set_margin_bottom(3)
-
-        left_sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
-        left_sep.set_hexpand(True)
-        left_sep.set_valign(Gtk.Align.CENTER)
-        box.pack_start(left_sep, True, True, 0)
+        box.set_margin_top(4)
+        box.set_margin_bottom(2)
 
         label = Gtk.Label()
         label.set_markup(f'<span size="larger" weight="bold">{GLib.markup_escape_text(feed_name)}</span>')
         label.set_xalign(0.5)
+        label.set_halign(Gtk.Align.CENTER)
         box.pack_start(label, False, False, 0)
 
-        right_sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
-        right_sep.set_hexpand(True)
-        right_sep.set_valign(Gtk.Align.CENTER)
-        box.pack_start(right_sep, True, True, 0)
+        sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        sep.set_hexpand(True)
+        box.pack_start(sep, False, False, 0)
 
         row.add(box)
         return row
