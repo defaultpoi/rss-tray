@@ -433,7 +433,9 @@ class RssTray:
     def build_header_row(self, feed_name, is_first=False):
         row = Gtk.ListBoxRow()
         row.set_selectable(False)
-        row.set_activatable(False)
+        row.set_activatable(True)
+        row.header_feed_name = feed_name
+        row.set_tooltip_text(f"Mark all '{feed_name}' items as read")
 
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         box.set_margin_start(4)
@@ -509,6 +511,9 @@ class RssTray:
             save_state(self.state)
 
     def on_row_activated(self, _listbox, row):
+        if hasattr(row, 'header_feed_name'):
+            self.mark_feed_read(row.header_feed_name)
+            return
         if not hasattr(row, 'entry_id'):
             return
         item_id, link, pkg_match = row.entry_id, row.link, row.pkg_match
@@ -517,6 +522,16 @@ class RssTray:
             update_package(pkg_match)
         elif link:
             webbrowser.open(link)
+        self.update_icon()
+        self.refresh_list()
+
+    def mark_feed_read(self, feed_name):
+        with self.lock:
+            self.state['unread'] = [
+                e for e in self.state.get('unread', [])
+                if self.feed_name_for(e.get('feed_url', '')) != feed_name
+            ]
+            save_state(self.state)
         self.update_icon()
         self.refresh_list()
 
