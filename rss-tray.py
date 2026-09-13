@@ -3,6 +3,11 @@
 import gi
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, GLib, Gdk, Pango
+try:
+    gi.require_version('Wnck', '3.0')
+    from gi.repository import Wnck
+except Exception:
+    Wnck = None  # fullscreen detection just no-ops if this isn't available
 import cairo
 import feedparser
 import json
@@ -33,6 +38,10 @@ PRIVILEGE_CMD = ['sudo']  # change to ['doas'] if that's what you use; requires 
                           # updates now run headlessly with no terminal/tty attached
 WINDOW_WIDTH = 456  # 380 * 1.2
 UPDATE_TIMEOUT_SECONDS = 300
+NOTIFICATION_SOUND_CANDIDATES = [
+    '/usr/share/sounds/alsa/Front_Center.wav',
+    '/usr/share/sounds/alsa/Front_Left.wav',
+]
 
 
 def ensure_config():
@@ -146,6 +155,37 @@ def get_installed_version(pkgname):
     return None
 
 
+def play_notification_sound():
+    """Best-effort: play one of the bundled ALSA test sounds using whichever
+    player is available. Silently does nothing if none are found."""
+    for path in NOTIFICATION_SOUND_CANDIDATES:
+        if not os.path.exists(path):
+            continue
+        for player in (['paplay'], ['aplay', '-q'],
+                       ['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet']):
+            if shutil.which(player[0]):
+                try:
+                    subprocess.Popen(player + [path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    return
+                except Exception:
+                    continue
+
+
+def is_fullscreen_active():
+    """Best-effort check for whether the currently focused window is fullscreen,
+    so the popup doesn't interrupt a video/game/presentation. Returns False
+    (never suppresses) if the Wnck library isn't available."""
+    if Wnck is None:
+        return False
+    try:
+        screen = Wnck.Screen.get_default()
+        screen.force_update()
+        active = screen.get_active_window()
+        return bool(active and active.is_fullscreen())
+    except Exception:
+        return False
+
+
 def edit_feeds_file():
     try:
         subprocess.Popen(['xdg-open', FEEDS_FILE])
@@ -185,7 +225,7 @@ class RssTray:
 
     def maybe_auto_show_startup(self):
         if self.unread_count() > 0:
-            self.show_popup()
+            self.show_popup(auto=True)
         return False
 
     def initial_check(self):
@@ -267,7 +307,8 @@ class RssTray:
 
     def on_new_items(self):
         self.update_icon()
-        self.show_popup()  # auto-open whenever new unread items arrive
+        play_notification_sound()
+        self.show_popup(auto=True)  # auto-open whenever new unread items arrive
         return False
 
     def unread_count(self):
@@ -405,7 +446,9 @@ class RssTray:
             return
         self.show_popup()
 
-    def show_popup(self):
+    def show_popup(self, auto=False):
+        if auto and is_fullscreen_active():
+            return  # don't interrupt a fullscreen video/game/presentation
         if self.popup is None:
             self.build_popup_window()
         self._update_scroller_max_height()
