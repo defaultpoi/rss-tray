@@ -13,6 +13,8 @@ import subprocess
 import threading
 import webbrowser
 import hashlib
+import calendar
+import time as time_module
 
 CONFIG_DIR = os.path.expanduser('~/.config/rss-tray')
 FEEDS_FILE = os.path.join(CONFIG_DIR, 'feeds.conf')
@@ -20,6 +22,7 @@ STATE_FILE = os.path.join(CONFIG_DIR, 'state.json')
 CHECK_INTERVAL = 600  # 10 minutes
 MAX_LIST_ITEMS = 40
 MAX_TITLE_LEN = 60
+MAX_ITEM_AGE_SECONDS = 24 * 3600  # ignore entries older than this on first sight
 PRIVILEGE_CMD = ['sudo']  # change to ['doas'] if that's what you use
 WINDOW_WIDTH = 456  # 380 * 1.2
 
@@ -75,6 +78,18 @@ def save_state(state):
 def entry_id(entry):
     raw = entry.get('id') or entry.get('link') or (entry.get('title', '') + entry.get('published', ''))
     return hashlib.sha1(raw.encode('utf-8', 'ignore')).hexdigest()
+
+
+def entry_age_seconds(entry):
+    """Returns seconds since publish/update time, or None if no date info available."""
+    parsed = entry.get('published_parsed') or entry.get('updated_parsed')
+    if not parsed:
+        return None
+    try:
+        entry_time = calendar.timegm(parsed)
+        return time_module.time() - entry_time
+    except Exception:
+        return None
 
 
 def extract_candidate_pkgnames(title):
@@ -178,6 +193,9 @@ class RssTray:
                 if eid in seen:
                     continue
                 seen.add(eid)
+                age = entry_age_seconds(entry)
+                if age is not None and age > MAX_ITEM_AGE_SECONDS:
+                    continue  # too old — mark as seen, don't surface as unread
                 title = entry.get('title', '(untitled)')
                 pkg_match = find_installed_match(title) if is_pkgfeed else None
                 new_items.append({
