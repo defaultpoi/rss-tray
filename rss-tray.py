@@ -27,6 +27,7 @@ SCHEDULER_TICK_SECONDS = 60  # how often we check whether any feed is due
 MAX_LIST_ITEMS = 40
 MAX_TITLE_LEN = 60
 MAX_ITEM_AGE_SECONDS = 24 * 3600  # ignore entries older than this on first sight
+SEEN_RETENTION_SECONDS = 30 * 24 * 3600  # prune seen-item records older than this
 PRIVILEGE_CMD = ['sudo']  # change to ['doas'] if that's what you use
 WINDOW_WIDTH = 456  # 380 * 1.2
 
@@ -77,7 +78,7 @@ def load_state():
                 return json.load(f)
         except (json.JSONDecodeError, OSError):
             pass
-    return {"seen": [], "unread": []}
+    return {"seen": {}, "unread": []}
 
 
 def save_state(state):
@@ -163,6 +164,7 @@ class RssTray:
         self._check_lock = threading.Lock()  # prevents overlapping check_feeds runs
         self.popup = None
         self.listbox = None
+        self.scroller = None
 
         self._apply_compact_css()
 
@@ -204,8 +206,9 @@ class RssTray:
         new_items = []
         now = time_module.time()
         with self.lock:
-            seen = set(self.state.get('seen', []))
+            seen_ids = set(self.state.get('seen', {}).keys())
             last_checked = dict(self.state.get('last_checked', {}))
+        newly_seen_ids = set()
         due_urls = []
         for url, is_pkgfeed, _custom_name, interval_seconds in feeds:
             last = last_checked.get(url, 0)
@@ -219,9 +222,10 @@ class RssTray:
             last_checked[url] = now
             for entry in parsed.entries:
                 eid = entry_id(entry)
-                if eid in seen:
+                if eid in seen_ids:
                     continue
-                seen.add(eid)
+                seen_ids.add(eid)
+                newly_seen_ids.add(eid)
                 age = entry_age_seconds(entry)
                 if age is not None and age > MAX_ITEM_AGE_SECONDS:
                     continue  # too old — mark as seen, don't surface as unread
@@ -235,13 +239,18 @@ class RssTray:
                     'pkg_match': pkg_match,
                 })
         with self.lock:
-            # Merge rather than overwrite: another check could have run concurrently
-            # in a rare case (e.g. this run was force-started while a scheduled one
-            # was still finishing), so combine instead of clobbering.
-            merged_seen = set(self.state.get('seen', [])) | seen
+            # Merge rather than overwrite: guards against the rare case of two
+            # check cycles running close together.
+            merged_seen = dict(self.state.get('seen', {}))
+            for eid in newly_seen_ids:
+                merged_seen.setdefault(eid, now)
+            cutoff = now - SEEN_RETENTION_SECONDS
+            merged_seen = {eid: ts for eid, ts in merged_seen.items() if ts >= cutoff}
+
             merged_last_checked = dict(self.state.get('last_checked', {}))
             merged_last_checked.update(last_checked)
-            self.state['seen'] = list(merged_seen)
+
+            self.state['seen'] = merged_seen
             self.state['last_checked'] = merged_last_checked
             if new_items:
                 existing_ids = {e['id'] for e in self.state.get('unread', [])}
@@ -324,6 +333,16 @@ class RssTray:
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
         )
 
+    def _update_scroller_max_height(self):
+        try:
+            display = Gdk.Display.get_default()
+            monitor = display.get_primary_monitor() or display.get_monitor(0)
+            screen_height = monitor.get_geometry().height
+        except Exception:
+            screen_height = 1080  # reasonable fallback if monitor lookup fails
+        max_height = int(screen_height * 0.75)
+        self.scroller.set_max_content_height(max_height)
+
     def build_popup_window(self):
         win = Gtk.Window(type=Gtk.WindowType.POPUP)
         win.set_decorated(False)
@@ -371,18 +390,6 @@ class RssTray:
         win.add(outer)
         self.popup = win
 
-    def _update_scroller_max_height(self):
-        try:
-            display = Gdk.Display.get_default()
-            monitor = display.get_primary_monitor() or display.get_monitor(0)
-            screen_height = monitor.get_geometry().height
-        except Exception:
-            screen_height = 1080  # reasonable fallback if monitor lookup fails
-        # Leave headroom for the footer buttons, panel, and window decorations;
-        # this comfortably fits well beyond 20 compact rows on typical displays.
-        max_height = int(screen_height * 0.75)
-        self.scroller.set_max_content_height(max_height)
-
     def on_popup_key(self, widget, event):
         if event.keyval == Gdk.KEY_Escape:
             widget.hide()
@@ -417,7 +424,6 @@ class RssTray:
             if screen_width and x + WINDOW_WIDTH > screen_width:
                 x = screen_width - WINDOW_WIDTH - 4
         if x is None:
-            # Fallback: top-right corner of the primary monitor
             display = Gdk.Display.get_default()
             monitor = display.get_primary_monitor() or display.get_monitor(0)
             geo = monitor.get_geometry()
@@ -431,7 +437,6 @@ class RssTray:
         with self.lock:
             unread = list(self.state.get('unread', []))
 
-        # Load feeds.conf once for this refresh instead of once per row/header.
         feeds_map = {url: (custom_name or url) for url, _is_pkgfeed, custom_name, _interval in load_feeds()}
 
         if not unread:
@@ -460,7 +465,7 @@ class RssTray:
                 feed_name = feeds_map.get(feed_url, feed_url)
                 self.listbox.add(self.build_header_row(feed_url, feed_name, is_first=(i == 0)))
                 for entry in groups[feed_url]:
-                    self.listbox.add(self.build_row(entry, feeds_map))
+                    self.listbox.add(self.build_row(entry))
 
             if len(unread) > MAX_LIST_ITEMS:
                 row = Gtk.ListBoxRow()
@@ -497,7 +502,7 @@ class RssTray:
         row.add(box)
         return row
 
-    def build_row(self, entry, feeds_map=None):
+    def build_row(self, entry):
         row = Gtk.ListBoxRow()
         row.entry_id = entry['id']
         row.link = entry['link']
