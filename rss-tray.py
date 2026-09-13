@@ -29,12 +29,12 @@ def ensure_config():
     if not os.path.exists(FEEDS_FILE):
         with open(FEEDS_FILE, 'w') as f:
             f.write(
-                "# Format: URL|pkgfeed flag (optional)|custom display name (optional)\n"
-                "# Add 'pkgfeed' in the second field to enable Void package-update\n"
+                "# Format: URL|custom display name (optional)|pkgfeed flag (optional)\n"
+                "# Add 'pkgfeed' in the third field to enable Void package-update\n"
                 "# detection for that feed's entries.\n"
                 "# https://example.com/feed.xml\n"
-                "# https://example.com/feed.xml||My Blog\n"
-                "# https://github.com/void-linux/void-packages/commits/master.atom|pkgfeed|void-package\n"
+                "# https://example.com/feed.xml|My Blog\n"
+                "# https://github.com/void-linux/void-packages/commits/master.atom|void-package|pkgfeed\n"
             )
 
 
@@ -49,8 +49,8 @@ def load_feeds():
                     continue
                 parts = [p.strip() for p in line.split('|')]
                 url = parts[0]
-                is_pkgfeed = len(parts) > 1 and parts[1].lower() == 'pkgfeed'
-                custom_name = parts[2] if len(parts) > 2 and parts[2] else None
+                custom_name = parts[1] if len(parts) > 1 and parts[1] else None
+                is_pkgfeed = len(parts) > 2 and parts[2].lower() == 'pkgfeed'
                 feeds.append((url, is_pkgfeed, custom_name))
     return feeds
 
