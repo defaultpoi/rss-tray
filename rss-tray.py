@@ -398,8 +398,8 @@ class RssTray:
                     order.append(feed_name)
                 groups[feed_name].append(entry)
 
-            for feed_name in order:
-                self.listbox.add(self.build_header_row(feed_name))
+            for i, feed_name in enumerate(order):
+                self.listbox.add(self.build_header_row(feed_name, is_first=(i == 0)))
                 for entry in groups[feed_name]:
                     self.listbox.add(self.build_row(entry))
 
@@ -412,7 +412,7 @@ class RssTray:
                 self.listbox.add(row)
         self.listbox.show_all()
 
-    def build_header_row(self, feed_name):
+    def build_header_row(self, feed_name, is_first=False):
         row = Gtk.ListBoxRow()
         row.set_selectable(False)
         row.set_activatable(False)
@@ -420,7 +420,7 @@ class RssTray:
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         box.set_margin_start(4)
         box.set_margin_end(4)
-        box.set_margin_top(4)
+        box.set_margin_top(4 if is_first else 20)
         box.set_margin_bottom(2)
 
         label = Gtk.Label()
