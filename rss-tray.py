@@ -449,8 +449,10 @@ class RssTray:
     def show_popup(self, auto=False):
         if auto and is_fullscreen_active():
             return  # don't interrupt a fullscreen video/game/presentation
-        if self.popup is None:
-            self.build_popup_window()
+        if self.popup is not None:
+            self.popup.destroy()
+            self.popup = None
+        self.build_popup_window()
         self._update_scroller_max_height()
         self.refresh_list()
         self.position_popup()
@@ -522,8 +524,6 @@ class RssTray:
                 row.add(lbl)
                 self.listbox.add(row)
         self.listbox.show_all()
-        if self.popup:
-            self.popup.resize(WINDOW_WIDTH, 1)
 
     def build_header_row(self, feed_url, feed_name, is_first=False):
         row = Gtk.ListBoxRow()
