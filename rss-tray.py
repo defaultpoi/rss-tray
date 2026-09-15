@@ -522,6 +522,8 @@ class RssTray:
                 row.add(lbl)
                 self.listbox.add(row)
         self.listbox.show_all()
+        if self.popup:
+            self.popup.resize(WINDOW_WIDTH, 1)
 
     def build_header_row(self, feed_url, feed_name, is_first=False):
         row = Gtk.ListBoxRow()
