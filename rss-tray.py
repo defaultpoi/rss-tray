@@ -30,6 +30,7 @@ MUTE_FILE = os.path.join(CONFIG_DIR, 'mute.conf')
 STATE_FILE = os.path.join(CONFIG_DIR, 'state.json')
 CHECK_INTERVAL = 600  # default per-feed interval (seconds) when none is set in feeds.conf
 SCHEDULER_TICK_SECONDS = 60  # how often we check whether any feed is due
+PENDING_CHECK_INTERVAL_SECONDS = 3600  # how often to check pending package matches against repodata
 MAX_LIST_ITEMS = 40
 MAX_TITLE_LEN = 60
 MAX_ITEM_AGE_SECONDS = 24 * 3600  # ignore entries older than this on first sight
@@ -187,9 +188,29 @@ def get_installed_version(pkgname):
     return None
 
 
+def repodata_has_update(pkgname):
+    """Read-only, in-memory dry run against the configured repos — no root needed,
+    nothing written to disk. Returns True only if a real newer build is published."""
+    try:
+        result = subprocess.run(
+            ['xbps-install', '-Mn', '-u', pkgname],
+            capture_output=True, text=True, timeout=30
+        )
+    except Exception:
+        return False
+    if result.returncode != 0:
+        return False
+    output = (result.stdout or '') + (result.stderr or '')
+    for line in output.splitlines():
+        line = line.strip()
+        if line.startswith(pkgname + '-') and '->' in line:
+            return True
+    return False
+
+
 def play_notification_sound():
-    """Best-effort: play one of the bundled ALSA test sounds using whichever
-    player is available. Silently does nothing if none are found."""
+    """Best-effort: play a notification sound using whichever player is available.
+    Silently does nothing if none are found."""
     for path in NOTIFICATION_SOUND_CANDIDATES:
         if not os.path.exists(path):
             continue
@@ -239,7 +260,7 @@ class RssTray:
         ensure_config()
         self.state = load_state()
         self.lock = threading.Lock()
-        self._check_lock = threading.Lock()  # prevents overlapping check_feeds runs
+        self._check_lock = threading.Lock()  # prevents overlapping check cycles
         self.popup = None
         self.listbox = None
         self.scroller = None
@@ -256,7 +277,7 @@ class RssTray:
         GLib.timeout_add(800, self.maybe_auto_show_startup)
 
     def maybe_auto_show_startup(self):
-        if self.unread_count() > 0:
+        if self.has_anything_to_show():
             self.show_popup(auto=True)
         return False
 
@@ -276,6 +297,7 @@ class RssTray:
     def _check_feeds_guarded(self, force):
         try:
             self.check_feeds(force)
+            self.check_pending_updates_if_due(force=force)
         finally:
             self._check_lock.release()
 
@@ -283,10 +305,13 @@ class RssTray:
         feeds = load_feeds()
         mute_phrases = load_mute_filters()
         new_items = []
+        new_pending = []
         now = time_module.time()
         with self.lock:
             seen_ids = set(self.state.get('seen', {}).keys())
             last_checked = dict(self.state.get('last_checked', {}))
+            known_pkgnames = {e['pkgname'] for e in self.state.get('pending_updates', [])} | \
+                              {e['pkgname'] for e in self.state.get('available_updates', [])}
         newly_seen_ids = set()
         due_urls = []
         for url, is_pkgfeed, _custom_name, interval_seconds in feeds:
@@ -307,18 +332,30 @@ class RssTray:
                 newly_seen_ids.add(eid)
                 age = entry_age_seconds(entry)
                 if age is not None and age > MAX_ITEM_AGE_SECONDS:
-                    continue  # too old — mark as seen, don't surface as unread
+                    continue  # too old — mark as seen, don't surface
                 title = entry.get('title', '(untitled)')
                 if is_muted(title, mute_phrases):
-                    continue  # matches mute.conf — mark as seen, don't surface as unread
+                    continue  # matches mute.conf — mark as seen, don't surface
                 pkg_match = find_installed_match(title) if is_pkgfeed else None
-                new_items.append({
-                    'id': eid,
-                    'title': title,
-                    'link': entry.get('link', ''),
-                    'feed_url': url,
-                    'pkg_match': pkg_match,
-                })
+                if pkg_match:
+                    if pkg_match in known_pkgnames:
+                        continue  # already tracking this package
+                    known_pkgnames.add(pkg_match)
+                    new_pending.append({
+                        'id': eid,
+                        'title': title,
+                        'link': entry.get('link', ''),
+                        'feed_url': url,
+                        'pkgname': pkg_match,
+                    })
+                else:
+                    new_items.append({
+                        'id': eid,
+                        'title': title,
+                        'link': entry.get('link', ''),
+                        'feed_url': url,
+                        'pkg_match': None,
+                    })
         with self.lock:
             merged_seen = dict(self.state.get('seen', {}))
             for eid in newly_seen_ids:
@@ -331,6 +368,13 @@ class RssTray:
 
             self.state['seen'] = merged_seen
             self.state['last_checked'] = merged_last_checked
+
+            if new_pending:
+                existing_pending_ids = {e['id'] for e in self.state.get('pending_updates', [])}
+                new_pending = [e for e in new_pending if e['id'] not in existing_pending_ids]
+                if new_pending:
+                    self.state['pending_updates'] = new_pending + self.state.get('pending_updates', [])
+
             if new_items:
                 existing_ids = {e['id'] for e in self.state.get('unread', [])}
                 new_items = [e for e in new_items if e['id'] not in existing_ids]
@@ -340,22 +384,60 @@ class RssTray:
         if new_items:
             GLib.idle_add(self.on_new_items)
 
+    def check_pending_updates_if_due(self, force=False):
+        now = time_module.time()
+        with self.lock:
+            last = self.state.get('pending_last_checked', 0)
+            pending = list(self.state.get('pending_updates', []))
+        if not pending:
+            with self.lock:
+                self.state['pending_last_checked'] = now
+                save_state(self.state)
+            return
+        if not force and (now - last) < PENDING_CHECK_INTERVAL_SECONDS:
+            return
+        promoted = []
+        still_pending = []
+        for item in pending:
+            if repodata_has_update(item['pkgname']):
+                promoted.append(item)
+            else:
+                still_pending.append(item)
+        with self.lock:
+            self.state['pending_updates'] = still_pending
+            if promoted:
+                existing_ids = {e['id'] for e in self.state.get('available_updates', [])}
+                new_avail = [p for p in promoted if p['id'] not in existing_ids]
+                self.state['available_updates'] = new_avail + self.state.get('available_updates', [])
+            self.state['pending_last_checked'] = now
+            save_state(self.state)
+        if promoted:
+            GLib.idle_add(self.on_new_items)  # reuse: sound + auto-popup + icon refresh
+
     def on_new_items(self):
         self.update_icon()
         play_notification_sound()
-        self.show_popup(auto=True)  # auto-open whenever new unread items arrive
+        self.show_popup(auto=True)  # auto-open whenever new unread items or updates arrive
         return False
 
     def unread_count(self):
         with self.lock:
             return len(self.state.get('unread', []))
 
+    def total_badge_count(self):
+        with self.lock:
+            return len(self.state.get('unread', [])) + len(self.state.get('available_updates', []))
+
+    def has_anything_to_show(self):
+        with self.lock:
+            return bool(self.state.get('unread')) or bool(self.state.get('available_updates'))
+
     def has_pkg_update(self):
         with self.lock:
-            return any(e.get('pkg_match') for e in self.state.get('unread', []))
+            return bool(self.state.get('available_updates'))
 
     def update_icon(self):
-        count = self.unread_count()
+        count = self.total_badge_count()
         self.status_icon.set_from_pixbuf(self.render_icon(count))
         if self.has_pkg_update():
             tooltip = f"{count} unread — package update available"
@@ -523,10 +605,11 @@ class RssTray:
             self.listbox.remove(child)
         with self.lock:
             unread = list(self.state.get('unread', []))
+            available = list(self.state.get('available_updates', []))
 
         feeds_map = {url: (custom_name or url) for url, _is_pkgfeed, custom_name, _interval in load_feeds()}
 
-        if not unread:
+        if not unread and not available:
             row = Gtk.ListBoxRow()
             row.set_selectable(False)
             row.set_activatable(False)
@@ -538,37 +621,60 @@ class RssTray:
             if self.popup:
                 self.popup.hide()
         else:
-            shown = unread[:MAX_LIST_ITEMS]
-            groups = {}
-            order = []
-            for entry in shown:
-                feed_url = entry.get('feed_url', '')
-                if feed_url not in groups:
-                    groups[feed_url] = []
-                    order.append(feed_url)
-                groups[feed_url].append(entry)
+            if unread:
+                shown = unread[:MAX_LIST_ITEMS]
+                groups = {}
+                order = []
+                for entry in shown:
+                    feed_url = entry.get('feed_url', '')
+                    if feed_url not in groups:
+                        groups[feed_url] = []
+                        order.append(feed_url)
+                    groups[feed_url].append(entry)
 
-            for i, feed_url in enumerate(order):
-                feed_name = feeds_map.get(feed_url, feed_url)
-                self.listbox.add(self.build_header_row(feed_url, feed_name, is_first=(i == 0)))
-                for entry in groups[feed_url]:
-                    self.listbox.add(self.build_row(entry))
+                for i, feed_url in enumerate(order):
+                    feed_name = feeds_map.get(feed_url, feed_url)
+                    self.listbox.add(self.build_header_row(feed_url, feed_name, is_first=(i == 0)))
+                    for entry in groups[feed_url]:
+                        self.listbox.add(self.build_row(entry))
 
-            if len(unread) > MAX_LIST_ITEMS:
-                row = Gtk.ListBoxRow()
-                row.set_selectable(False)
-                row.set_activatable(False)
-                lbl = Gtk.Label(label=f"... and {len(unread) - MAX_LIST_ITEMS} more")
-                row.add(lbl)
-                self.listbox.add(row)
+                if len(unread) > MAX_LIST_ITEMS:
+                    row = Gtk.ListBoxRow()
+                    row.set_selectable(False)
+                    row.set_activatable(False)
+                    lbl = Gtk.Label(label=f"... and {len(unread) - MAX_LIST_ITEMS} more")
+                    row.add(lbl)
+                    self.listbox.add(row)
+
+            if available:
+                self.listbox.add(self.build_header_row(
+                    '__updates__', 'Updates available',
+                    is_first=(not unread), clickable=False
+                ))
+                for entry in available[:MAX_LIST_ITEMS]:
+                    row_entry = {
+                        'id': entry['id'],
+                        'title': entry['title'],
+                        'link': entry.get('link', ''),
+                        'pkg_match': entry['pkgname'],
+                    }
+                    self.listbox.add(self.build_row(row_entry))
+                if len(available) > MAX_LIST_ITEMS:
+                    row = Gtk.ListBoxRow()
+                    row.set_selectable(False)
+                    row.set_activatable(False)
+                    lbl = Gtk.Label(label=f"... and {len(available) - MAX_LIST_ITEMS} more")
+                    row.add(lbl)
+                    self.listbox.add(row)
         self.listbox.show_all()
 
-    def build_header_row(self, feed_url, feed_name, is_first=False):
+    def build_header_row(self, feed_url, feed_name, is_first=False, clickable=True):
         row = Gtk.ListBoxRow()
         row.set_selectable(False)
-        row.set_activatable(True)
-        row.header_feed_url = feed_url
-        row.set_tooltip_text(f"Mark all '{feed_name}' items as read")
+        row.set_activatable(clickable)
+        if clickable:
+            row.header_feed_url = feed_url
+            row.set_tooltip_text(f"Mark all '{feed_name}' items as read")
 
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         box.set_margin_start(4)
@@ -625,7 +731,7 @@ class RssTray:
 
         tooltip_parts = []
         if row.pkg_match:
-            tooltip_parts.append(f"Matches installed package '{row.pkg_match}' — click to check for an update")
+            tooltip_parts.append(f"Ready to update '{row.pkg_match}' — click to install")
         if truncated:
             tooltip_parts.append(full_title)
         if tooltip_parts:
@@ -642,17 +748,23 @@ class RssTray:
             self.state['unread'] = [e for e in self.state.get('unread', []) if e['id'] != item_id]
             save_state(self.state)
 
+    def _remove_available_update(self, item_id):
+        with self.lock:
+            self.state['available_updates'] = [
+                e for e in self.state.get('available_updates', []) if e['id'] != item_id
+            ]
+            save_state(self.state)
+
     def _confirm_update(self, pkgname):
         dialog = Gtk.MessageDialog(
             transient_for=self.popup,
             flags=0,
             message_type=Gtk.MessageType.QUESTION,
             buttons=Gtk.ButtonsType.YES_NO,
-            text=f"Check for and install an update for '{pkgname}'?",
+            text=f"Install the available update for '{pkgname}'?",
         )
         dialog.format_secondary_text(
-            "This runs xbps-install with elevated privileges in the background. "
-            "The item will stay unread unless the package actually gets updated."
+            "This runs xbps-install with elevated privileges in the background."
         )
         response = dialog.run()
         dialog.destroy()
@@ -677,14 +789,14 @@ class RssTray:
     def _on_update_finished(self, item_id, pkgname, before, after, returncode, output):
         updated = bool(before and after and before != after)
         if updated:
-            self._remove_unread(item_id)
+            self._remove_available_update(item_id)
             summary = f"Updated '{pkgname}': {before} → {after}"
             msg_type = Gtk.MessageType.INFO
         elif returncode != 0:
-            summary = f"Update check for '{pkgname}' failed (exit code {returncode})."
+            summary = f"Update for '{pkgname}' failed (exit code {returncode})."
             msg_type = Gtk.MessageType.WARNING
         else:
-            summary = f"No newer build available yet for '{pkgname}' (still {before or 'unknown'})."
+            summary = f"'{pkgname}' didn't update (still {before or 'unknown'}) — repo may have changed since the last check."
             msg_type = Gtk.MessageType.WARNING
 
         dialog = Gtk.MessageDialog(
@@ -717,8 +829,7 @@ class RssTray:
             if not self._confirm_update(pkg_match):
                 return
             self.start_update(item_id, pkg_match)
-            # Row stays unread until _on_update_finished confirms a real version
-            # change — no premature dismissal if the build hasn't landed yet.
+            # Row stays until _on_update_finished confirms a real version change.
         else:
             self._remove_unread(item_id)
             if link:
@@ -737,7 +848,15 @@ class RssTray:
         self.refresh_list()
 
     def on_mark_read_clicked(self, _button, item_id):
-        self._remove_unread(item_id)
+        with self.lock:
+            before_count = len(self.state.get('unread', []))
+            self.state['unread'] = [e for e in self.state.get('unread', []) if e['id'] != item_id]
+            removed_from_unread = len(self.state['unread']) != before_count
+            if not removed_from_unread:
+                self.state['available_updates'] = [
+                    e for e in self.state.get('available_updates', []) if e['id'] != item_id
+                ]
+            save_state(self.state)
         self.update_icon()
         self.refresh_list()
 
