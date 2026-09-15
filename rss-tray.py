@@ -26,6 +26,7 @@ socket.setdefaulttimeout(15)  # avoid feed fetches hanging indefinitely on slow/
 
 CONFIG_DIR = os.path.expanduser('~/.config/rss-tray')
 FEEDS_FILE = os.path.join(CONFIG_DIR, 'feeds.conf')
+MUTE_FILE = os.path.join(CONFIG_DIR, 'mute.conf')
 STATE_FILE = os.path.join(CONFIG_DIR, 'state.json')
 CHECK_INTERVAL = 600  # default per-feed interval (seconds) when none is set in feeds.conf
 SCHEDULER_TICK_SECONDS = 60  # how often we check whether any feed is due
@@ -58,6 +59,16 @@ def ensure_config():
                 "# https://example.com/feed.xml|My Blog|5\n"
                 "# https://github.com/void-linux/void-packages/commits/master.atom|void-package|30|pkgfeed\n"
             )
+    if not os.path.exists(MUTE_FILE):
+        with open(MUTE_FILE, 'w') as f:
+            f.write(
+                "# Items whose title contains any of these phrases (case-insensitive,\n"
+                "# substring match) are auto-marked as read and never shown as unread.\n"
+                "# One phrase per line, or several separated by | on the same line.\n"
+                "# Lines starting with # are ignored.\n"
+                "# Example:\n"
+                "# (P)|Fashion week|Another item\n"
+            )
 
 
 def load_feeds():
@@ -81,6 +92,27 @@ def load_feeds():
                 is_pkgfeed = len(parts) > 3 and parts[3].lower() == 'pkgfeed'
                 feeds.append((url, is_pkgfeed, custom_name, interval_seconds))
     return feeds
+
+
+def load_mute_filters():
+    """Returns a list of lowercase phrases; a title is muted if it contains any of them."""
+    phrases = []
+    if os.path.exists(MUTE_FILE):
+        with open(MUTE_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                for phrase in line.split('|'):
+                    phrase = phrase.strip()
+                    if phrase:
+                        phrases.append(phrase.lower())
+    return phrases
+
+
+def is_muted(title, mute_phrases):
+    title_lower = title.lower()
+    return any(phrase in title_lower for phrase in mute_phrases)
 
 
 def load_state():
@@ -186,20 +218,20 @@ def is_fullscreen_active():
         return False
 
 
-def edit_feeds_file():
+def edit_file_externally(path):
     try:
-        subprocess.Popen(['xdg-open', FEEDS_FILE])
+        subprocess.Popen(['xdg-open', path])
         return
     except Exception:
         pass
     editor = os.environ.get('EDITOR', 'vi')
     if shutil.which('xfce4-terminal'):
-        subprocess.Popen(['xfce4-terminal', '-e', f'{editor} "{FEEDS_FILE}"'])
+        subprocess.Popen(['xfce4-terminal', '-e', f'{editor} "{path}"'])
     else:
         try:
-            subprocess.Popen([editor, FEEDS_FILE])
+            subprocess.Popen([editor, path])
         except Exception:
-            print(f"Couldn't open an editor — edit manually: {FEEDS_FILE}")
+            print(f"Couldn't open an editor — edit manually: {path}")
 
 
 class RssTray:
@@ -249,6 +281,7 @@ class RssTray:
 
     def check_feeds(self, force=False):
         feeds = load_feeds()
+        mute_phrases = load_mute_filters()
         new_items = []
         now = time_module.time()
         with self.lock:
@@ -276,6 +309,8 @@ class RssTray:
                 if age is not None and age > MAX_ITEM_AGE_SECONDS:
                     continue  # too old — mark as seen, don't surface as unread
                 title = entry.get('title', '(untitled)')
+                if is_muted(title, mute_phrases):
+                    continue  # matches mute.conf — mark as seen, don't surface as unread
                 pkg_match = find_installed_match(title) if is_pkgfeed else None
                 new_items.append({
                     'id': eid,
@@ -419,8 +454,11 @@ class RssTray:
         footer.set_margin_top(4)
         footer.set_margin_bottom(4)
         edit_btn = Gtk.Button(label='Edit feeds')
-        edit_btn.connect('clicked', lambda *_a: edit_feeds_file())
+        edit_btn.connect('clicked', lambda *_a: edit_file_externally(FEEDS_FILE))
         footer.pack_start(edit_btn, True, True, 0)
+        edit_mute_btn = Gtk.Button(label='Edit filters')
+        edit_mute_btn.connect('clicked', lambda *_a: edit_file_externally(MUTE_FILE))
+        footer.pack_start(edit_mute_btn, True, True, 0)
         refresh_btn = Gtk.Button(label='Refresh')
         refresh_btn.connect('clicked', lambda *_a: self.start_check_thread(force=True))
         footer.pack_start(refresh_btn, True, True, 0)
