@@ -474,18 +474,20 @@ class RssTray:
         if self.weather_view == 'forecast':
             days = d.get('forecast_days', [])
             if not days:
-                return '<span size="large">Forecast unavailable</span>'
+                return '<span size="medium">Forecast unavailable</span>'
             parts = []
             for day in days:
                 segment = ''
                 if day.get('rain_prob') is not None and day['rain_prob'] > 0:
-                    segment += '🌧 '
+                    segment += '<span foreground="#2b2b2b">☔</span> '
                 if day.get('max_temp') is not None and day.get('min_temp') is not None:
-                    segment += f"{day['max_temp']:.0f}/{day['min_temp']:.0f}°C"
+                    segment += GLib.markup_escape_text(
+                        f"{day['max_temp']:.0f}/{day['min_temp']:.0f}°C"
+                    )
                 if segment:
                     parts.append(segment)
-            text = "   ·   ".join(parts) if parts else "Forecast unavailable"
-            return f'<span size="large"><b>{GLib.markup_escape_text(text)}</b></span>'
+            text = " · ".join(parts) if parts else "Forecast unavailable"
+            return f'<span size="medium"><b>{text}</b></span>'
 
         parts = []
         if d.get('temp') is not None:
@@ -515,7 +517,7 @@ class RssTray:
         label = Gtk.Label()
         label.set_xalign(0.5)
         label.set_hexpand(True)
-        label.set_line_wrap(True)
+        label.set_line_wrap(self.weather_view != 'forecast')
         label.set_justify(Gtk.Justification.CENTER)
         self.weather_label = label
         self.update_weather_label()
