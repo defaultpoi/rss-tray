@@ -37,9 +37,9 @@ MAX_LIST_ITEMS = 40
 MAX_TITLE_LEN = 60
 MAX_ITEM_AGE_SECONDS = 24 * 3600  # ignore entries older than this on first sight
 SEEN_RETENTION_SECONDS = 30 * 24 * 3600  # prune seen-item records older than this
-PRIVILEGE_CMD = ['sudo']  # change to ['doas'] if that's what you use; requires a
-                          # passwordless (NOPASSWD) rule for xbps-install, since
-                          # updates now run headlessly with no terminal/tty attached
+PRIVILEGE_CMD = ['sudo']  # change to ['doas'] if that's what you use; requires
+                          # passwordless (NOPASSWD) rules for xbps-install, since
+                          # updates run headlessly with no terminal/tty attached
 WINDOW_WIDTH = 456  # 380 * 1.2
 UPDATE_TIMEOUT_SECONDS = 1800  # 30 minutes
 NOTIFICATION_SOUND_CANDIDATES = [
@@ -52,12 +52,11 @@ WEATHER_API_URL = (
     "https://api.open-meteo.com/v1/forecast"
     f"?latitude={WEATHER_LATITUDE}&longitude={WEATHER_LONGITUDE}"
     "&current=temperature_2m,wind_speed_10m"
-    "&hourly=temperature_2m,wind_speed_10m"
-    "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,wind_speed_10m_max"
-    "&forecast_days=2&timezone=auto"
+    "&hourly=wind_speed_10m"
+    "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+    "&forecast_days=7&timezone=auto"
 )
 WEATHER_REFRESH_SECONDS = 1800  # 30 minutes
-WEATHER_EVENING_HOUR = 18  # after this local hour, show tomorrow's outlook instead
 
 
 def ensure_config():
@@ -68,7 +67,6 @@ def ensure_config():
                 "# Format: URL|custom display name (optional)|check interval in minutes (optional)\n"
                 "# All fields after the URL are optional but positional — leave a field empty\n"
                 "# to skip it while still setting a later one, e.g. URL||5\n"
-                "# The interval overrides the default 10-minute check for that feed only.\n"
                 "# Package updates are detected system-wide automatically — no feed setup needed.\n"
                 "# https://example.com/feed.xml\n"
                 "# https://example.com/feed.xml|My Blog\n"
@@ -87,9 +85,7 @@ def ensure_config():
 
 
 def load_feeds():
-    """Returns list of (url, custom_name, interval_seconds).
-    A trailing 4th field from older configs (the retired 'pkgfeed' flag) is
-    simply ignored if still present, so old feeds.conf files keep working."""
+    """Returns list of (url, custom_name, interval_seconds)."""
     feeds = []
     if os.path.exists(FEEDS_FILE):
         with open(FEEDS_FILE) as f:
@@ -204,8 +200,6 @@ def list_all_updates():
         pkgver_token, action = parts[0], parts[1]
         if action != 'update':
             continue
-        # pkgver_token is "<pkgname>-<version>_<revision>"; strip the trailing
-        # "-<version>_<revision>" to recover the bare package name.
         match = re.match(r'^(.+)-[0-9][^-]*$', pkgver_token)
         if match:
             updates.append(match.group(1))
@@ -270,44 +264,34 @@ def fetch_weather():
         current = data.get('current', {})
         hourly = data.get('hourly', {})
         daily = data.get('daily', {})
-        times = hourly.get('time', [])
-        temps = hourly.get('temperature_2m', [])
         winds = hourly.get('wind_speed_10m', [])
-        current_time = current.get('time')
-
-        idx = times.index(current_time) if current_time in times else None
-
-        temp_trend = None
-        if idx is not None and idx + 1 < len(temps) and temps[idx] is not None and temps[idx + 1] is not None:
-            if temps[idx + 1] > temps[idx]:
-                temp_trend = 'up'
-            elif temps[idx + 1] < temps[idx]:
-                temp_trend = 'down'
-            else:
-                temp_trend = 'flat'
 
         today_max_wind = None
-        if idx is not None:
-            today_winds = [(i, w) for i, w in enumerate(winds[:24]) if w is not None]
-            if today_winds:
-                _max_idx, max_val = max(today_winds, key=lambda pair: pair[1])
-                today_max_wind = max_val
+        today_winds = [w for w in winds[:24] if w is not None]
+        if today_winds:
+            today_max_wind = max(today_winds)
 
         daily_max = daily.get('temperature_2m_max', [])
         daily_min = daily.get('temperature_2m_min', [])
         daily_rain_prob = daily.get('precipitation_probability_max', [])
 
+        forecast_days = []
+        for i in range(1, 7):
+            if i < len(daily_max) and i < len(daily_min):
+                forecast_days.append({
+                    'max_temp': daily_max[i],
+                    'min_temp': daily_min[i],
+                    'rain_prob': daily_rain_prob[i] if i < len(daily_rain_prob) else None,
+                })
+
         return {
             'temp': current.get('temperature_2m'),
-            'temp_trend': temp_trend,
             'wind': current.get('wind_speed_10m'),
             'today_max_wind': today_max_wind,
             'today_max_temp': daily_max[0] if len(daily_max) > 0 else None,
             'today_min_temp': daily_min[0] if len(daily_min) > 0 else None,
             'today_rain_prob': daily_rain_prob[0] if len(daily_rain_prob) > 0 else None,
-            'tomorrow_max_temp': daily_max[1] if len(daily_max) > 1 else None,
-            'tomorrow_min_temp': daily_min[1] if len(daily_min) > 1 else None,
-            'tomorrow_rain_prob': daily_rain_prob[1] if len(daily_rain_prob) > 1 else None,
+            'forecast_days': forecast_days,
         }
     except Exception:
         return None
@@ -318,12 +302,14 @@ class RssTray:
         ensure_config()
         self.state = load_state()
         self.lock = threading.Lock()
-        self._check_lock = threading.Lock()  # prevents overlapping check cycles
+        self._check_lock = threading.Lock()  # prevents overlapping check/install cycles
         self.popup = None
         self.listbox = None
         self.scroller = None
         self.weather_data = None
         self.weather_label = None
+        self.weather_box = None
+        self.weather_view = 'today'
         self.active_installs = 0
         self._spin_angle = 0
         self._spin_timeout_id = None
@@ -356,7 +342,7 @@ class RssTray:
 
     def start_check_thread(self, force=False):
         if not self._check_lock.acquire(blocking=False):
-            return  # a check is already in flight — skip this tick rather than overlap
+            return  # a check or install is already in flight — skip this tick
         threading.Thread(target=self._check_feeds_guarded, args=(force,), daemon=True).start()
 
     def _check_feeds_guarded(self, force):
@@ -447,8 +433,6 @@ class RssTray:
                     }
                     existing[pkgname] = entry
                     promoted_new.append(entry)
-            # Drop entries for packages that no longer have a pending update
-            # (e.g. installed via another tool, or the repo changed).
             self.state['available_updates'] = [existing[p] for p in pkgnames if p in existing]
             self.state['updates_last_checked'] = now
             save_state(self.state)
@@ -487,19 +471,25 @@ class RssTray:
         if not d:
             return '<span size="large">Weather unavailable</span>'
 
-        is_evening = time_module.localtime().tm_hour >= WEATHER_EVENING_HOUR
-
-        if is_evening:
+        if self.weather_view == 'forecast':
+            days = d.get('forecast_days', [])
+            if not days:
+                return '<span size="large">Forecast unavailable</span>'
             parts = []
-            if d.get('tomorrow_max_temp') is not None and d.get('tomorrow_min_temp') is not None:
-                parts.append(f"{d['tomorrow_max_temp']:.0f}/{d['tomorrow_min_temp']:.0f}°C")
-            rain_prob = d.get('tomorrow_rain_prob')
-            if rain_prob is not None and rain_prob > 0:
-                parts.append(f"🌧 {rain_prob:.0f}%")
-            text = "   ·   ".join(parts) if parts else "Weather unavailable"
+            for day in days:
+                segment = ''
+                if day.get('rain_prob') is not None and day['rain_prob'] > 0:
+                    segment += '🌧 '
+                if day.get('max_temp') is not None and day.get('min_temp') is not None:
+                    segment += f"{day['max_temp']:.0f}/{day['min_temp']:.0f}°C"
+                if segment:
+                    parts.append(segment)
+            text = "   ·   ".join(parts) if parts else "Forecast unavailable"
             return f'<span size="large"><b>{GLib.markup_escape_text(text)}</b></span>'
 
         parts = []
+        if d.get('temp') is not None:
+            parts.append(f"{d['temp']:.0f}°C")
         if d.get('today_max_temp') is not None and d.get('today_min_temp') is not None:
             parts.append(f"{d['today_max_temp']:.0f}/{d['today_min_temp']:.0f}°C")
         if d.get('wind') is not None and d.get('today_max_wind') is not None:
@@ -516,21 +506,40 @@ class RssTray:
             return
         self.weather_label.set_markup(self.format_weather_markup())
 
-    def unread_count(self):
-        with self.lock:
-            return len(self.state.get('unread', []))
+    def rebuild_weather_bar(self):
+        if self.weather_box is None:
+            return
+        for child in self.weather_box.get_children():
+            self.weather_box.remove(child)
 
-    def total_badge_count(self):
-        with self.lock:
-            return len(self.state.get('unread', [])) + len(self.state.get('available_updates', []))
+        label = Gtk.Label()
+        label.set_xalign(0.5)
+        label.set_hexpand(True)
+        label.set_line_wrap(True)
+        label.set_justify(Gtk.Justification.CENTER)
+        self.weather_label = label
+        self.update_weather_label()
 
-    def has_anything_to_show(self):
-        with self.lock:
-            return bool(self.state.get('unread')) or bool(self.state.get('available_updates'))
+        if self.weather_view == 'forecast':
+            back_btn = Gtk.Button(label='‹')
+            back_btn.set_relief(Gtk.ReliefStyle.NONE)
+            back_btn.set_tooltip_text('Back to today')
+            back_btn.connect('clicked', self.on_weather_arrow_clicked, 'today')
+            self.weather_box.pack_start(back_btn, False, False, 0)
+            self.weather_box.pack_start(label, True, True, 0)
+        else:
+            self.weather_box.pack_start(label, True, True, 0)
+            fwd_btn = Gtk.Button(label='›')
+            fwd_btn.set_relief(Gtk.ReliefStyle.NONE)
+            fwd_btn.set_tooltip_text('Show 6-day forecast')
+            fwd_btn.connect('clicked', self.on_weather_arrow_clicked, 'forecast')
+            self.weather_box.pack_start(fwd_btn, False, False, 0)
 
-    def has_pkg_update(self):
-        with self.lock:
-            return bool(self.state.get('available_updates'))
+        self.weather_box.show_all()
+
+    def on_weather_arrow_clicked(self, _button, target_view):
+        self.weather_view = target_view
+        self.rebuild_weather_bar()
 
     def _begin_install(self):
         self.active_installs += 1
@@ -549,7 +558,7 @@ class RssTray:
     def _spin_tick(self):
         self._spin_angle = (self._spin_angle + 30) % 360
         self.update_icon()
-        return self.active_installs > 0  # keep repeating while any install is running
+        return self.active_installs > 0
 
     def update_icon(self):
         count = self.total_badge_count()
@@ -564,6 +573,22 @@ class RssTray:
             tooltip = "No unread items"
         self.status_icon.set_tooltip_text(tooltip)
         return False
+
+    def unread_count(self):
+        with self.lock:
+            return len(self.state.get('unread', []))
+
+    def total_badge_count(self):
+        with self.lock:
+            return len(self.state.get('unread', [])) + len(self.state.get('available_updates', []))
+
+    def has_anything_to_show(self):
+        with self.lock:
+            return bool(self.state.get('unread')) or bool(self.state.get('available_updates'))
+
+    def has_pkg_update(self):
+        with self.lock:
+            return bool(self.state.get('available_updates'))
 
     def render_icon(self, count):
         size = 24
@@ -649,18 +674,14 @@ class RssTray:
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
 
-        weather_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        weather_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         weather_box.get_style_context().add_class('weather-bar')
         weather_box.set_margin_start(6)
         weather_box.set_margin_end(6)
         weather_box.set_margin_top(4)
         weather_box.set_margin_bottom(4)
-        weather_label = Gtk.Label()
-        weather_label.set_xalign(0.5)
-        weather_label.set_hexpand(True)
-        weather_box.pack_start(weather_label, True, True, 0)
-        self.weather_label = weather_label
-        self.update_weather_label()
+        self.weather_box = weather_box
+        self.rebuild_weather_bar()
         outer.pack_start(weather_box, False, False, 0)
         outer.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 0)
 
@@ -718,6 +739,7 @@ class RssTray:
         if self.popup is not None:
             self.popup.destroy()
             self.popup = None
+        self.weather_view = 'today'
         self.build_popup_window()
         self._update_scroller_max_height()
         self.refresh_list()
@@ -898,16 +920,9 @@ class RssTray:
         label.set_xalign(0)
         label.set_ellipsize(Pango.EllipsizeMode.END)
         label.set_hexpand(True)
-
-        tooltip_parts = []
-        if row.pkg_match:
-            tooltip_parts.append(f"Ready to update '{row.pkg_match}' — click to install")
         if truncated:
-            tooltip_parts.append(full_title)
-        if tooltip_parts:
-            tooltip_text = "\n".join(tooltip_parts)
-            row.set_tooltip_text(tooltip_text)
-            label.set_tooltip_text(tooltip_text)
+            row.set_tooltip_text(full_title)
+            label.set_tooltip_text(full_title)
 
         box.pack_start(label, True, True, 0)
         row.add(box)
@@ -924,75 +939,6 @@ class RssTray:
                 e for e in self.state.get('available_updates', []) if e['id'] != item_id
             ]
             save_state(self.state)
-
-    def _confirm_update(self, pkgname):
-        dialog = Gtk.MessageDialog(
-            transient_for=self.popup,
-            flags=0,
-            message_type=Gtk.MessageType.QUESTION,
-            buttons=Gtk.ButtonsType.YES_NO,
-            text=f"Install the available update for '{pkgname}'?",
-        )
-        dialog.format_secondary_text(
-            "This runs xbps-install with elevated privileges in the background."
-        )
-        response = dialog.run()
-        dialog.destroy()
-        return response == Gtk.ResponseType.YES
-
-    def start_update(self, item_id, pkgname):
-        self._begin_install()
-        threading.Thread(target=self._run_update, args=(item_id, pkgname), daemon=True).start()
-
-    def _run_update(self, item_id, pkgname):
-        self._check_lock.acquire()  # block until any in-flight scan finishes, and hold
-        try:                        # it so no scan can start mid-install either
-            before = get_installed_version(pkgname)
-            cmd = PRIVILEGE_CMD + ['xbps-install', '-Su', '-y', pkgname]
-            try:
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=UPDATE_TIMEOUT_SECONDS)
-                output = (result.stdout or '') + (result.stderr or '')
-                returncode = result.returncode
-            except Exception as e:
-                output = str(e)
-                returncode = -1
-            after = get_installed_version(pkgname)
-        finally:
-            self._check_lock.release()
-        GLib.idle_add(self._on_update_finished, item_id, pkgname, before, after, returncode, output)
-
-    def _on_update_finished(self, item_id, pkgname, before, after, returncode, output):
-        self._end_install()
-        updated = bool(before and after and before != after)
-        if updated:
-            self._remove_available_update(item_id)
-            summary = f"Updated '{pkgname}': {before} → {after}"
-            msg_type = Gtk.MessageType.INFO
-        elif returncode != 0:
-            summary = f"Update for '{pkgname}' failed (exit code {returncode})."
-            msg_type = Gtk.MessageType.WARNING
-        else:
-            summary = f"'{pkgname}' didn't update (still {before or 'unknown'}) — repo may have changed since the last check."
-            msg_type = Gtk.MessageType.WARNING
-
-        dialog = Gtk.MessageDialog(
-            transient_for=self.popup,
-            flags=0,
-            message_type=msg_type,
-            buttons=Gtk.ButtonsType.OK,
-            text=summary,
-        )
-        trimmed_output = output.strip()
-        if trimmed_output:
-            if len(trimmed_output) > 2000:
-                trimmed_output = trimmed_output[-2000:]
-            dialog.format_secondary_text(trimmed_output)
-        dialog.run()
-        dialog.destroy()
-
-        self.update_icon()
-        self.refresh_list()
-        return False
 
     def install_all_updates(self):
         with self.lock:
@@ -1038,18 +984,12 @@ class RssTray:
             return
         if not hasattr(row, 'entry_id'):
             return
-        item_id, link, pkg_match = row.entry_id, row.link, row.pkg_match
-        if pkg_match:
-            if not self._confirm_update(pkg_match):
-                return
-            self.start_update(item_id, pkg_match)
-            # Row stays until _on_update_finished confirms a real version change.
-        else:
-            self._remove_unread(item_id)
-            if link:
-                webbrowser.open(link)
-            self.update_icon()
-            self.refresh_list()
+        item_id, link = row.entry_id, row.link
+        self._remove_unread(item_id)
+        if link:
+            webbrowser.open(link)
+        self.update_icon()
+        self.refresh_list()
 
     def mark_feed_read(self, feed_url):
         with self.lock:
@@ -1062,15 +1002,7 @@ class RssTray:
         self.refresh_list()
 
     def on_mark_read_clicked(self, _button, item_id):
-        with self.lock:
-            before_count = len(self.state.get('unread', []))
-            self.state['unread'] = [e for e in self.state.get('unread', []) if e['id'] != item_id]
-            removed_from_unread = len(self.state['unread']) != before_count
-            if not removed_from_unread:
-                self.state['available_updates'] = [
-                    e for e in self.state.get('available_updates', []) if e['id'] != item_id
-                ]
-            save_state(self.state)
+        self._remove_unread(item_id)
         self.update_icon()
         self.refresh_list()
 
