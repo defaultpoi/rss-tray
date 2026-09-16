@@ -755,23 +755,20 @@ class RssTray:
         self.popup.grab_focus()
 
     def position_popup(self):
-        x = y = None
+        display = Gdk.Display.get_default()
+        monitor = display.get_primary_monitor() or display.get_monitor(0)
+        geo = monitor.get_geometry()
+
+        x = geo.x + geo.width - WINDOW_WIDTH  # flush against the right edge
+
+        y = geo.y  # flush against the top, as a fallback
         try:
-            ok, screen, area, _orientation = self.status_icon.get_geometry()
+            ok, _screen, area, _orientation = self.status_icon.get_geometry()
+            if ok and area is not None:
+                y = area.y + area.height  # flush against the bottom of the panel/tray icon
         except Exception:
-            ok = False
-        if ok and area is not None:
-            x = area.x
-            y = area.y + area.height
-            screen_width = screen.get_width() if screen else None
-            if screen_width and x + WINDOW_WIDTH > screen_width:
-                x = screen_width - WINDOW_WIDTH - 4
-        if x is None:
-            display = Gdk.Display.get_default()
-            monitor = display.get_primary_monitor() or display.get_monitor(0)
-            geo = monitor.get_geometry()
-            x = geo.x + geo.width - WINDOW_WIDTH - 10
-            y = geo.y + 30
+            pass
+
         self.popup.move(max(x, 0), max(y, 0))
 
     def refresh_list(self):
