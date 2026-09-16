@@ -286,17 +286,12 @@ def fetch_weather():
             else:
                 temp_trend = 'flat'
 
-        wind_trend = None
+        today_max_wind = None
         if idx is not None:
             today_winds = [(i, w) for i, w in enumerate(winds[:24]) if w is not None]
             if today_winds:
-                max_idx, _max_val = max(today_winds, key=lambda pair: pair[1])
-                if max_idx > idx:
-                    wind_trend = 'up'
-                elif max_idx < idx:
-                    wind_trend = 'down'
-                else:
-                    wind_trend = 'flat'
+                _max_idx, max_val = max(today_winds, key=lambda pair: pair[1])
+                today_max_wind = max_val
 
         daily_max = daily.get('temperature_2m_max', [])
         daily_min = daily.get('temperature_2m_min', [])
@@ -306,7 +301,7 @@ def fetch_weather():
             'temp': current.get('temperature_2m'),
             'temp_trend': temp_trend,
             'wind': current.get('wind_speed_10m'),
-            'wind_trend': wind_trend,
+            'today_max_wind': today_max_wind,
             'today_max_temp': daily_max[0] if len(daily_max) > 0 else None,
             'today_min_temp': daily_min[0] if len(daily_min) > 0 else None,
             'today_rain_prob': daily_rain_prob[0] if len(daily_rain_prob) > 0 else None,
@@ -490,36 +485,31 @@ class RssTray:
     def format_weather_markup(self):
         d = self.weather_data
         if not d:
-            return '<span size="small">Weather unavailable</span>'
+            return '<span size="large">Weather unavailable</span>'
 
-        arrow = {'up': ' ↑', 'down': ' ↓', 'flat': ' →'}
         is_evening = time_module.localtime().tm_hour >= WEATHER_EVENING_HOUR
 
         if is_evening:
             parts = []
             if d.get('tomorrow_max_temp') is not None and d.get('tomorrow_min_temp') is not None:
-                parts.append(f"Tomorrow {d['tomorrow_max_temp']:.0f}°/{d['tomorrow_min_temp']:.0f}°C")
+                parts.append(f"{d['tomorrow_max_temp']:.0f}/{d['tomorrow_min_temp']:.0f}°C")
             rain_prob = d.get('tomorrow_rain_prob')
             if rain_prob is not None and rain_prob > 0:
                 parts.append(f"🌧 {rain_prob:.0f}%")
             text = "   ·   ".join(parts) if parts else "Weather unavailable"
-            return f'<span size="small"><b>{GLib.markup_escape_text(text)}</b></span>'
+            return f'<span size="large"><b>{GLib.markup_escape_text(text)}</b></span>'
 
         parts = []
-        if d.get('temp') is not None:
-            t = f"{d['temp']:.0f}°C" + arrow.get(d.get('temp_trend'), '')
-            parts.append(t)
-        if d.get('today_max_temp') is not None:
-            parts.append(f"High {d['today_max_temp']:.0f}°C")
-        if d.get('today_min_temp') is not None:
-            parts.append(f"Night {d['today_min_temp']:.0f}°C")
-        if d.get('wind') is not None:
-            w = f"Wind {d['wind']:.0f}" + arrow.get(d.get('wind_trend'), '') + " km/h"
-            parts.append(w)
+        if d.get('today_max_temp') is not None and d.get('today_min_temp') is not None:
+            parts.append(f"{d['today_max_temp']:.0f}/{d['today_min_temp']:.0f}°C")
+        if d.get('wind') is not None and d.get('today_max_wind') is not None:
+            parts.append(f"{d['wind']:.0f}/{d['today_max_wind']:.0f} km/h")
+        elif d.get('wind') is not None:
+            parts.append(f"{d['wind']:.0f} km/h")
         if d.get('today_rain_prob') is not None:
             parts.append(f"Rain {d['today_rain_prob']:.0f}%")
         text = "   ·   ".join(parts) if parts else "Weather unavailable"
-        return f'<span size="small"><b>{GLib.markup_escape_text(text)}</b></span>'
+        return f'<span size="large"><b>{GLib.markup_escape_text(text)}</b></span>'
 
     def update_weather_label(self):
         if self.weather_label is None:
