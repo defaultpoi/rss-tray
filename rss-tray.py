@@ -202,7 +202,11 @@ def get_installed_version(pkgname):
 
 def repodata_has_update(pkgname):
     """Read-only, in-memory dry run against the configured repos — no root needed,
-    nothing written to disk. Returns True only if a real newer build is published."""
+    nothing written to disk. Returns True only if a real newer build is published.
+
+    Real xbps-install -Mn -u output looks like:
+        cryptsetup-2.8.8_1 update x86_64 https://repo-default.voidlinux.org/current 3203607 568523
+    i.e. "<pkgver> <action> <arch> <repo> <dlsize> <instsize>" — no '->' arrow."""
     try:
         result = subprocess.run(
             ['xbps-install', '-Mn', '-u', pkgname],
@@ -213,9 +217,19 @@ def repodata_has_update(pkgname):
     if result.returncode != 0:
         return False
     output = (result.stdout or '') + (result.stderr or '')
+    prefix = pkgname + '-'
     for line in output.splitlines():
         line = line.strip()
-        if line.startswith(pkgname + '-') and '->' in line:
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        pkgver_token, action = parts[0], parts[1]
+        if not pkgver_token.startswith(prefix):
+            continue
+        rest = pkgver_token[len(prefix):]
+        # Guard against prefix collisions (e.g. "foo" matching "foo-bar-1.0_1") by
+        # requiring the character right after the name to start a version number.
+        if rest and rest[0].isdigit() and action == 'update':
             return True
     return False
 
