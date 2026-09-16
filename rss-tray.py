@@ -51,12 +51,13 @@ WEATHER_LONGITUDE = 26.775255
 WEATHER_API_URL = (
     "https://api.open-meteo.com/v1/forecast"
     f"?latitude={WEATHER_LATITUDE}&longitude={WEATHER_LONGITUDE}"
-    "&current=temperature_2m,wind_speed_10m,precipitation"
-    "&hourly=temperature_2m,precipitation_probability,wind_speed_10m"
+    "&current=temperature_2m,wind_speed_10m"
+    "&hourly=temperature_2m,wind_speed_10m"
+    "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,wind_speed_10m_max"
     "&forecast_days=2&timezone=auto"
 )
 WEATHER_REFRESH_SECONDS = 1800  # 30 minutes
-WEATHER_NIGHT_WINDOW_HOURS = 15  # how far ahead to look for the night's low
+WEATHER_EVENING_HOUR = 18  # after this local hour, show tomorrow's outlook instead
 
 
 def ensure_config():
@@ -268,27 +269,50 @@ def fetch_weather():
     try:
         current = data.get('current', {})
         hourly = data.get('hourly', {})
+        daily = data.get('daily', {})
         times = hourly.get('time', [])
         temps = hourly.get('temperature_2m', [])
-        probs = hourly.get('precipitation_probability', [])
+        winds = hourly.get('wind_speed_10m', [])
         current_time = current.get('time')
 
-        night_temp = None
-        precip_prob = None
-        if current_time in times:
-            idx = times.index(current_time)
-            window = [t for t in temps[idx:idx + WEATHER_NIGHT_WINDOW_HOURS] if t is not None]
-            if window:
-                night_temp = min(window)
-            if idx < len(probs):
-                precip_prob = probs[idx]
+        idx = times.index(current_time) if current_time in times else None
+
+        temp_trend = None
+        if idx is not None and idx + 1 < len(temps) and temps[idx] is not None and temps[idx + 1] is not None:
+            if temps[idx + 1] > temps[idx]:
+                temp_trend = 'up'
+            elif temps[idx + 1] < temps[idx]:
+                temp_trend = 'down'
+            else:
+                temp_trend = 'flat'
+
+        wind_trend = None
+        if idx is not None:
+            today_winds = [(i, w) for i, w in enumerate(winds[:24]) if w is not None]
+            if today_winds:
+                max_idx, _max_val = max(today_winds, key=lambda pair: pair[1])
+                if max_idx > idx:
+                    wind_trend = 'up'
+                elif max_idx < idx:
+                    wind_trend = 'down'
+                else:
+                    wind_trend = 'flat'
+
+        daily_max = daily.get('temperature_2m_max', [])
+        daily_min = daily.get('temperature_2m_min', [])
+        daily_rain_prob = daily.get('precipitation_probability_max', [])
 
         return {
             'temp': current.get('temperature_2m'),
+            'temp_trend': temp_trend,
             'wind': current.get('wind_speed_10m'),
-            'precip': current.get('precipitation'),
-            'precip_prob': precip_prob,
-            'night_temp': night_temp,
+            'wind_trend': wind_trend,
+            'today_max_temp': daily_max[0] if len(daily_max) > 0 else None,
+            'today_min_temp': daily_min[0] if len(daily_min) > 0 else None,
+            'today_rain_prob': daily_rain_prob[0] if len(daily_rain_prob) > 0 else None,
+            'tomorrow_max_temp': daily_max[1] if len(daily_max) > 1 else None,
+            'tomorrow_min_temp': daily_min[1] if len(daily_min) > 1 else None,
+            'tomorrow_rain_prob': daily_rain_prob[1] if len(daily_rain_prob) > 1 else None,
         }
     except Exception:
         return None
@@ -467,17 +491,33 @@ class RssTray:
         d = self.weather_data
         if not d:
             return '<span size="small">Weather unavailable</span>'
+
+        arrow = {'up': ' ↑', 'down': ' ↓', 'flat': ' →'}
+        is_evening = time_module.localtime().tm_hour >= WEATHER_EVENING_HOUR
+
+        if is_evening:
+            parts = []
+            if d.get('tomorrow_max_temp') is not None and d.get('tomorrow_min_temp') is not None:
+                parts.append(f"Tomorrow {d['tomorrow_max_temp']:.0f}°/{d['tomorrow_min_temp']:.0f}°C")
+            rain_prob = d.get('tomorrow_rain_prob')
+            if rain_prob is not None and rain_prob > 0:
+                parts.append(f"🌧 {rain_prob:.0f}%")
+            text = "   ·   ".join(parts) if parts else "Weather unavailable"
+            return f'<span size="small"><b>{GLib.markup_escape_text(text)}</b></span>'
+
         parts = []
         if d.get('temp') is not None:
-            parts.append(f"{d['temp']:.0f}°C")
+            t = f"{d['temp']:.0f}°C" + arrow.get(d.get('temp_trend'), '')
+            parts.append(t)
+        if d.get('today_max_temp') is not None:
+            parts.append(f"High {d['today_max_temp']:.0f}°C")
+        if d.get('today_min_temp') is not None:
+            parts.append(f"Night {d['today_min_temp']:.0f}°C")
         if d.get('wind') is not None:
-            parts.append(f"Wind {d['wind']:.0f} km/h")
-        if d.get('precip_prob') is not None:
-            parts.append(f"Rain {d['precip_prob']:.0f}%")
-        elif d.get('precip') is not None:
-            parts.append(f"Rain {d['precip']:.1f} mm")
-        if d.get('night_temp') is not None:
-            parts.append(f"Night {d['night_temp']:.0f}°C")
+            w = f"Wind {d['wind']:.0f}" + arrow.get(d.get('wind_trend'), '') + " km/h"
+            parts.append(w)
+        if d.get('today_rain_prob') is not None:
+            parts.append(f"Rain {d['today_rain_prob']:.0f}%")
         text = "   ·   ".join(parts) if parts else "Weather unavailable"
         return f'<span size="small"><b>{GLib.markup_escape_text(text)}</b></span>'
 
@@ -768,13 +808,7 @@ class RssTray:
                     is_first=(not unread), clickable=False, install_all=True
                 ))
                 for entry in available[:MAX_LIST_ITEMS]:
-                    row_entry = {
-                        'id': entry['id'],
-                        'title': entry['title'],
-                        'link': entry.get('link', ''),
-                        'pkg_match': entry['pkgname'],
-                    }
-                    self.listbox.add(self.build_row(row_entry))
+                    self.listbox.add(self.build_info_row(entry))
                 if len(available) > MAX_LIST_ITEMS:
                     row = Gtk.ListBoxRow()
                     row.set_selectable(False)
@@ -811,6 +845,37 @@ class RssTray:
         sep.set_hexpand(True)
         box.pack_start(sep, False, False, 0)
 
+        row.add(box)
+        return row
+
+    def build_info_row(self, entry):
+        """Purely informational row: no mark-as-read button, no click action.
+        Used for 'Updates available' entries — install is only ever triggered
+        via the section header (install all), never per-row."""
+        row = Gtk.ListBoxRow()
+        row.set_selectable(False)
+        row.set_activatable(False)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
+        box.set_margin_start(3)
+        box.set_margin_end(3)
+        box.set_margin_top(0)
+        box.set_margin_bottom(0)
+
+        full_title = entry['title']
+        truncated = len(full_title) > MAX_TITLE_LEN
+        title = full_title[:MAX_TITLE_LEN - 1] + '…' if truncated else full_title
+        text = GLib.markup_escape_text(title)
+        label = Gtk.Label()
+        label.set_markup(f'<span foreground="#000000"><b>{text}</b></span>')
+        label.set_xalign(0)
+        label.set_ellipsize(Pango.EllipsizeMode.END)
+        label.set_hexpand(True)
+        if truncated:
+            label.set_tooltip_text(full_title)
+            row.set_tooltip_text(full_title)
+
+        box.pack_start(label, True, True, 0)
         row.add(box)
         return row
 
