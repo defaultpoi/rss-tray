@@ -396,12 +396,12 @@ class RssTray:
                     continue
                 seen_ids.add(eid)
                 newly_seen_ids.add(eid)
-                age = entry_age_seconds(entry)
-                if age is not None and age > MAX_ITEM_AGE_SECONDS:
-                    continue  # too old — mark as seen, don't surface
                 title = entry.get('title', '(untitled)')
                 if is_muted(title, mute_phrases):
                     continue  # matches mute.conf — mark as seen, don't surface
+                # Package matches bypass the age filter entirely: a template bump
+                # needs durable tracking until a build actually gets published,
+                # which can take well over 24h, unlike ordinary news items.
                 pkg_match = find_installed_match(title) if is_pkgfeed else None
                 if pkg_match:
                     if pkg_match in known_pkgnames:
@@ -415,6 +415,9 @@ class RssTray:
                         'pkgname': pkg_match,
                     })
                 else:
+                    age = entry_age_seconds(entry)
+                    if age is not None and age > MAX_ITEM_AGE_SECONDS:
+                        continue  # too old — mark as seen, don't surface
                     new_items.append({
                         'id': eid,
                         'title': title,
