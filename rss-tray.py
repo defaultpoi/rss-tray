@@ -22,6 +22,7 @@ import hashlib
 import calendar
 import time as time_module
 import urllib.request
+import math
 
 socket.setdefaulttimeout(15)  # avoid feed fetches hanging indefinitely on slow/broken servers
 
@@ -304,6 +305,9 @@ class RssTray:
         self.scroller = None
         self.weather_data = None
         self.weather_label = None
+        self.active_installs = 0
+        self._spin_angle = 0
+        self._spin_timeout_id = None
 
         self._apply_compact_css()
 
@@ -498,10 +502,31 @@ class RssTray:
         with self.lock:
             return bool(self.state.get('available_updates'))
 
+    def _begin_install(self):
+        self.active_installs += 1
+        if self.active_installs == 1:
+            self._spin_angle = 0
+            self._spin_timeout_id = GLib.timeout_add(120, self._spin_tick)
+        self.update_icon()
+
+    def _end_install(self):
+        self.active_installs = max(0, self.active_installs - 1)
+        if self.active_installs == 0 and self._spin_timeout_id is not None:
+            GLib.source_remove(self._spin_timeout_id)
+            self._spin_timeout_id = None
+        self.update_icon()
+
+    def _spin_tick(self):
+        self._spin_angle = (self._spin_angle + 30) % 360
+        self.update_icon()
+        return self.active_installs > 0  # keep repeating while any install is running
+
     def update_icon(self):
         count = self.total_badge_count()
         self.status_icon.set_from_pixbuf(self.render_icon(count))
-        if self.has_pkg_update():
+        if self.active_installs > 0:
+            tooltip = "Installing package update(s)…"
+        elif self.has_pkg_update():
             tooltip = f"{count} unread — package update available"
         elif count:
             tooltip = f"{count} unread"
@@ -514,6 +539,19 @@ class RssTray:
         size = 24
         surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
         ctx = cairo.Context(surface)
+        if self.active_installs > 0:
+            ctx.set_source_rgba(0.25, 0.45, 0.85, 1)  # blue: working
+            ctx.arc(size / 2, size / 2, size / 2 - 1, 0, 2 * 3.14159265)
+            ctx.fill()
+            ctx.set_source_rgba(1, 1, 1, 1)
+            ctx.set_line_width(2.5)
+            ctx.set_line_cap(cairo.LINE_CAP_ROUND)
+            start = math.radians(self._spin_angle)
+            end = start + math.radians(270)
+            ctx.arc(size / 2, size / 2, size / 2 - 5, start, end)
+            ctx.stroke()
+            surface.flush()
+            return Gdk.pixbuf_get_from_surface(surface, 0, 0, size, size)
         if self.has_pkg_update():
             ctx.set_source_rgba(0.82, 0.18, 0.18, 1)   # red: update available
         elif count > 0:
@@ -788,10 +826,6 @@ class RssTray:
         box.set_margin_top(0)
         box.set_margin_bottom(0)
 
-        if row.pkg_match:
-            img = Gtk.Image.new_from_icon_name('software-update-available-symbolic', Gtk.IconSize.SMALL_TOOLBAR)
-            box.pack_start(img, False, False, 0)
-
         mark_btn = Gtk.Button()
         mark_btn.set_relief(Gtk.ReliefStyle.NONE)
         mark_icon = Gtk.Image.new_from_icon_name('mail-mark-read-symbolic', Gtk.IconSize.MENU)
@@ -852,6 +886,7 @@ class RssTray:
         return response == Gtk.ResponseType.YES
 
     def start_update(self, item_id, pkgname):
+        self._begin_install()
         threading.Thread(target=self._run_update, args=(item_id, pkgname), daemon=True).start()
 
     def _run_update(self, item_id, pkgname):
@@ -872,6 +907,7 @@ class RssTray:
         GLib.idle_add(self._on_update_finished, item_id, pkgname, before, after, returncode, output)
 
     def _on_update_finished(self, item_id, pkgname, before, after, returncode, output):
+        self._end_install()
         updated = bool(before and after and before != after)
         if updated:
             self._remove_available_update(item_id)
@@ -908,6 +944,7 @@ class RssTray:
             pkgnames = [e['pkgname'] for e in self.state.get('available_updates', [])]
         if not pkgnames:
             return
+        self._begin_install()
         threading.Thread(target=self._run_update_all, args=(pkgnames,), daemon=True).start()
 
     def _run_update_all(self, pkgnames):
@@ -927,6 +964,7 @@ class RssTray:
         GLib.idle_add(self._on_update_all_finished, remaining)
 
     def _on_update_all_finished(self, remaining):
+        self._end_install()
         with self.lock:
             self.state['available_updates'] = [
                 e for e in self.state.get('available_updates', []) if e['pkgname'] in remaining
