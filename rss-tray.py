@@ -40,7 +40,7 @@ PRIVILEGE_CMD = ['sudo']  # change to ['doas'] if that's what you use; requires 
                           # passwordless (NOPASSWD) rule for xbps-install, since
                           # updates now run headlessly with no terminal/tty attached
 WINDOW_WIDTH = 456  # 380 * 1.2
-UPDATE_TIMEOUT_SECONDS = 300
+UPDATE_TIMEOUT_SECONDS = 1800  # 30 minutes
 NOTIFICATION_SOUND_CANDIDATES = [
     os.path.join(CONFIG_DIR, 'notification.wav'),  # QuiteRSS's notification sound, if present
     '/usr/share/sounds/alsa/Front_Center.wav',      # fallback if the above is missing
@@ -855,16 +855,20 @@ class RssTray:
         threading.Thread(target=self._run_update, args=(item_id, pkgname), daemon=True).start()
 
     def _run_update(self, item_id, pkgname):
-        before = get_installed_version(pkgname)
-        cmd = PRIVILEGE_CMD + ['xbps-install', '-Su', '-y', pkgname]
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=UPDATE_TIMEOUT_SECONDS)
-            output = (result.stdout or '') + (result.stderr or '')
-            returncode = result.returncode
-        except Exception as e:
-            output = str(e)
-            returncode = -1
-        after = get_installed_version(pkgname)
+        self._check_lock.acquire()  # block until any in-flight scan finishes, and hold
+        try:                        # it so no scan can start mid-install either
+            before = get_installed_version(pkgname)
+            cmd = PRIVILEGE_CMD + ['xbps-install', '-Su', '-y', pkgname]
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=UPDATE_TIMEOUT_SECONDS)
+                output = (result.stdout or '') + (result.stderr or '')
+                returncode = result.returncode
+            except Exception as e:
+                output = str(e)
+                returncode = -1
+            after = get_installed_version(pkgname)
+        finally:
+            self._check_lock.release()
         GLib.idle_add(self._on_update_finished, item_id, pkgname, before, after, returncode, output)
 
     def _on_update_finished(self, item_id, pkgname, before, after, returncode, output):
@@ -907,15 +911,19 @@ class RssTray:
         threading.Thread(target=self._run_update_all, args=(pkgnames,), daemon=True).start()
 
     def _run_update_all(self, pkgnames):
-        cmd = PRIVILEGE_CMD + ['xbps-install', '-Su', '-y']
+        self._check_lock.acquire()
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=UPDATE_TIMEOUT_SECONDS)
-            output = (result.stdout or '') + (result.stderr or '')
-        except Exception as e:
-            output = str(e)
-        if output.strip():
-            print(output.strip())  # visible if run in a terminal; harmless otherwise
-        remaining = set(list_all_updates())
+            cmd = PRIVILEGE_CMD + ['xbps-install', '-Su', '-y']
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=UPDATE_TIMEOUT_SECONDS)
+                output = (result.stdout or '') + (result.stderr or '')
+            except Exception as e:
+                output = str(e)
+            if output.strip():
+                print(output.strip())  # visible if run in a terminal; harmless otherwise
+            remaining = set(list_all_updates())
+        finally:
+            self._check_lock.release()
         GLib.idle_add(self._on_update_all_finished, remaining)
 
     def _on_update_all_finished(self, remaining):
