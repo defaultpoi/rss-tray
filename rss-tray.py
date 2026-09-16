@@ -54,7 +54,7 @@ WEATHER_API_URL = (
     "&current=temperature_2m,wind_speed_10m"
     "&hourly=wind_speed_10m"
     "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max"
-    "&forecast_days=7&timezone=auto"
+    "&forecast_days=6&timezone=auto"
 )
 WEATHER_REFRESH_SECONDS = 1800  # 30 minutes
 
@@ -276,7 +276,7 @@ def fetch_weather():
         daily_rain_prob = daily.get('precipitation_probability_max', [])
 
         forecast_days = []
-        for i in range(1, 7):
+        for i in range(1, 6):
             if i < len(daily_max) and i < len(daily_min):
                 forecast_days.append({
                     'max_temp': daily_max[i],
@@ -537,7 +537,7 @@ class RssTray:
             self.weather_box.pack_start(label, True, True, 0)
             fwd_btn = Gtk.Button(label='›')
             fwd_btn.set_relief(Gtk.ReliefStyle.NONE)
-            fwd_btn.set_tooltip_text('Show 6-day forecast')
+            fwd_btn.set_tooltip_text('Show 5-day forecast')
             fwd_btn.connect('clicked', self.on_weather_arrow_clicked, 'forecast')
             self.weather_box.pack_start(fwd_btn, False, False, 0)
 
