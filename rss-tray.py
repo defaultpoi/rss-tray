@@ -727,7 +727,7 @@ class RssTray:
             if available:
                 self.listbox.add(self.build_header_row(
                     '__updates__', 'Updates available',
-                    is_first=(not unread), clickable=False
+                    is_first=(not unread), clickable=False, install_all=True
                 ))
                 for entry in available[:MAX_LIST_ITEMS]:
                     row_entry = {
@@ -746,11 +746,14 @@ class RssTray:
                     self.listbox.add(row)
         self.listbox.show_all()
 
-    def build_header_row(self, feed_url, feed_name, is_first=False, clickable=True):
+    def build_header_row(self, feed_url, feed_name, is_first=False, clickable=True, install_all=False):
         row = Gtk.ListBoxRow()
         row.set_selectable(False)
-        row.set_activatable(clickable)
-        if clickable:
+        row.set_activatable(clickable or install_all)
+        if install_all:
+            row.install_all_header = True
+            row.set_tooltip_text("Install all available updates")
+        elif clickable:
             row.header_feed_url = feed_url
             row.set_tooltip_text(f"Mark all '{feed_name}' items as read")
 
@@ -896,7 +899,81 @@ class RssTray:
         self.refresh_list()
         return False
 
+    def _confirm_update_all(self, pkgnames):
+        dialog = Gtk.MessageDialog(
+            transient_for=self.popup,
+            flags=0,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.YES_NO,
+            text=f"Install all {len(pkgnames)} available update(s)?",
+        )
+        dialog.format_secondary_text(", ".join(pkgnames))
+        response = dialog.run()
+        dialog.destroy()
+        return response == Gtk.ResponseType.YES
+
+    def install_all_updates(self):
+        with self.lock:
+            pkgnames = [e['pkgname'] for e in self.state.get('available_updates', [])]
+        if not pkgnames:
+            return
+        if not self._confirm_update_all(pkgnames):
+            return
+        threading.Thread(target=self._run_update_all, args=(pkgnames,), daemon=True).start()
+
+    def _run_update_all(self, pkgnames):
+        cmd = PRIVILEGE_CMD + ['xbps-install', '-Su']
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=UPDATE_TIMEOUT_SECONDS)
+            output = (result.stdout or '') + (result.stderr or '')
+            returncode = result.returncode
+        except Exception as e:
+            output = str(e)
+            returncode = -1
+        remaining = set(list_all_updates())
+        GLib.idle_add(self._on_update_all_finished, pkgnames, remaining, returncode, output)
+
+    def _on_update_all_finished(self, pkgnames, remaining, returncode, output):
+        installed = [p for p in pkgnames if p not in remaining]
+        with self.lock:
+            self.state['available_updates'] = [
+                e for e in self.state.get('available_updates', []) if e['pkgname'] in remaining
+            ]
+            save_state(self.state)
+
+        if installed and not remaining:
+            summary = f"Installed all {len(installed)} update(s)."
+            msg_type = Gtk.MessageType.INFO
+        elif installed:
+            summary = f"Installed {len(installed)} of {len(pkgnames)} update(s); {len(remaining)} still pending."
+            msg_type = Gtk.MessageType.WARNING
+        else:
+            summary = f"No updates were installed (exit code {returncode})."
+            msg_type = Gtk.MessageType.WARNING
+
+        dialog = Gtk.MessageDialog(
+            transient_for=self.popup,
+            flags=0,
+            message_type=msg_type,
+            buttons=Gtk.ButtonsType.OK,
+            text=summary,
+        )
+        trimmed_output = output.strip()
+        if trimmed_output:
+            if len(trimmed_output) > 2000:
+                trimmed_output = trimmed_output[-2000:]
+            dialog.format_secondary_text(trimmed_output)
+        dialog.run()
+        dialog.destroy()
+
+        self.update_icon()
+        self.refresh_list()
+        return False
+
     def on_row_activated(self, _listbox, row):
+        if getattr(row, 'install_all_header', False):
+            self.install_all_updates()
+            return
         if hasattr(row, 'header_feed_url'):
             self.mark_feed_read(row.header_feed_url)
             return
