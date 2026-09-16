@@ -517,7 +517,11 @@ class RssTray:
         label = Gtk.Label()
         label.set_xalign(0.5)
         label.set_hexpand(True)
-        label.set_line_wrap(self.weather_view != 'forecast')
+        label.set_line_wrap(True)
+        # Cap the label's natural width so long forecast text wraps to a
+        # second line instead of forcing the whole popup wider than
+        # WINDOW_WIDTH (which was pushing the window off-screen).
+        label.set_max_width_chars(48)
         label.set_justify(Gtk.Justification.CENTER)
         self.weather_label = label
         self.update_weather_label()
