@@ -21,6 +21,7 @@ import webbrowser
 import hashlib
 import calendar
 import time as time_module
+import urllib.request
 
 socket.setdefaulttimeout(15)  # avoid feed fetches hanging indefinitely on slow/broken servers
 
@@ -44,6 +45,17 @@ NOTIFICATION_SOUND_CANDIDATES = [
     os.path.join(CONFIG_DIR, 'notification.wav'),  # QuiteRSS's notification sound, if present
     '/usr/share/sounds/alsa/Front_Center.wav',      # fallback if the above is missing
 ]
+WEATHER_LATITUDE = 45.361698
+WEATHER_LONGITUDE = 26.775255
+WEATHER_API_URL = (
+    "https://api.open-meteo.com/v1/forecast"
+    f"?latitude={WEATHER_LATITUDE}&longitude={WEATHER_LONGITUDE}"
+    "&current=temperature_2m,wind_speed_10m,precipitation"
+    "&hourly=temperature_2m,precipitation_probability,wind_speed_10m"
+    "&forecast_days=2&timezone=auto"
+)
+WEATHER_REFRESH_SECONDS = 1800  # 30 minutes
+WEATHER_NIGHT_WINDOW_HOURS = 15  # how far ahead to look for the night's low
 
 
 def ensure_config():
@@ -208,6 +220,42 @@ def repodata_has_update(pkgname):
     return False
 
 
+def fetch_weather():
+    """Best-effort fetch from Open-Meteo. Returns a dict or None on any failure."""
+    try:
+        with urllib.request.urlopen(WEATHER_API_URL, timeout=10) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+    except Exception:
+        return None
+    try:
+        current = data.get('current', {})
+        hourly = data.get('hourly', {})
+        times = hourly.get('time', [])
+        temps = hourly.get('temperature_2m', [])
+        probs = hourly.get('precipitation_probability', [])
+        current_time = current.get('time')
+
+        night_temp = None
+        precip_prob = None
+        if current_time in times:
+            idx = times.index(current_time)
+            window = [t for t in temps[idx:idx + WEATHER_NIGHT_WINDOW_HOURS] if t is not None]
+            if window:
+                night_temp = min(window)
+            if idx < len(probs):
+                precip_prob = probs[idx]
+
+        return {
+            'temp': current.get('temperature_2m'),
+            'wind': current.get('wind_speed_10m'),
+            'precip': current.get('precipitation'),
+            'precip_prob': precip_prob,
+            'night_temp': night_temp,
+        }
+    except Exception:
+        return None
+
+
 def play_notification_sound():
     """Best-effort: play a notification sound using whichever player is available.
     Silently does nothing if none are found."""
@@ -264,6 +312,8 @@ class RssTray:
         self.popup = None
         self.listbox = None
         self.scroller = None
+        self.weather_data = None
+        self.weather_label = None
 
         self._apply_compact_css()
 
@@ -275,6 +325,8 @@ class RssTray:
         GLib.timeout_add_seconds(1, self.initial_check)
         GLib.timeout_add_seconds(SCHEDULER_TICK_SECONDS, self.periodic_check)
         GLib.timeout_add(800, self.maybe_auto_show_startup)
+        GLib.timeout_add_seconds(2, self.initial_weather_check)
+        GLib.timeout_add_seconds(WEATHER_REFRESH_SECONDS, self.periodic_weather_check)
 
     def maybe_auto_show_startup(self):
         if self.has_anything_to_show():
@@ -420,6 +472,50 @@ class RssTray:
         self.show_popup(auto=True)  # auto-open whenever new unread items or updates arrive
         return False
 
+    def initial_weather_check(self):
+        self.start_weather_fetch()
+        return False
+
+    def periodic_weather_check(self):
+        self.start_weather_fetch()
+        return True
+
+    def start_weather_fetch(self):
+        threading.Thread(target=self._fetch_weather_bg, daemon=True).start()
+
+    def _fetch_weather_bg(self):
+        data = fetch_weather()
+        GLib.idle_add(self._on_weather_fetched, data)
+
+    def _on_weather_fetched(self, data):
+        if data is not None:
+            self.weather_data = data
+        self.update_weather_label()
+        return False
+
+    def format_weather_markup(self):
+        d = self.weather_data
+        if not d:
+            return '<span size="small">Weather unavailable</span>'
+        parts = []
+        if d.get('temp') is not None:
+            parts.append(f"{d['temp']:.0f}°C")
+        if d.get('wind') is not None:
+            parts.append(f"Wind {d['wind']:.0f} km/h")
+        if d.get('precip_prob') is not None:
+            parts.append(f"Rain {d['precip_prob']:.0f}%")
+        elif d.get('precip') is not None:
+            parts.append(f"Rain {d['precip']:.1f} mm")
+        if d.get('night_temp') is not None:
+            parts.append(f"Night {d['night_temp']:.0f}°C")
+        text = "   ·   ".join(parts) if parts else "Weather unavailable"
+        return f'<span size="small"><b>{GLib.markup_escape_text(text)}</b></span>'
+
+    def update_weather_label(self):
+        if self.weather_label is None:
+            return
+        self.weather_label.set_markup(self.format_weather_markup())
+
     def unread_count(self):
         with self.lock:
             return len(self.state.get('unread', []))
@@ -486,6 +582,7 @@ class RssTray:
         css = b"""
         list row { padding: 1px 3px; min-height: 0px; }
         button { padding: 1px; }
+        .weather-bar { background-color: #e8eef5; }
         """
         provider = Gtk.CssProvider()
         provider.load_from_data(css)
@@ -517,6 +614,21 @@ class RssTray:
         win.connect('key-press-event', self.on_popup_key)
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+
+        weather_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        weather_box.get_style_context().add_class('weather-bar')
+        weather_box.set_margin_start(6)
+        weather_box.set_margin_end(6)
+        weather_box.set_margin_top(4)
+        weather_box.set_margin_bottom(4)
+        weather_label = Gtk.Label()
+        weather_label.set_xalign(0.5)
+        weather_label.set_hexpand(True)
+        weather_box.pack_start(weather_label, True, True, 0)
+        self.weather_label = weather_label
+        self.update_weather_label()
+        outer.pack_start(weather_box, False, False, 0)
+        outer.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 0)
 
         scroller = Gtk.ScrolledWindow()
         scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
