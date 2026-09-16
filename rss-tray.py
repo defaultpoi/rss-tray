@@ -856,7 +856,7 @@ class RssTray:
 
     def _run_update(self, item_id, pkgname):
         before = get_installed_version(pkgname)
-        cmd = PRIVILEGE_CMD + ['xbps-install', '-Su', pkgname]
+        cmd = PRIVILEGE_CMD + ['xbps-install', '-Su', '-y', pkgname]
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=UPDATE_TIMEOUT_SECONDS)
             output = (result.stdout or '') + (result.stderr or '')
@@ -907,7 +907,7 @@ class RssTray:
         threading.Thread(target=self._run_update_all, args=(pkgnames,), daemon=True).start()
 
     def _run_update_all(self, pkgnames):
-        cmd = PRIVILEGE_CMD + ['xbps-install', '-Su']
+        cmd = PRIVILEGE_CMD + ['xbps-install', '-Su', '-y']
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=UPDATE_TIMEOUT_SECONDS)
             output = (result.stdout or '') + (result.stderr or '')
