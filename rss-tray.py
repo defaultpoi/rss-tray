@@ -765,7 +765,7 @@ class RssTray:
         try:
             ok, _screen, area, _orientation = self.status_icon.get_geometry()
             if ok and area is not None:
-                y = area.y + area.height  # flush against the bottom of the panel/tray icon
+                y = area.y + area.height + 1  # 1px below the panel/tray icon
         except Exception:
             pass
 
