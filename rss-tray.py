@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Minimal tray RSS/Atom reader with Void package-update detection."""
+"""Minimal tray RSS/Atom reader with system-wide Void package-update detection."""
 import gi
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, GLib, Gdk, Pango
@@ -31,7 +31,7 @@ MUTE_FILE = os.path.join(CONFIG_DIR, 'mute.conf')
 STATE_FILE = os.path.join(CONFIG_DIR, 'state.json')
 CHECK_INTERVAL = 600  # default per-feed interval (seconds) when none is set in feeds.conf
 SCHEDULER_TICK_SECONDS = 60  # how often we check whether any feed is due
-PENDING_CHECK_INTERVAL_SECONDS = 3600  # how often to check pending package matches against repodata
+PENDING_CHECK_INTERVAL_SECONDS = 3600  # how often to check for system-wide package updates
 MAX_LIST_ITEMS = 40
 MAX_TITLE_LEN = 60
 MAX_ITEM_AGE_SECONDS = 24 * 3600  # ignore entries older than this on first sight
@@ -63,14 +63,14 @@ def ensure_config():
     if not os.path.exists(FEEDS_FILE):
         with open(FEEDS_FILE, 'w') as f:
             f.write(
-                "# Format: URL|custom display name (optional)|check interval in minutes (optional)|pkgfeed flag (optional)\n"
+                "# Format: URL|custom display name (optional)|check interval in minutes (optional)\n"
                 "# All fields after the URL are optional but positional — leave a field empty\n"
-                "# to skip it while still setting a later one, e.g. URL||5|pkgfeed\n"
+                "# to skip it while still setting a later one, e.g. URL||5\n"
                 "# The interval overrides the default 10-minute check for that feed only.\n"
+                "# Package updates are detected system-wide automatically — no feed setup needed.\n"
                 "# https://example.com/feed.xml\n"
                 "# https://example.com/feed.xml|My Blog\n"
                 "# https://example.com/feed.xml|My Blog|5\n"
-                "# https://github.com/void-linux/void-packages/commits/master.atom|void-package|30|pkgfeed\n"
             )
     if not os.path.exists(MUTE_FILE):
         with open(MUTE_FILE, 'w') as f:
@@ -85,7 +85,9 @@ def ensure_config():
 
 
 def load_feeds():
-    """Returns list of (url, is_pkgfeed, custom_name, interval_seconds)."""
+    """Returns list of (url, custom_name, interval_seconds).
+    A trailing 4th field from older configs (the retired 'pkgfeed' flag) is
+    simply ignored if still present, so old feeds.conf files keep working."""
     feeds = []
     if os.path.exists(FEEDS_FILE):
         with open(FEEDS_FILE) as f:
@@ -102,8 +104,7 @@ def load_feeds():
                         interval_seconds = max(1, int(parts[2])) * 60
                     except ValueError:
                         pass
-                is_pkgfeed = len(parts) > 3 and parts[3].lower() == 'pkgfeed'
-                feeds.append((url, is_pkgfeed, custom_name, interval_seconds))
+                feeds.append((url, custom_name, interval_seconds))
     return feeds
 
 
@@ -162,31 +163,6 @@ def entry_age_seconds(entry):
         return None
 
 
-def extract_candidate_pkgnames(title):
-    if ':' not in title:
-        return []
-    prefix = title.split(':', 1)[0].strip()
-    if prefix.lower() in ('new package', 'removed package', 'srcpkgs'):
-        return []
-    return [p.strip() for p in prefix.split(',') if p.strip() and ' ' not in p.strip()]
-
-
-def find_installed_match(title):
-    for name in extract_candidate_pkgnames(title):
-        if not re.match(r'^[A-Za-z0-9._+-]+$', name):
-            continue
-        try:
-            result = subprocess.run(
-                ['xbps-query', name],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5
-            )
-            if result.returncode == 0:
-                return name
-        except Exception:
-            continue
-    return None
-
-
 def get_installed_version(pkgname):
     try:
         result = subprocess.run(
@@ -200,74 +176,38 @@ def get_installed_version(pkgname):
     return None
 
 
-def repodata_has_update(pkgname):
-    """Read-only, in-memory dry run against the configured repos — no root needed,
-    nothing written to disk. Returns True only if a real newer build is published.
+def list_all_updates():
+    """Read-only, in-memory, system-wide dry run — no root needed, nothing written
+    to disk. Returns a list of pkgnames that have a real newer build published.
 
-    Real xbps-install -Mn -u output looks like:
+    Real xbps-install -Mn -u output (per package) looks like:
         cryptsetup-2.8.8_1 update x86_64 https://repo-default.voidlinux.org/current 3203607 568523
     i.e. "<pkgver> <action> <arch> <repo> <dlsize> <instsize>" — no '->' arrow."""
     try:
         result = subprocess.run(
-            ['xbps-install', '-Mn', '-u', pkgname],
-            capture_output=True, text=True, timeout=30
+            ['xbps-install', '-Mn', '-u'],
+            capture_output=True, text=True, timeout=60
         )
     except Exception:
-        return False
+        return []
     if result.returncode != 0:
-        return False
+        return []
     output = (result.stdout or '') + (result.stderr or '')
-    prefix = pkgname + '-'
+    updates = []
     for line in output.splitlines():
         line = line.strip()
         parts = line.split()
         if len(parts) < 2:
             continue
         pkgver_token, action = parts[0], parts[1]
-        if not pkgver_token.startswith(prefix):
+        if action != 'update':
             continue
-        rest = pkgver_token[len(prefix):]
-        # Guard against prefix collisions (e.g. "foo" matching "foo-bar-1.0_1") by
-        # requiring the character right after the name to start a version number.
-        if rest and rest[0].isdigit() and action == 'update':
-            return True
-    return False
-
-
-def fetch_weather():
-    """Best-effort fetch from Open-Meteo. Returns a dict or None on any failure."""
-    try:
-        with urllib.request.urlopen(WEATHER_API_URL, timeout=10) as resp:
-            data = json.loads(resp.read().decode('utf-8'))
-    except Exception:
-        return None
-    try:
-        current = data.get('current', {})
-        hourly = data.get('hourly', {})
-        times = hourly.get('time', [])
-        temps = hourly.get('temperature_2m', [])
-        probs = hourly.get('precipitation_probability', [])
-        current_time = current.get('time')
-
-        night_temp = None
-        precip_prob = None
-        if current_time in times:
-            idx = times.index(current_time)
-            window = [t for t in temps[idx:idx + WEATHER_NIGHT_WINDOW_HOURS] if t is not None]
-            if window:
-                night_temp = min(window)
-            if idx < len(probs):
-                precip_prob = probs[idx]
-
-        return {
-            'temp': current.get('temperature_2m'),
-            'wind': current.get('wind_speed_10m'),
-            'precip': current.get('precipitation'),
-            'precip_prob': precip_prob,
-            'night_temp': night_temp,
-        }
-    except Exception:
-        return None
+        # pkgver_token is "<pkgname>-<version>_<revision>"; strip the trailing
+        # "-<version>_<revision>" to recover the bare package name.
+        match = re.match(r'^(.+)-[0-9][^-]*$', pkgver_token)
+        if match:
+            updates.append(match.group(1))
+    return updates
 
 
 def play_notification_sound():
@@ -317,6 +257,42 @@ def edit_file_externally(path):
             print(f"Couldn't open an editor — edit manually: {path}")
 
 
+def fetch_weather():
+    """Best-effort fetch from Open-Meteo. Returns a dict or None on any failure."""
+    try:
+        with urllib.request.urlopen(WEATHER_API_URL, timeout=10) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+    except Exception:
+        return None
+    try:
+        current = data.get('current', {})
+        hourly = data.get('hourly', {})
+        times = hourly.get('time', [])
+        temps = hourly.get('temperature_2m', [])
+        probs = hourly.get('precipitation_probability', [])
+        current_time = current.get('time')
+
+        night_temp = None
+        precip_prob = None
+        if current_time in times:
+            idx = times.index(current_time)
+            window = [t for t in temps[idx:idx + WEATHER_NIGHT_WINDOW_HOURS] if t is not None]
+            if window:
+                night_temp = min(window)
+            if idx < len(probs):
+                precip_prob = probs[idx]
+
+        return {
+            'temp': current.get('temperature_2m'),
+            'wind': current.get('wind_speed_10m'),
+            'precip': current.get('precipitation'),
+            'precip_prob': precip_prob,
+            'night_temp': night_temp,
+        }
+    except Exception:
+        return None
+
+
 class RssTray:
     def __init__(self):
         ensure_config()
@@ -363,7 +339,7 @@ class RssTray:
     def _check_feeds_guarded(self, force):
         try:
             self.check_feeds(force)
-            self.check_pending_updates_if_due(force=force)
+            self.check_updates_if_due(force=force)
         finally:
             self._check_lock.release()
 
@@ -371,20 +347,17 @@ class RssTray:
         feeds = load_feeds()
         mute_phrases = load_mute_filters()
         new_items = []
-        new_pending = []
         now = time_module.time()
         with self.lock:
             seen_ids = set(self.state.get('seen', {}).keys())
             last_checked = dict(self.state.get('last_checked', {}))
-            known_pkgnames = {e['pkgname'] for e in self.state.get('pending_updates', [])} | \
-                              {e['pkgname'] for e in self.state.get('available_updates', [])}
         newly_seen_ids = set()
         due_urls = []
-        for url, is_pkgfeed, _custom_name, interval_seconds in feeds:
+        for url, _custom_name, interval_seconds in feeds:
             last = last_checked.get(url, 0)
             if force or (now - last) >= interval_seconds:
-                due_urls.append((url, is_pkgfeed))
-        for url, is_pkgfeed in due_urls:
+                due_urls.append(url)
+        for url in due_urls:
             try:
                 parsed = feedparser.parse(url)
             except Exception:
@@ -399,32 +372,16 @@ class RssTray:
                 title = entry.get('title', '(untitled)')
                 if is_muted(title, mute_phrases):
                     continue  # matches mute.conf — mark as seen, don't surface
-                # Package matches bypass the age filter entirely: a template bump
-                # needs durable tracking until a build actually gets published,
-                # which can take well over 24h, unlike ordinary news items.
-                pkg_match = find_installed_match(title) if is_pkgfeed else None
-                if pkg_match:
-                    if pkg_match in known_pkgnames:
-                        continue  # already tracking this package
-                    known_pkgnames.add(pkg_match)
-                    new_pending.append({
-                        'id': eid,
-                        'title': title,
-                        'link': entry.get('link', ''),
-                        'feed_url': url,
-                        'pkgname': pkg_match,
-                    })
-                else:
-                    age = entry_age_seconds(entry)
-                    if age is not None and age > MAX_ITEM_AGE_SECONDS:
-                        continue  # too old — mark as seen, don't surface
-                    new_items.append({
-                        'id': eid,
-                        'title': title,
-                        'link': entry.get('link', ''),
-                        'feed_url': url,
-                        'pkg_match': None,
-                    })
+                age = entry_age_seconds(entry)
+                if age is not None and age > MAX_ITEM_AGE_SECONDS:
+                    continue  # too old — mark as seen, don't surface
+                new_items.append({
+                    'id': eid,
+                    'title': title,
+                    'link': entry.get('link', ''),
+                    'feed_url': url,
+                    'pkg_match': None,
+                })
         with self.lock:
             merged_seen = dict(self.state.get('seen', {}))
             for eid in newly_seen_ids:
@@ -438,12 +395,6 @@ class RssTray:
             self.state['seen'] = merged_seen
             self.state['last_checked'] = merged_last_checked
 
-            if new_pending:
-                existing_pending_ids = {e['id'] for e in self.state.get('pending_updates', [])}
-                new_pending = [e for e in new_pending if e['id'] not in existing_pending_ids]
-                if new_pending:
-                    self.state['pending_updates'] = new_pending + self.state.get('pending_updates', [])
-
             if new_items:
                 existing_ids = {e['id'] for e in self.state.get('unread', [])}
                 new_items = [e for e in new_items if e['id'] not in existing_ids]
@@ -453,34 +404,32 @@ class RssTray:
         if new_items:
             GLib.idle_add(self.on_new_items)
 
-    def check_pending_updates_if_due(self, force=False):
+    def check_updates_if_due(self, force=False):
         now = time_module.time()
         with self.lock:
-            last = self.state.get('pending_last_checked', 0)
-            pending = list(self.state.get('pending_updates', []))
-        if not pending:
-            with self.lock:
-                self.state['pending_last_checked'] = now
-                save_state(self.state)
-            return
+            last = self.state.get('updates_last_checked', 0)
         if not force and (now - last) < PENDING_CHECK_INTERVAL_SECONDS:
             return
-        promoted = []
-        still_pending = []
-        for item in pending:
-            if repodata_has_update(item['pkgname']):
-                promoted.append(item)
-            else:
-                still_pending.append(item)
+        pkgnames = list_all_updates()
         with self.lock:
-            self.state['pending_updates'] = still_pending
-            if promoted:
-                existing_ids = {e['id'] for e in self.state.get('available_updates', [])}
-                new_avail = [p for p in promoted if p['id'] not in existing_ids]
-                self.state['available_updates'] = new_avail + self.state.get('available_updates', [])
-            self.state['pending_last_checked'] = now
+            existing = {e['pkgname']: e for e in self.state.get('available_updates', [])}
+            promoted_new = []
+            for pkgname in pkgnames:
+                if pkgname not in existing:
+                    entry = {
+                        'id': hashlib.sha1(f"update:{pkgname}".encode()).hexdigest(),
+                        'title': f"Update available for {pkgname}",
+                        'link': '',
+                        'pkgname': pkgname,
+                    }
+                    existing[pkgname] = entry
+                    promoted_new.append(entry)
+            # Drop entries for packages that no longer have a pending update
+            # (e.g. installed via another tool, or the repo changed).
+            self.state['available_updates'] = [existing[p] for p in pkgnames if p in existing]
+            self.state['updates_last_checked'] = now
             save_state(self.state)
-        if promoted:
+        if promoted_new:
             GLib.idle_add(self.on_new_items)  # reuse: sound + auto-popup + icon refresh
 
     def on_new_items(self):
@@ -588,7 +537,7 @@ class RssTray:
     def feed_name_for(self, url, feeds_map=None):
         if feeds_map is not None:
             return feeds_map.get(url, url)
-        for feed_url, _is_pkgfeed, custom_name, _interval in load_feeds():
+        for feed_url, custom_name, _interval in load_feeds():
             if feed_url == url:
                 return custom_name or feed_url
         return url
@@ -736,7 +685,7 @@ class RssTray:
             unread = list(self.state.get('unread', []))
             available = list(self.state.get('available_updates', []))
 
-        feeds_map = {url: (custom_name or url) for url, _is_pkgfeed, custom_name, _interval in load_feeds()}
+        feeds_map = {url: (custom_name or url) for url, custom_name, _interval in load_feeds()}
 
         if not unread and not available:
             row = Gtk.ListBoxRow()
