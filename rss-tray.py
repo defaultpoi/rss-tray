@@ -311,6 +311,7 @@ class RssTray:
         self.weather_box = None
         self.weather_view = 'today'
         self.active_installs = 0
+        self.install_status = {}  # pkgname -> 'Waiting…'/'Downloading…'/'Installing…'/'Done'/'Failed' 
 
         self._apply_compact_css()
 
@@ -797,7 +798,7 @@ class RssTray:
                     is_first=(not unread), clickable=False, install_all=True
                 ))
                 for entry in available[:MAX_LIST_ITEMS]:
-                    self.listbox.add(self.build_info_row(entry, installing=(self.active_installs > 0)))
+                    self.listbox.add(self.build_info_row(entry))
                 if len(available) > MAX_LIST_ITEMS:
                     row = Gtk.ListBoxRow()
                     row.set_selectable(False)
@@ -837,7 +838,7 @@ class RssTray:
         row.add(box)
         return row
 
-    def build_info_row(self, entry, installing=False):
+    def build_info_row(self, entry):
         """Purely informational row: no mark-as-read button, no click action.
         Used for 'Updates available' entries — install is only ever triggered
         via the section header (install all), never per-row."""
@@ -851,10 +852,13 @@ class RssTray:
         box.set_margin_top(0)
         box.set_margin_bottom(0)
 
-        if installing:
-            spinner = Gtk.Spinner()
-            spinner.start()
-            box.pack_start(spinner, False, False, 0)
+        status = self.install_status.get(entry.get('pkgname'))
+        if status:
+            status_label = Gtk.Label()
+            status_label.set_markup(
+                f'<span foreground="#2b5fad"><i>{GLib.markup_escape_text(status)}</i></span>'
+            )
+            box.pack_start(status_label, False, False, 0)
 
         full_title = entry['title']
         truncated = len(full_title) > MAX_TITLE_LEN
@@ -922,36 +926,67 @@ class RssTray:
             save_state(self.state)
 
     def install_all_updates(self):
+        if self.active_installs > 0:
+            return  # already running
         with self.lock:
             pkgnames = [e['pkgname'] for e in self.state.get('available_updates', [])]
         if not pkgnames:
             return
+        self.install_status = {pkg: 'Waiting…' for pkg in pkgnames}
         self._begin_install()
         threading.Thread(target=self._run_update_all, args=(pkgnames,), daemon=True).start()
 
-    def _run_update_all(self, pkgnames):
-        with self._xbps_lock:
-            cmd = PRIVILEGE_CMD + ['xbps-install', '-Su', '-y']
-            try:
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=UPDATE_TIMEOUT_SECONDS)
-                output = (result.stdout or '') + (result.stderr or '')
-            except Exception as e:
-                output = str(e)
-            if output.strip():
-                print(output.strip())  # visible if run in a terminal; harmless otherwise
-            remaining = set(list_all_updates())
-        GLib.idle_add(self._on_update_all_finished, remaining)
+    def _set_status(self, pkgname, status):
+        GLib.idle_add(self._apply_status, pkgname, status)
 
-    def _on_update_all_finished(self, remaining):
-        self._end_install()
+    def _apply_status(self, pkgname, status):
+        self.install_status[pkgname] = status
+        self.refresh_list()
+        return False
+
+    def _finalize_package_removal(self, pkgname):
         with self.lock:
             self.state['available_updates'] = [
-                e for e in self.state.get('available_updates', []) if e['pkgname'] in remaining
+                e for e in self.state.get('available_updates', []) if e['pkgname'] != pkgname
             ]
             save_state(self.state)
+        self.install_status.pop(pkgname, None)
         self.update_icon()
         self.refresh_list()
         return False
+
+    def _run_update_all(self, pkgnames):
+        with self._xbps_lock:
+            for pkgname in pkgnames:
+                self._set_status(pkgname, 'Installing…')
+                before = get_installed_version(pkgname)
+                cmd = PRIVILEGE_CMD + ['xbps-install', '-Su', '-y', pkgname]
+                returncode = -1
+                try:
+                    proc = subprocess.Popen(
+                        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        text=True, bufsize=1
+                    )
+                    name_lower = pkgname.lower()
+                    for line in proc.stdout:
+                        ll = line.lower()
+                        if name_lower in ll:
+                            if 'download' in ll:
+                                self._set_status(pkgname, 'Downloading…')
+                            elif any(k in ll for k in ('unpack', 'configur', 'install')):
+                                self._set_status(pkgname, 'Installing…')
+                    proc.wait(timeout=UPDATE_TIMEOUT_SECONDS)
+                    returncode = proc.returncode
+                except Exception:
+                    pass
+                after = get_installed_version(pkgname)
+                success = returncode == 0 and before != after
+                if success:
+                    self._set_status(pkgname, 'Done')
+                    GLib.timeout_add(1200, self._finalize_package_removal, pkgname)
+                else:
+                    self._set_status(pkgname, 'Failed')
+        GLib.idle_add(self._end_install)
 
     def on_row_activated(self, _listbox, row):
         if getattr(row, 'install_all_header', False):
