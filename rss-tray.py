@@ -22,7 +22,6 @@ import hashlib
 import calendar
 import time as time_module
 import urllib.request
-import math
 
 socket.setdefaulttimeout(15)  # avoid feed fetches hanging indefinitely on slow/broken servers
 
@@ -302,7 +301,8 @@ class RssTray:
         ensure_config()
         self.state = load_state()
         self.lock = threading.Lock()
-        self._check_lock = threading.Lock()  # prevents overlapping check/install cycles
+        self._check_lock = threading.Lock()  # guards overlapping feed-check cycles only
+        self._xbps_lock = threading.Lock()   # guards xbps db access (scans + installs), separately
         self.popup = None
         self.listbox = None
         self.scroller = None
@@ -311,8 +311,6 @@ class RssTray:
         self.weather_box = None
         self.weather_view = 'today'
         self.active_installs = 0
-        self._spin_angle = 0
-        self._spin_timeout_id = None
 
         self._apply_compact_css()
 
@@ -419,7 +417,8 @@ class RssTray:
             last = self.state.get('updates_last_checked', 0)
         if not force and (now - last) < PENDING_CHECK_INTERVAL_SECONDS:
             return
-        pkgnames = list_all_updates()
+        with self._xbps_lock:
+            pkgnames = list_all_updates()
         with self.lock:
             existing = {e['pkgname']: e for e in self.state.get('available_updates', [])}
             promoted_new = []
@@ -549,29 +548,17 @@ class RssTray:
 
     def _begin_install(self):
         self.active_installs += 1
-        if self.active_installs == 1:
-            self._spin_angle = 0
-            self._spin_timeout_id = GLib.timeout_add(120, self._spin_tick)
         self.update_icon()
+        self.refresh_list()  # show per-row spinners under "Updates available"
 
     def _end_install(self):
         self.active_installs = max(0, self.active_installs - 1)
-        if self.active_installs == 0 and self._spin_timeout_id is not None:
-            GLib.source_remove(self._spin_timeout_id)
-            self._spin_timeout_id = None
         self.update_icon()
-
-    def _spin_tick(self):
-        self._spin_angle = (self._spin_angle + 30) % 360
-        self.update_icon()
-        return self.active_installs > 0
 
     def update_icon(self):
         count = self.total_badge_count()
         self.status_icon.set_from_pixbuf(self.render_icon(count))
-        if self.active_installs > 0:
-            tooltip = "Installing package update(s)…"
-        elif self.has_pkg_update():
+        if self.has_pkg_update():
             tooltip = f"{count} unread — package update available"
         elif count:
             tooltip = f"{count} unread"
@@ -600,19 +587,6 @@ class RssTray:
         size = 24
         surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
         ctx = cairo.Context(surface)
-        if self.active_installs > 0:
-            ctx.set_source_rgba(0.25, 0.45, 0.85, 1)  # blue: working
-            ctx.arc(size / 2, size / 2, size / 2 - 1, 0, 2 * 3.14159265)
-            ctx.fill()
-            ctx.set_source_rgba(1, 1, 1, 1)
-            ctx.set_line_width(2.5)
-            ctx.set_line_cap(cairo.LINE_CAP_ROUND)
-            start = math.radians(self._spin_angle)
-            end = start + math.radians(270)
-            ctx.arc(size / 2, size / 2, size / 2 - 5, start, end)
-            ctx.stroke()
-            surface.flush()
-            return Gdk.pixbuf_get_from_surface(surface, 0, 0, size, size)
         if self.has_pkg_update():
             ctx.set_source_rgba(0.82, 0.18, 0.18, 1)   # red: update available
         elif count > 0:
@@ -823,7 +797,7 @@ class RssTray:
                     is_first=(not unread), clickable=False, install_all=True
                 ))
                 for entry in available[:MAX_LIST_ITEMS]:
-                    self.listbox.add(self.build_info_row(entry))
+                    self.listbox.add(self.build_info_row(entry, installing=(self.active_installs > 0)))
                 if len(available) > MAX_LIST_ITEMS:
                     row = Gtk.ListBoxRow()
                     row.set_selectable(False)
@@ -863,7 +837,7 @@ class RssTray:
         row.add(box)
         return row
 
-    def build_info_row(self, entry):
+    def build_info_row(self, entry, installing=False):
         """Purely informational row: no mark-as-read button, no click action.
         Used for 'Updates available' entries — install is only ever triggered
         via the section header (install all), never per-row."""
@@ -876,6 +850,11 @@ class RssTray:
         box.set_margin_end(3)
         box.set_margin_top(0)
         box.set_margin_bottom(0)
+
+        if installing:
+            spinner = Gtk.Spinner()
+            spinner.start()
+            box.pack_start(spinner, False, False, 0)
 
         full_title = entry['title']
         truncated = len(full_title) > MAX_TITLE_LEN
@@ -898,7 +877,6 @@ class RssTray:
         row = Gtk.ListBoxRow()
         row.entry_id = entry['id']
         row.link = entry['link']
-        row.pkg_match = entry.get('pkg_match')
 
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
         box.set_margin_start(3)
@@ -952,8 +930,7 @@ class RssTray:
         threading.Thread(target=self._run_update_all, args=(pkgnames,), daemon=True).start()
 
     def _run_update_all(self, pkgnames):
-        self._check_lock.acquire()
-        try:
+        with self._xbps_lock:
             cmd = PRIVILEGE_CMD + ['xbps-install', '-Su', '-y']
             try:
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=UPDATE_TIMEOUT_SECONDS)
@@ -963,8 +940,6 @@ class RssTray:
             if output.strip():
                 print(output.strip())  # visible if run in a terminal; harmless otherwise
             remaining = set(list_all_updates())
-        finally:
-            self._check_lock.release()
         GLib.idle_add(self._on_update_all_finished, remaining)
 
     def _on_update_all_finished(self, remaining):
