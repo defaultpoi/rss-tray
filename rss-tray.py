@@ -967,14 +967,19 @@ class RssTray:
                         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                         text=True, bufsize=1
                     )
-                    name_lower = pkgname.lower()
+                    # xbps-install prints section headers like "[*] Downloading
+                    # packages", "[*] Collecting package files", "[*] Unpacking
+                    # packages", "[*] Configuring unpacked packages" — the actual
+                    # per-file lines under them don't contain words like
+                    # "download" at all, so we key off these headers instead.
+                    # Since we install one package at a time, every line in this
+                    # stream belongs to the current package regardless of wording.
                     for line in proc.stdout:
-                        ll = line.lower()
-                        if name_lower in ll:
-                            if 'download' in ll:
-                                self._set_status(pkgname, 'Downloading…')
-                            elif any(k in ll for k in ('unpack', 'configur', 'install')):
-                                self._set_status(pkgname, 'Installing…')
+                        stripped = line.strip()
+                        if stripped.startswith('[*] Downloading'):
+                            self._set_status(pkgname, 'Downloading…')
+                        elif stripped.startswith('[*]'):
+                            self._set_status(pkgname, 'Installing…')
                     proc.wait(timeout=UPDATE_TIMEOUT_SECONDS)
                     returncode = proc.returncode
                 except Exception:
