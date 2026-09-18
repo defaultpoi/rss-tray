@@ -530,7 +530,7 @@ class RssTray:
         if d.get('temp') is not None:
             temp_text = GLib.markup_escape_text(f"{d['temp']:.0f}°C")
             if glyph:
-                temp_text = f'<span foreground="#2b2b2b">{glyph}</span>' + temp_text
+                temp_text = f'<span foreground="#2b2b2b" rise="3000">{glyph}</span>' + temp_text
             parts.append(temp_text)
         if d.get('today_max_temp') is not None and d.get('today_min_temp') is not None:
             parts.append(GLib.markup_escape_text(
