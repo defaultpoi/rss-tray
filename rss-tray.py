@@ -631,26 +631,20 @@ class RssTray:
         size = 24
         surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
         ctx = cairo.Context(surface)
-        if self.has_pkg_update():
-            ctx.set_source_rgba(0.82, 0.18, 0.18, 1)   # red: update available
-        elif count > 0:
-            ctx.set_source_rgba(0.92, 0.55, 0.10, 1)   # orange: unread news
-        else:
-            ctx.set_source_rgba(0.20, 0.65, 0.30, 1)   # green: nothing unread
-        ctx.arc(size / 2, size / 2, size / 2 - 1, 0, 2 * 3.14159265)
-        ctx.fill()
-
-        ctx.set_source_rgba(1, 1, 1, 1)
 
         show_weather = (
             count == 0 and not self.has_pkg_update()
             and self.weather_data and self.weather_data.get('temp') is not None
         )
+
         if show_weather:
+            # No badge circle — just the glyph + temp directly on a
+            # transparent background. White text for a dark panel.
+            ctx.set_source_rgba(1, 1, 1, 1)
             glyph = weather_code_glyph(self.weather_data.get('weather_code')) or ''
             temp_text = f"{self.weather_data['temp']:.0f}"
             ctx.select_font_face('Sans', cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
-            ctx.set_font_size(8)
+            ctx.set_font_size(9)
             temp_x = 2
             if glyph:
                 xb, yb, gw, gh, dx, dy = ctx.text_extents(glyph)
@@ -661,6 +655,16 @@ class RssTray:
             ctx.move_to(temp_x, size / 2 - th / 2 - yb)
             ctx.show_text(temp_text)
         else:
+            if self.has_pkg_update():
+                ctx.set_source_rgba(0.82, 0.18, 0.18, 1)   # red: update available
+            elif count > 0:
+                ctx.set_source_rgba(0.92, 0.55, 0.10, 1)   # orange: unread news
+            else:
+                ctx.set_source_rgba(0.20, 0.65, 0.30, 1)   # green: nothing unread, weather not loaded yet
+            ctx.arc(size / 2, size / 2, size / 2 - 1, 0, 2 * 3.14159265)
+            ctx.fill()
+
+            ctx.set_source_rgba(1, 1, 1, 1)
             text = str(count) if count < 100 else '99+'
             ctx.select_font_face('Sans', cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
             ctx.set_font_size(12 if len(text) <= 2 else 8)
