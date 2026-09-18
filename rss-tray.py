@@ -31,6 +31,7 @@ MUTE_FILE = os.path.join(CONFIG_DIR, 'mute.conf')
 STATE_FILE = os.path.join(CONFIG_DIR, 'state.json')
 CHECK_INTERVAL = 600  # default per-feed interval (seconds) when none is set in feeds.conf
 SCHEDULER_TICK_SECONDS = 60  # how often we check whether any feed is due
+NETWORK_RETRY_SECONDS = 10  # how often to recheck connectivity if offline at startup
 PENDING_CHECK_INTERVAL_SECONDS = 3600  # how often to check for system-wide package updates
 MAX_LIST_ITEMS = 40
 MAX_TITLE_LEN = 60
@@ -81,6 +82,15 @@ def ensure_config():
                 "# Example:\n"
                 "# (P)|Fashion week|Another item\n"
             )
+
+
+def is_online():
+    """Quick, low-cost check for basic network connectivity."""
+    try:
+        socket.create_connection(("1.1.1.1", 53), timeout=2)
+        return True
+    except OSError:
+        return False
 
 
 def load_feeds():
@@ -332,6 +342,9 @@ class RssTray:
         return False
 
     def initial_check(self):
+        if not is_online():
+            GLib.timeout_add_seconds(NETWORK_RETRY_SECONDS, self.initial_check)
+            return False
         self.start_check_thread(force=True)
         return False
 
@@ -446,6 +459,9 @@ class RssTray:
         return False
 
     def initial_weather_check(self):
+        if not is_online():
+            GLib.timeout_add_seconds(NETWORK_RETRY_SECONDS, self.initial_weather_check)
+            return False
         self.start_weather_fetch()
         return False
 
