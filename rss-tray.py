@@ -643,14 +643,16 @@ class RssTray:
             ctx.set_source_rgba(1, 1, 1, 1)
             glyph = weather_code_glyph(self.weather_data.get('weather_code')) or ''
             temp_text = f"{self.weather_data['temp']:.0f}"
-            ctx.select_font_face('Sans', cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
-            ctx.set_font_size(9)
-            temp_x = 2
+            temp_x = 1
             if glyph:
+                ctx.select_font_face('Sans', cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+                ctx.set_font_size(8)
                 xb, yb, gw, gh, dx, dy = ctx.text_extents(glyph)
-                ctx.move_to(2, size / 2 - gh / 2 - yb)
+                ctx.move_to(1, size / 2 - gh / 2 - yb)
                 ctx.show_text(glyph)
-                temp_x = 2 + gw + 1
+                temp_x = 1 + gw + 1
+            ctx.select_font_face('Sans', cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+            ctx.set_font_size(13)
             xb, yb, tw, th, dx, dy = ctx.text_extents(temp_text)
             ctx.move_to(temp_x, size / 2 - th / 2 - yb)
             ctx.show_text(temp_text)
