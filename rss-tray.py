@@ -628,7 +628,7 @@ class RssTray:
             return bool(self.state.get('available_updates'))
 
     def render_icon(self, count):
-        size = 24
+        size = 48
         surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
         ctx = cairo.Context(surface)
 
@@ -643,9 +643,9 @@ class RssTray:
             ctx.set_source_rgba(1, 1, 1, 1)
             glyph = weather_code_glyph(self.weather_data.get('weather_code')) or ''
             temp_text = f"{self.weather_data['temp']:.0f}"
-            left_padding = 2
-            gap = 1
-            max_width = size - left_padding - 1  # leave 1px breathing room on the right too
+            left_padding = 4
+            gap = 2
+            max_width = size - left_padding - 2  # leave breathing room on the right too
 
             ctx.select_font_face('Sans', cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
 
@@ -658,8 +658,8 @@ class RssTray:
                 tw = ctx.text_extents(temp_text)[4]
                 return gw + tw
 
-            glyph_size, temp_size = 12, 16
-            min_glyph_size, min_temp_size = 7, 9
+            glyph_size, temp_size = 24, 32
+            min_glyph_size, min_temp_size = 14, 18
             while measure(glyph_size, temp_size) > max_width and (
                 glyph_size > min_glyph_size or temp_size > min_temp_size
             ):
@@ -693,7 +693,7 @@ class RssTray:
             ctx.set_source_rgba(1, 1, 1, 1)
             text = str(count) if count < 100 else '99+'
             ctx.select_font_face('Sans', cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
-            ctx.set_font_size(12 if len(text) <= 2 else 8)
+            ctx.set_font_size(24 if len(text) <= 2 else 16)
             xb, yb, w, h, dx, dy = ctx.text_extents(text)
             ctx.move_to(size / 2 - w / 2 - xb, size / 2 - h / 2 - yb)
             ctx.show_text(text)
