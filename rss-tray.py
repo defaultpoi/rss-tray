@@ -51,7 +51,7 @@ WEATHER_LONGITUDE = 26.775255
 WEATHER_API_URL = (
     "https://api.open-meteo.com/v1/forecast"
     f"?latitude={WEATHER_LATITUDE}&longitude={WEATHER_LONGITUDE}"
-    "&current=temperature_2m,wind_speed_10m"
+    "&current=temperature_2m,wind_speed_10m,weather_code"
     "&hourly=wind_speed_10m"
     "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max"
     "&forecast_days=6&timezone=auto"
@@ -295,6 +295,7 @@ def fetch_weather():
 
         return {
             'temp': current.get('temperature_2m'),
+            'weather_code': current.get('weather_code'),
             'wind': current.get('wind_speed_10m'),
             'today_max_wind': today_max_wind,
             'today_max_temp': daily_max[0] if len(daily_max) > 0 else None,
@@ -304,6 +305,25 @@ def fetch_weather():
         }
     except Exception:
         return None
+
+
+def weather_code_glyph(code):
+    """Maps a WMO weather_code to a plain (non-color-emoji) Unicode glyph.
+    Returns None for codes without a good simple symbol (e.g. fog), so the
+    icon is just omitted rather than showing something misleading."""
+    if code is None:
+        return None
+    if code == 0:
+        return '\u2600'  # clear sky
+    if code in (1, 2, 3):
+        return '\u2601'  # mainly clear / partly cloudy / overcast
+    if code in (51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82):
+        return '\u2614'  # drizzle / rain / rain showers
+    if code in (71, 73, 75, 77, 85, 86):
+        return '\u2744'  # snow
+    if code in (95, 96, 99):
+        return '\u26a1'  # thunderstorm
+    return None  # e.g. fog (45, 48) — no reliable simple glyph
 
 
 class RssTray:
@@ -506,18 +526,23 @@ class RssTray:
             return f'<span size="medium"><b>{text}</b></span>'
 
         parts = []
+        glyph = weather_code_glyph(d.get('weather_code'))
+        if glyph:
+            parts.append(f'<span foreground="#2b2b2b">{glyph}</span>')
         if d.get('temp') is not None:
-            parts.append(f"{d['temp']:.0f}°C")
+            parts.append(GLib.markup_escape_text(f"{d['temp']:.0f}°C"))
         if d.get('today_max_temp') is not None and d.get('today_min_temp') is not None:
-            parts.append(f"{d['today_max_temp']:.0f}/{d['today_min_temp']:.0f}°C")
+            parts.append(GLib.markup_escape_text(
+                f"{d['today_max_temp']:.0f}/{d['today_min_temp']:.0f}°C"
+            ))
         if d.get('wind') is not None and d.get('today_max_wind') is not None:
-            parts.append(f"{d['wind']:.0f}/{d['today_max_wind']:.0f} km/h")
+            parts.append(GLib.markup_escape_text(f"{d['wind']:.0f}/{d['today_max_wind']:.0f} km/h"))
         elif d.get('wind') is not None:
-            parts.append(f"{d['wind']:.0f} km/h")
+            parts.append(GLib.markup_escape_text(f"{d['wind']:.0f} km/h"))
         if d.get('today_rain_prob') is not None:
-            parts.append(f"Rain {d['today_rain_prob']:.0f}%")
+            parts.append(GLib.markup_escape_text(f"Rain {d['today_rain_prob']:.0f}%"))
         text = "   ·   ".join(parts) if parts else "Weather unavailable"
-        return f'<span size="large"><b>{GLib.markup_escape_text(text)}</b></span>'
+        return f'<span size="large"><b>{text}</b></span>'
 
     def update_weather_label(self):
         if self.weather_label is None:
