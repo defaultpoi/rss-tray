@@ -527,10 +527,11 @@ class RssTray:
 
         parts = []
         glyph = weather_code_glyph(d.get('weather_code'))
-        if glyph:
-            parts.append(f'<span foreground="#2b2b2b">{glyph}</span>')
         if d.get('temp') is not None:
-            parts.append(GLib.markup_escape_text(f"{d['temp']:.0f}°C"))
+            temp_text = GLib.markup_escape_text(f"{d['temp']:.0f}°C")
+            if glyph:
+                temp_text = f'<span foreground="#2b2b2b">{glyph}</span>' + temp_text
+            parts.append(temp_text)
         if d.get('today_max_temp') is not None and d.get('today_min_temp') is not None:
             parts.append(GLib.markup_escape_text(
                 f"{d['today_max_temp']:.0f}/{d['today_min_temp']:.0f}°C"
