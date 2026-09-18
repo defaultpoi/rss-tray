@@ -643,18 +643,42 @@ class RssTray:
             ctx.set_source_rgba(1, 1, 1, 1)
             glyph = weather_code_glyph(self.weather_data.get('weather_code')) or ''
             temp_text = f"{self.weather_data['temp']:.0f}"
-            temp_x = 1
-            if glyph:
-                ctx.select_font_face('Sans', cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
-                ctx.set_font_size(8)
-                xb, yb, gw, gh, dx, dy = ctx.text_extents(glyph)
-                ctx.move_to(1, size / 2 - gh / 2 - yb)
-                ctx.show_text(glyph)
-                temp_x = 1 + gw + 1
+            left_padding = 2
+            gap = 1
+            max_width = size - left_padding - 1  # leave 1px breathing room on the right too
+
             ctx.select_font_face('Sans', cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
-            ctx.set_font_size(13)
+
+            def measure(glyph_size, temp_size):
+                gw = 0.0
+                if glyph:
+                    ctx.set_font_size(glyph_size)
+                    gw = ctx.text_extents(glyph)[4] + gap
+                ctx.set_font_size(temp_size)
+                tw = ctx.text_extents(temp_text)[4]
+                return gw + tw
+
+            glyph_size, temp_size = 12, 16
+            min_glyph_size, min_temp_size = 7, 9
+            while measure(glyph_size, temp_size) > max_width and (
+                glyph_size > min_glyph_size or temp_size > min_temp_size
+            ):
+                if temp_size > min_temp_size:
+                    temp_size -= 1
+                if glyph_size > min_glyph_size:
+                    glyph_size -= 1
+
+            x = left_padding
+            if glyph:
+                ctx.set_font_size(glyph_size)
+                xb, yb, gw, gh, dx, dy = ctx.text_extents(glyph)
+                ctx.move_to(x, size / 2 - gh / 2 - yb)
+                ctx.show_text(glyph)
+                x += gw + gap
+
+            ctx.set_font_size(temp_size)
             xb, yb, tw, th, dx, dy = ctx.text_extents(temp_text)
-            ctx.move_to(temp_x, size / 2 - th / 2 - yb)
+            ctx.move_to(x, size / 2 - th / 2 - yb)
             ctx.show_text(temp_text)
         else:
             if self.has_pkg_update():
