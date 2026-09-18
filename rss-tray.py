@@ -500,6 +500,7 @@ class RssTray:
         if data is not None:
             self.weather_data = data
         self.update_weather_label()
+        self.update_icon()
         return False
 
     def format_weather_markup(self):
@@ -640,12 +641,32 @@ class RssTray:
         ctx.fill()
 
         ctx.set_source_rgba(1, 1, 1, 1)
-        text = str(count) if count < 100 else '99+'
-        ctx.select_font_face('Sans', cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
-        ctx.set_font_size(12 if len(text) <= 2 else 8)
-        xb, yb, w, h, dx, dy = ctx.text_extents(text)
-        ctx.move_to(size / 2 - w / 2 - xb, size / 2 - h / 2 - yb)
-        ctx.show_text(text)
+
+        show_weather = (
+            count == 0 and not self.has_pkg_update()
+            and self.weather_data and self.weather_data.get('temp') is not None
+        )
+        if show_weather:
+            glyph = weather_code_glyph(self.weather_data.get('weather_code')) or ''
+            temp_text = f"{self.weather_data['temp']:.0f}"
+            ctx.select_font_face('Sans', cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+            ctx.set_font_size(8)
+            temp_x = 2
+            if glyph:
+                xb, yb, gw, gh, dx, dy = ctx.text_extents(glyph)
+                ctx.move_to(2, size / 2 - gh / 2 - yb)
+                ctx.show_text(glyph)
+                temp_x = 2 + gw + 1
+            xb, yb, tw, th, dx, dy = ctx.text_extents(temp_text)
+            ctx.move_to(temp_x, size / 2 - th / 2 - yb)
+            ctx.show_text(temp_text)
+        else:
+            text = str(count) if count < 100 else '99+'
+            ctx.select_font_face('Sans', cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+            ctx.set_font_size(12 if len(text) <= 2 else 8)
+            xb, yb, w, h, dx, dy = ctx.text_extents(text)
+            ctx.move_to(size / 2 - w / 2 - xb, size / 2 - h / 2 - yb)
+            ctx.show_text(text)
 
         surface.flush()
         return Gdk.pixbuf_get_from_surface(surface, 0, 0, size, size)
