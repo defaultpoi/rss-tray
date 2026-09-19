@@ -644,7 +644,7 @@ class RssTray:
             # instead of splitting the space with it. The glyph still shows
             # in the popup's weather bar, where space isn't constrained.
             ctx.set_source_rgba(1, 1, 1, 1)
-            temp_text = f"{self.weather_data['temp']:.0f}°C"
+            temp_text = f"{self.weather_data['temp']:.0f}"
             padding = 2
             max_width = size - 2 * padding
 
