@@ -611,10 +611,6 @@ class RssTray:
         self.status_icon.set_tooltip_text(tooltip)
         return False
 
-    def unread_count(self):
-        with self.lock:
-            return len(self.state.get('unread', []))
-
     def total_badge_count(self):
         with self.lock:
             return len(self.state.get('unread', [])) + len(self.state.get('available_updates', []))
