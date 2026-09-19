@@ -628,7 +628,7 @@ class RssTray:
             return bool(self.state.get('available_updates'))
 
     def render_icon(self, count):
-        size = 48
+        size = 24
         surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
         ctx = cairo.Context(surface)
 
@@ -638,47 +638,27 @@ class RssTray:
         )
 
         if show_weather:
-            # No badge circle — just the glyph + temp directly on a
-            # transparent background. White text for a dark panel.
+            # Temperature only, no glyph — the icon is a fixed-size XEMBED
+            # tray slot with no way to make it bigger overall, so dropping
+            # the glyph here lets the digits alone claim the full icon
+            # instead of splitting the space with it. The glyph still shows
+            # in the popup's weather bar, where space isn't constrained.
             ctx.set_source_rgba(1, 1, 1, 1)
-            glyph = weather_code_glyph(self.weather_data.get('weather_code')) or ''
             temp_text = f"{self.weather_data['temp']:.0f}"
-            left_padding = 4
-            gap = 2
-            max_width = size - left_padding - 2  # leave breathing room on the right too
+            padding = 2
+            max_width = size - 2 * padding
 
             ctx.select_font_face('Sans', cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
-
-            def measure(glyph_size, temp_size):
-                gw = 0.0
-                if glyph:
-                    ctx.set_font_size(glyph_size)
-                    gw = ctx.text_extents(glyph)[4] + gap
+            temp_size = 20
+            min_temp_size = 10
+            while temp_size > min_temp_size:
                 ctx.set_font_size(temp_size)
-                tw = ctx.text_extents(temp_text)[4]
-                return gw + tw
+                if ctx.text_extents(temp_text)[4] <= max_width:
+                    break
+                temp_size -= 1
 
-            glyph_size, temp_size = 24, 32
-            min_glyph_size, min_temp_size = 14, 18
-            while measure(glyph_size, temp_size) > max_width and (
-                glyph_size > min_glyph_size or temp_size > min_temp_size
-            ):
-                if temp_size > min_temp_size:
-                    temp_size -= 1
-                if glyph_size > min_glyph_size:
-                    glyph_size -= 1
-
-            x = left_padding
-            if glyph:
-                ctx.set_font_size(glyph_size)
-                xb, yb, gw, gh, dx, dy = ctx.text_extents(glyph)
-                ctx.move_to(x, size / 2 - gh / 2 - yb)
-                ctx.show_text(glyph)
-                x += gw + gap
-
-            ctx.set_font_size(temp_size)
             xb, yb, tw, th, dx, dy = ctx.text_extents(temp_text)
-            ctx.move_to(x, size / 2 - th / 2 - yb)
+            ctx.move_to((size - tw) / 2 - xb, size / 2 - th / 2 - yb)
             ctx.show_text(temp_text)
         else:
             if self.has_pkg_update():
@@ -693,7 +673,7 @@ class RssTray:
             ctx.set_source_rgba(1, 1, 1, 1)
             text = str(count) if count < 100 else '99+'
             ctx.select_font_face('Sans', cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
-            ctx.set_font_size(24 if len(text) <= 2 else 16)
+            ctx.set_font_size(12 if len(text) <= 2 else 8)
             xb, yb, w, h, dx, dy = ctx.text_extents(text)
             ctx.move_to(size / 2 - w / 2 - xb, size / 2 - h / 2 - yb)
             ctx.show_text(text)
