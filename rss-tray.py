@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Minimal tray RSS/Atom reader with system-wide Void package-update detection."""
+"""Minimal tray RSS/Atom reader with system-wide Void package-update detection
+and Twitch live-channel notifications."""
 import gi
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, GLib, Gdk, Pango
@@ -26,13 +27,13 @@ import urllib.request
 socket.setdefaulttimeout(15)  # avoid feed fetches hanging indefinitely on slow/broken servers
 
 CONFIG_DIR = os.path.expanduser('~/.config/rss-tray')
-FEEDS_FILE = os.path.join(CONFIG_DIR, 'feeds.conf')
-MUTE_FILE = os.path.join(CONFIG_DIR, 'mute.conf')
+CONFIG_FILE = os.path.join(CONFIG_DIR, 'config.conf')
 STATE_FILE = os.path.join(CONFIG_DIR, 'state.json')
-CHECK_INTERVAL = 600  # default per-feed interval (seconds) when none is set in feeds.conf
+CHECK_INTERVAL = 600  # default per-feed interval (seconds) when none is set in config.conf
 SCHEDULER_TICK_SECONDS = 60  # how often we check whether any feed is due
-NETWORK_RETRY_SECONDS = 10  # how often to recheck connectivity if offline at startup
 PENDING_CHECK_INTERVAL_SECONDS = 3600  # how often to check for system-wide package updates
+TWITCH_CHECK_INTERVAL_SECONDS = 120  # how often to poll Twitch live status
+NETWORK_RETRY_SECONDS = 10  # how often to recheck connectivity if offline at startup
 MAX_LIST_ITEMS = 40
 MAX_TITLE_LEN = 60
 MAX_ITEM_AGE_SECONDS = 24 * 3600  # ignore entries older than this on first sight
@@ -57,31 +58,127 @@ WEATHER_API_URL = (
     "&forecast_days=6&timezone=auto"
 )
 WEATHER_REFRESH_SECONDS = 1800  # 30 minutes
+TWITCH_GQL_URL = "https://gql.twitch.tv/gql"
+TWITCH_GQL_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"  # Twitch's own public web-client ID —
+                                                          # used by twitch.tv itself for logged-out
+                                                          # visitors. Unofficial/undocumented; no
+                                                          # app registration or secret needed.
 
 
 def ensure_config():
     os.makedirs(CONFIG_DIR, exist_ok=True)
-    if not os.path.exists(FEEDS_FILE):
-        with open(FEEDS_FILE, 'w') as f:
-            f.write(
-                "# Format: URL|custom display name (optional)|check interval in minutes (optional)\n"
-                "# All fields after the URL are optional but positional — leave a field empty\n"
-                "# to skip it while still setting a later one, e.g. URL||5\n"
-                "# Package updates are detected system-wide automatically — no feed setup needed.\n"
-                "# https://example.com/feed.xml\n"
-                "# https://example.com/feed.xml|My Blog\n"
-                "# https://example.com/feed.xml|My Blog|5\n"
-            )
-    if not os.path.exists(MUTE_FILE):
-        with open(MUTE_FILE, 'w') as f:
-            f.write(
-                "# Items whose title contains any of these phrases (case-insensitive,\n"
-                "# substring match) are auto-marked as read and never shown as unread.\n"
-                "# One phrase per line, or several separated by | on the same line.\n"
-                "# Lines starting with # are ignored.\n"
-                "# Example:\n"
-                "# (P)|Fashion week|Another item\n"
-            )
+    if os.path.exists(CONFIG_FILE):
+        return
+    legacy_feeds = os.path.join(CONFIG_DIR, 'feeds.conf')
+    legacy_mute = os.path.join(CONFIG_DIR, 'mute.conf')
+    if os.path.exists(legacy_feeds) or os.path.exists(legacy_mute):
+        _migrate_legacy_config(legacy_feeds, legacy_mute)
+        return
+    with open(CONFIG_FILE, 'w') as f:
+        f.write(
+            "[feeds]\n"
+            "# Format: URL|custom display name (optional)|check interval in minutes (optional)\n"
+            "# All fields after the URL are optional but positional — leave a field empty\n"
+            "# to skip it while still setting a later one, e.g. URL||5\n"
+            "# https://example.com/feed.xml\n"
+            "# https://example.com/feed.xml|My Blog\n"
+            "# https://example.com/feed.xml|My Blog|5\n"
+            "\n"
+            "[mute]\n"
+            "# Items whose title contains any of these phrases (case-insensitive,\n"
+            "# substring match) are auto-marked as read and never shown as unread.\n"
+            "# One phrase per line, or several separated by | on the same line.\n"
+            "# Example:\n"
+            "# (P)|Fashion week|Another item\n"
+            "\n"
+            "[twitch]\n"
+            "# Twitch channel login names to watch for live status, one per line.\n"
+            "# Uses Twitch's own internal (unofficial) API — no account/app needed.\n"
+            "# Clicking a live channel runs: streamlink --player mpv twitch.tv/<name> best\n"
+            "# examplechannel\n"
+        )
+
+
+def _migrate_legacy_config(legacy_feeds, legacy_mute):
+    """One-time merge of the old separate feeds.conf/mute.conf into the new
+    consolidated config.conf. The legacy files are left in place, untouched."""
+    lines = ['[feeds]']
+    if os.path.exists(legacy_feeds):
+        with open(legacy_feeds) as f:
+            for line in f:
+                line = line.rstrip('\n')
+                if line.strip() and not line.strip().startswith('#'):
+                    lines.append(line)
+    lines.append('')
+    lines.append('[mute]')
+    if os.path.exists(legacy_mute):
+        with open(legacy_mute) as f:
+            for line in f:
+                line = line.rstrip('\n')
+                if line.strip() and not line.strip().startswith('#'):
+                    lines.append(line)
+    lines.append('')
+    lines.append('[twitch]')
+    lines.append('# Twitch channel login names to watch for live status, one per line.')
+    with open(CONFIG_FILE, 'w') as f:
+        f.write('\n'.join(lines) + '\n')
+
+
+def _read_config_sections():
+    """Parses config.conf into {'feeds': [...], 'mute': [...], 'twitch': [...]},
+    each a list of raw non-comment, non-empty lines under that [section]."""
+    sections = {'feeds': [], 'mute': [], 'twitch': []}
+    current = None
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                if line.startswith('[') and line.endswith(']'):
+                    current = line[1:-1].strip().lower()
+                    continue
+                if current in sections:
+                    sections[current].append(line)
+    return sections
+
+
+def load_feeds():
+    """Returns list of (url, custom_name, interval_seconds)."""
+    feeds = []
+    for line in _read_config_sections()['feeds']:
+        parts = [p.strip() for p in line.split('|')]
+        url = parts[0]
+        custom_name = parts[1] if len(parts) > 1 and parts[1] else None
+        interval_seconds = CHECK_INTERVAL
+        if len(parts) > 2 and parts[2]:
+            try:
+                interval_seconds = max(1, int(parts[2])) * 60
+            except ValueError:
+                pass
+        feeds.append((url, custom_name, interval_seconds))
+    return feeds
+
+
+def load_mute_filters():
+    """Returns a list of lowercase phrases; a title is muted if it contains any of them."""
+    phrases = []
+    for line in _read_config_sections()['mute']:
+        for phrase in line.split('|'):
+            phrase = phrase.strip()
+            if phrase:
+                phrases.append(phrase.lower())
+    return phrases
+
+
+def load_twitch_channels():
+    """Returns a list of lowercase Twitch channel login names to watch."""
+    return [line.strip().lower() for line in _read_config_sections()['twitch'] if line.strip()]
+
+
+def is_muted(title, mute_phrases):
+    title_lower = title.lower()
+    return any(phrase in title_lower for phrase in mute_phrases)
 
 
 def is_online():
@@ -91,49 +188,6 @@ def is_online():
         return True
     except OSError:
         return False
-
-
-def load_feeds():
-    """Returns list of (url, custom_name, interval_seconds)."""
-    feeds = []
-    if os.path.exists(FEEDS_FILE):
-        with open(FEEDS_FILE) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-                parts = [p.strip() for p in line.split('|')]
-                url = parts[0]
-                custom_name = parts[1] if len(parts) > 1 and parts[1] else None
-                interval_seconds = CHECK_INTERVAL
-                if len(parts) > 2 and parts[2]:
-                    try:
-                        interval_seconds = max(1, int(parts[2])) * 60
-                    except ValueError:
-                        pass
-                feeds.append((url, custom_name, interval_seconds))
-    return feeds
-
-
-def load_mute_filters():
-    """Returns a list of lowercase phrases; a title is muted if it contains any of them."""
-    phrases = []
-    if os.path.exists(MUTE_FILE):
-        with open(MUTE_FILE) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-                for phrase in line.split('|'):
-                    phrase = phrase.strip()
-                    if phrase:
-                        phrases.append(phrase.lower())
-    return phrases
-
-
-def is_muted(title, mute_phrases):
-    title_lower = title.lower()
-    return any(phrase in title_lower for phrase in mute_phrases)
 
 
 def load_state():
@@ -213,6 +267,59 @@ def list_all_updates():
         if match:
             updates.append(match.group(1))
     return updates
+
+
+def check_twitch_channel_live(channel):
+    """Uses Twitch's internal (unofficial) GraphQL API — the same one twitch.tv
+    itself uses for logged-out visitors — so no app registration/secret is
+    needed. Undocumented; could break if Twitch changes their internal schema.
+    Returns True/False, or None if the check itself failed (network, etc.)."""
+    payload = json.dumps({
+        "operationName": "StreamMetadata",
+        "query": "query StreamMetadata($channelLogin: String!) { "
+                 "user(login: $channelLogin) { stream { type } } }",
+        "variables": {"channelLogin": channel},
+    }).encode('utf-8')
+    req = urllib.request.Request(
+        TWITCH_GQL_URL,
+        data=payload,
+        headers={
+            'Client-Id': TWITCH_GQL_CLIENT_ID,
+            'Content-Type': 'application/json',
+            'User-Agent': 'Mozilla/5.0',
+        },
+        method='POST',
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read().decode('utf-8'))
+        user = (result.get('data') or {}).get('user')
+        if not user:
+            return False  # channel doesn't exist / typo — treat as offline
+        stream = user.get('stream')
+        return bool(stream and stream.get('type') == 'live')
+    except Exception:
+        return None
+
+
+def check_twitch_live_channels(channels):
+    """Returns the set of channels currently live. Per-channel failures are
+    simply excluded (not assumed online or offline)."""
+    live = set()
+    for channel in channels:
+        if check_twitch_channel_live(channel):
+            live.add(channel)
+    return live
+
+
+def open_twitch_stream(channel):
+    try:
+        subprocess.Popen(
+            ['streamlink', '--player', 'mpv', f'twitch.tv/{channel}', 'best'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+    except Exception:
+        pass
 
 
 def play_notification_sound():
@@ -333,6 +440,7 @@ class RssTray:
         self.lock = threading.Lock()
         self._check_lock = threading.Lock()  # guards overlapping feed-check cycles only
         self._xbps_lock = threading.Lock()   # guards xbps db access (scans + installs), separately
+        self._twitch_lock = threading.Lock()  # guards overlapping Twitch-check cycles
         self.popup = None
         self.listbox = None
         self.scroller = None
@@ -341,7 +449,7 @@ class RssTray:
         self.weather_box = None
         self.weather_view = 'today'
         self.active_installs = 0
-        self.install_status = {}  # pkgname -> 'Waiting…'/'Downloading…'/'Installing…'/'Done'/'Failed' 
+        self.install_status = {}  # pkgname -> 'Waiting…'/'Downloading…'/'Installing…'/'Done'/'Failed'
 
         self._apply_compact_css()
 
@@ -355,6 +463,8 @@ class RssTray:
         GLib.timeout_add(800, self.maybe_auto_show_startup)
         GLib.timeout_add_seconds(2, self.initial_weather_check)
         GLib.timeout_add_seconds(WEATHER_REFRESH_SECONDS, self.periodic_weather_check)
+        GLib.timeout_add_seconds(3, self.initial_twitch_check)
+        GLib.timeout_add_seconds(TWITCH_CHECK_INTERVAL_SECONDS, self.periodic_twitch_check)
 
     def maybe_auto_show_startup(self):
         if self.has_anything_to_show():
@@ -374,7 +484,7 @@ class RssTray:
 
     def start_check_thread(self, force=False):
         if not self._check_lock.acquire(blocking=False):
-            return  # a check or install is already in flight — skip this tick
+            return  # a check is already in flight — skip this tick rather than overlap
         threading.Thread(target=self._check_feeds_guarded, args=(force,), daemon=True).start()
 
     def _check_feeds_guarded(self, force):
@@ -412,7 +522,7 @@ class RssTray:
                 newly_seen_ids.add(eid)
                 title = entry.get('title', '(untitled)')
                 if is_muted(title, mute_phrases):
-                    continue  # matches mute.conf — mark as seen, don't surface
+                    continue  # matches mute filters — mark as seen, don't surface
                 age = entry_age_seconds(entry)
                 if age is not None and age > MAX_ITEM_AGE_SECONDS:
                     continue  # too old — mark as seen, don't surface
@@ -451,8 +561,7 @@ class RssTray:
             last = self.state.get('updates_last_checked', 0)
         if not force and (now - last) < PENDING_CHECK_INTERVAL_SECONDS:
             return
-        with self._xbps_lock:
-            pkgnames = list_all_updates()
+        pkgnames = list_all_updates()
         with self.lock:
             existing = {e['pkgname']: e for e in self.state.get('available_updates', [])}
             promoted_new = []
@@ -475,13 +584,49 @@ class RssTray:
     def on_new_items(self):
         self.update_icon()
         play_notification_sound()
-        self.show_popup(auto=True)  # auto-open whenever new unread items or updates arrive
+        self.show_popup(auto=True)  # auto-open whenever new unread items, updates, or live channels arrive
+        return False
+
+    def initial_twitch_check(self):
+        if not is_online():
+            GLib.timeout_add_seconds(NETWORK_RETRY_SECONDS, self.initial_twitch_check)
+            return False
+        self.start_twitch_check()
+        return False
+
+    def periodic_twitch_check(self):
+        self.start_twitch_check()
+        return True
+
+    def start_twitch_check(self):
+        if not self._twitch_lock.acquire(blocking=False):
+            return  # a check is already in flight — skip this tick
+        threading.Thread(target=self._check_twitch_guarded, daemon=True).start()
+
+    def _check_twitch_guarded(self):
+        try:
+            channels = load_twitch_channels()
+            if channels:
+                live_now = check_twitch_live_channels(channels)
+                GLib.idle_add(self._on_twitch_checked, live_now)
+        finally:
+            self._twitch_lock.release()
+
+    def _on_twitch_checked(self, live_now):
+        with self.lock:
+            was_live = set(self.state.get('live_channels', []))
+            self.state['live_channels'] = sorted(live_now)
+            save_state(self.state)
+        newly_live = live_now - was_live
+        if newly_live:
+            self.on_new_items()
+        else:
+            self.update_icon()
+            if self.popup and self.popup.get_visible():
+                self.refresh_list()
         return False
 
     def initial_weather_check(self):
-        if not is_online():
-            GLib.timeout_add_seconds(NETWORK_RETRY_SECONDS, self.initial_weather_check)
-            return False
         self.start_weather_fetch()
         return False
 
@@ -516,26 +661,26 @@ class RssTray:
             for day in days:
                 segment = ''
                 if day.get('rain_prob') is not None and day['rain_prob'] > 0:
-                    segment += '<span foreground="#2b2b2b">☔</span> '
+                    segment += '<span foreground="#2b2b2b">\u2614</span> '
                 if day.get('max_temp') is not None and day.get('min_temp') is not None:
                     segment += GLib.markup_escape_text(
-                        f"{day['max_temp']:.0f}/{day['min_temp']:.0f}°C"
+                        f"{day['max_temp']:.0f}/{day['min_temp']:.0f}\u00b0C"
                     )
                 if segment:
                     parts.append(segment)
-            text = " · ".join(parts) if parts else "Forecast unavailable"
+            text = " \u00b7 ".join(parts) if parts else "Forecast unavailable"
             return f'<span size="medium"><b>{text}</b></span>'
 
         parts = []
         glyph = weather_code_glyph(d.get('weather_code'))
         if d.get('temp') is not None:
-            temp_text = GLib.markup_escape_text(f"{d['temp']:.0f}°C")
+            temp_text = GLib.markup_escape_text(f"{d['temp']:.0f}\u00b0C")
             if glyph:
                 temp_text = f'<span foreground="#2b2b2b" rise="3000">{glyph}</span>' + temp_text
             parts.append(temp_text)
         if d.get('today_max_temp') is not None and d.get('today_min_temp') is not None:
             parts.append(GLib.markup_escape_text(
-                f"{d['today_max_temp']:.0f}/{d['today_min_temp']:.0f}°C"
+                f"{d['today_max_temp']:.0f}/{d['today_min_temp']:.0f}\u00b0C"
             ))
         if d.get('wind') is not None and d.get('today_max_wind') is not None:
             parts.append(GLib.markup_escape_text(f"{d['wind']:.0f}/{d['today_max_wind']:.0f} km/h"))
@@ -543,7 +688,7 @@ class RssTray:
             parts.append(GLib.markup_escape_text(f"{d['wind']:.0f} km/h"))
         if d.get('today_rain_prob') is not None:
             parts.append(GLib.markup_escape_text(f"Rain {d['today_rain_prob']:.0f}%"))
-        text = "   ·   ".join(parts) if parts else "Weather unavailable"
+        text = "   \u00b7   ".join(parts) if parts else "Weather unavailable"
         return f'<span size="large"><b>{text}</b></span>'
 
     def update_weather_label(self):
@@ -561,16 +706,13 @@ class RssTray:
         label.set_xalign(0.5)
         label.set_hexpand(True)
         label.set_line_wrap(True)
-        # Cap the label's natural width so long forecast text wraps to a
-        # second line instead of forcing the whole popup wider than
-        # WINDOW_WIDTH (which was pushing the window off-screen).
         label.set_max_width_chars(48)
         label.set_justify(Gtk.Justification.CENTER)
         self.weather_label = label
         self.update_weather_label()
 
         if self.weather_view == 'forecast':
-            back_btn = Gtk.Button(label='‹')
+            back_btn = Gtk.Button(label='\u2039')
             back_btn.set_relief(Gtk.ReliefStyle.NONE)
             back_btn.set_tooltip_text('Back to today')
             back_btn.connect('clicked', self.on_weather_arrow_clicked, 'today')
@@ -578,7 +720,7 @@ class RssTray:
             self.weather_box.pack_start(label, True, True, 0)
         else:
             self.weather_box.pack_start(label, True, True, 0)
-            fwd_btn = Gtk.Button(label='›')
+            fwd_btn = Gtk.Button(label='\u203a')
             fwd_btn.set_relief(Gtk.ReliefStyle.NONE)
             fwd_btn.set_tooltip_text('Show 5-day forecast')
             fwd_btn.connect('clicked', self.on_weather_arrow_clicked, 'forecast')
@@ -593,7 +735,7 @@ class RssTray:
     def _begin_install(self):
         self.active_installs += 1
         self.update_icon()
-        self.refresh_list()  # show per-row spinners under "Updates available"
+        self.refresh_list()  # show per-row status under "Updates available"
 
     def _end_install(self):
         self.active_installs = max(0, self.active_installs - 1)
@@ -613,11 +755,19 @@ class RssTray:
 
     def total_badge_count(self):
         with self.lock:
-            return len(self.state.get('unread', [])) + len(self.state.get('available_updates', []))
+            return (
+                len(self.state.get('unread', []))
+                + len(self.state.get('available_updates', []))
+                + len(self.state.get('live_channels', []))
+            )
 
     def has_anything_to_show(self):
         with self.lock:
-            return bool(self.state.get('unread')) or bool(self.state.get('available_updates'))
+            return (
+                bool(self.state.get('unread'))
+                or bool(self.state.get('available_updates'))
+                or bool(self.state.get('live_channels'))
+            )
 
     def has_pkg_update(self):
         with self.lock:
@@ -660,7 +810,7 @@ class RssTray:
             if self.has_pkg_update():
                 ctx.set_source_rgba(0.82, 0.18, 0.18, 1)   # red: update available
             elif count > 0:
-                ctx.set_source_rgba(0.92, 0.55, 0.10, 1)   # orange: unread news
+                ctx.set_source_rgba(0.92, 0.55, 0.10, 1)   # orange: unread news / live channel
             else:
                 ctx.set_source_rgba(0.20, 0.65, 0.30, 1)   # green: nothing unread, weather not loaded yet
             ctx.arc(size / 2, size / 2, size / 2 - 1, 0, 2 * 3.14159265)
@@ -752,14 +902,13 @@ class RssTray:
         footer.set_margin_end(6)
         footer.set_margin_top(4)
         footer.set_margin_bottom(4)
-        edit_btn = Gtk.Button(label='Edit feeds')
-        edit_btn.connect('clicked', lambda *_a: edit_file_externally(FEEDS_FILE))
+        edit_btn = Gtk.Button(label='Edit config')
+        edit_btn.connect('clicked', lambda *_a: edit_file_externally(CONFIG_FILE))
         footer.pack_start(edit_btn, True, True, 0)
-        edit_mute_btn = Gtk.Button(label='Edit filters')
-        edit_mute_btn.connect('clicked', lambda *_a: edit_file_externally(MUTE_FILE))
-        footer.pack_start(edit_mute_btn, True, True, 0)
         refresh_btn = Gtk.Button(label='Refresh')
-        refresh_btn.connect('clicked', lambda *_a: self.start_check_thread(force=True))
+        refresh_btn.connect('clicked', lambda *_a: (
+            self.start_check_thread(force=True), self.start_twitch_check()
+        ))
         footer.pack_start(refresh_btn, True, True, 0)
         mark_all_btn = Gtk.Button(label='Mark all read')
         mark_all_btn.connect('clicked', self.on_mark_all_read)
@@ -799,20 +948,23 @@ class RssTray:
         self.popup.grab_focus()
 
     def position_popup(self):
-        display = Gdk.Display.get_default()
-        monitor = display.get_primary_monitor() or display.get_monitor(0)
-        geo = monitor.get_geometry()
-
-        x = geo.x + geo.width - WINDOW_WIDTH  # flush against the right edge
-
-        y = geo.y  # flush against the top, as a fallback
+        x = y = None
         try:
-            ok, _screen, area, _orientation = self.status_icon.get_geometry()
-            if ok and area is not None:
-                y = area.y + area.height + 2  # 2px below the panel/tray icon
+            ok, screen, area, _orientation = self.status_icon.get_geometry()
         except Exception:
-            pass
-
+            ok = False
+        if ok and area is not None:
+            x = area.x
+            y = area.y + area.height
+            screen_width = screen.get_width() if screen else None
+            if screen_width and x + WINDOW_WIDTH > screen_width:
+                x = screen_width - WINDOW_WIDTH - 4
+        if x is None:
+            display = Gdk.Display.get_default()
+            monitor = display.get_primary_monitor() or display.get_monitor(0)
+            geo = monitor.get_geometry()
+            x = geo.x + geo.width - WINDOW_WIDTH - 10
+            y = geo.y + 30
         self.popup.move(max(x, 0), max(y, 0))
 
     def refresh_list(self):
@@ -821,10 +973,11 @@ class RssTray:
         with self.lock:
             unread = list(self.state.get('unread', []))
             available = list(self.state.get('available_updates', []))
+            live_channels = list(self.state.get('live_channels', []))
 
         feeds_map = {url: (custom_name or url) for url, custom_name, _interval in load_feeds()}
 
-        if not unread and not available:
+        if not unread and not available and not live_channels:
             row = Gtk.ListBoxRow()
             row.set_selectable(False)
             row.set_activatable(False)
@@ -836,6 +989,16 @@ class RssTray:
             if self.popup:
                 self.popup.hide()
         else:
+            is_first_section = True
+
+            if live_channels:
+                self.listbox.add(self.build_header_row(
+                    '__live__', 'Live now', is_first=is_first_section, clickable=False
+                ))
+                is_first_section = False
+                for channel in live_channels:
+                    self.listbox.add(self.build_twitch_row(channel))
+
             if unread:
                 shown = unread[:MAX_LIST_ITEMS]
                 groups = {}
@@ -849,9 +1012,12 @@ class RssTray:
 
                 for i, feed_url in enumerate(order):
                     feed_name = feeds_map.get(feed_url, feed_url)
-                    self.listbox.add(self.build_header_row(feed_url, feed_name, is_first=(i == 0)))
+                    self.listbox.add(self.build_header_row(
+                        feed_url, feed_name, is_first=(is_first_section and i == 0)
+                    ))
                     for entry in groups[feed_url]:
                         self.listbox.add(self.build_row(entry))
+                is_first_section = False
 
                 if len(unread) > MAX_LIST_ITEMS:
                     row = Gtk.ListBoxRow()
@@ -864,8 +1030,9 @@ class RssTray:
             if available:
                 self.listbox.add(self.build_header_row(
                     '__updates__', 'Updates available',
-                    is_first=(not unread), clickable=False, install_all=True
+                    is_first=is_first_section, clickable=False, install_all=True
                 ))
+                is_first_section = False
                 for entry in available[:MAX_LIST_ITEMS]:
                     self.listbox.add(self.build_info_row(entry))
                 if len(available) > MAX_LIST_ITEMS:
@@ -907,6 +1074,32 @@ class RssTray:
         row.add(box)
         return row
 
+    def build_twitch_row(self, channel):
+        row = Gtk.ListBoxRow()
+        row.set_selectable(False)
+        row.set_activatable(True)
+        row.twitch_channel = channel
+        row.set_tooltip_text(f"Watch {channel} — streamlink --player mpv twitch.tv/{channel} best")
+
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        box.set_margin_start(3)
+        box.set_margin_end(3)
+        box.set_margin_top(0)
+        box.set_margin_bottom(0)
+
+        dot = Gtk.Label()
+        dot.set_markup('<span foreground="#9146FF"><b>\u25cf</b></span>')  # Twitch purple
+        box.pack_start(dot, False, False, 0)
+
+        label = Gtk.Label()
+        label.set_markup(f'<span foreground="#000000"><b>{GLib.markup_escape_text(channel)}</b></span>')
+        label.set_xalign(0)
+        label.set_hexpand(True)
+        box.pack_start(label, True, True, 0)
+
+        row.add(box)
+        return row
+
     def build_info_row(self, entry):
         """Purely informational row: no mark-as-read button, no click action.
         Used for 'Updates available' entries — install is only ever triggered
@@ -931,7 +1124,7 @@ class RssTray:
 
         full_title = entry['title']
         truncated = len(full_title) > MAX_TITLE_LEN
-        title = full_title[:MAX_TITLE_LEN - 1] + '…' if truncated else full_title
+        title = full_title[:MAX_TITLE_LEN - 1] + '\u2026' if truncated else full_title
         text = GLib.markup_escape_text(title)
         label = Gtk.Label()
         label.set_markup(f'<span foreground="#000000"><b>{text}</b></span>')
@@ -967,7 +1160,7 @@ class RssTray:
 
         full_title = entry['title']
         truncated = len(full_title) > MAX_TITLE_LEN
-        title = full_title[:MAX_TITLE_LEN - 1] + '…' if truncated else full_title
+        title = full_title[:MAX_TITLE_LEN - 1] + '\u2026' if truncated else full_title
         text = GLib.markup_escape_text(title)
         label = Gtk.Label()
         label.set_markup(f'<span foreground="#000000"><b>{text}</b></span>')
@@ -1068,6 +1261,9 @@ class RssTray:
             return
         if hasattr(row, 'header_feed_url'):
             self.mark_feed_read(row.header_feed_url)
+            return
+        if hasattr(row, 'twitch_channel'):
+            open_twitch_stream(row.twitch_channel)
             return
         if not hasattr(row, 'entry_id'):
             return
