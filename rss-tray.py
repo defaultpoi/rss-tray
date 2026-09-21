@@ -32,7 +32,7 @@ STATE_FILE = os.path.join(CONFIG_DIR, 'state.json')
 CHECK_INTERVAL = 600  # default per-feed interval (seconds) when none is set in config.conf
 SCHEDULER_TICK_SECONDS = 60  # how often we check whether any feed is due
 PENDING_CHECK_INTERVAL_SECONDS = 3600  # how often to check for system-wide package updates
-TWITCH_CHECK_INTERVAL_SECONDS = 120  # how often to poll Twitch live status
+TWITCH_CHECK_INTERVAL_SECONDS = 1800  # how often to poll Twitch live status
 NETWORK_RETRY_SECONDS = 10  # how often to recheck connectivity if offline at startup
 MAX_LIST_ITEMS = 40
 MAX_TITLE_LEN = 60
@@ -754,11 +754,13 @@ class RssTray:
         return False
 
     def total_badge_count(self):
+        # Live channels intentionally excluded — they show in the popup list
+        # and still trigger the sound/auto-popup notification, but shouldn't
+        # affect the tray icon's badge number or color.
         with self.lock:
             return (
                 len(self.state.get('unread', []))
                 + len(self.state.get('available_updates', []))
-                + len(self.state.get('live_channels', []))
             )
 
     def has_anything_to_show(self):
