@@ -754,10 +754,39 @@ class RssTray:
         self.active_installs = max(0, self.active_installs - 1)
         self.update_icon()
 
+    def _should_show_weather_icon(self, count):
+        return (
+            count == 0 and not self.has_pkg_update()
+            and self.weather_data and self.weather_data.get('temp') is not None
+        )
+
+    def format_weather_tooltip_text(self):
+        """Plain-text version of the popup's 'today' weather line, for the
+        tray icon's tooltip (which doesn't render Pango markup)."""
+        d = self.weather_data
+        if not d:
+            return "Weather unavailable"
+        parts = []
+        if d.get('temp') is not None:
+            parts.append(f"{d['temp']:.0f}°C")
+        if d.get('today_max_temp') is not None and d.get('today_min_temp') is not None:
+            parts.append(f"{d['today_max_temp']:.0f}/{d['today_min_temp']:.0f}°C")
+        if d.get('wind') is not None and d.get('today_max_wind') is not None:
+            parts.append(f"{d['wind']:.0f}/{d['today_max_wind']:.0f} km/h")
+        elif d.get('wind') is not None:
+            parts.append(f"{d['wind']:.0f} km/h")
+        if d.get('today_rain_prob') is not None and d.get('today_precip_sum') is not None:
+            parts.append(f"{d['today_rain_prob']:.0f}%/{d['today_precip_sum']:.1f}mm")
+        elif d.get('today_rain_prob') is not None:
+            parts.append(f"{d['today_rain_prob']:.0f}%")
+        return " · ".join(parts) if parts else "Weather unavailable"
+
     def update_icon(self):
         count = self.total_badge_count()
         self.status_icon.set_from_pixbuf(self.render_icon(count))
-        if self.has_pkg_update():
+        if self._should_show_weather_icon(count):
+            tooltip = self.format_weather_tooltip_text()
+        elif self.has_pkg_update():
             tooltip = f"{count} unread — package update available"
         elif count:
             tooltip = f"{count} unread"
@@ -793,10 +822,7 @@ class RssTray:
         surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
         ctx = cairo.Context(surface)
 
-        show_weather = (
-            count == 0 and not self.has_pkg_update()
-            and self.weather_data and self.weather_data.get('temp') is not None
-        )
+        show_weather = self._should_show_weather_icon(count)
 
         if show_weather:
             # Temperature only, no glyph — the icon is a fixed-size XEMBED
