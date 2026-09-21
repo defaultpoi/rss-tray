@@ -907,6 +907,7 @@ class RssTray:
         self.listbox = Gtk.ListBox()
         self.listbox.set_selection_mode(Gtk.SelectionMode.NONE)
         self.listbox.connect('row-activated', self.on_row_activated)
+        self.listbox.connect('button-press-event', self.on_listbox_button_press)
         scroller.add(self.listbox)
         outer.pack_start(scroller, True, True, 0)
 
@@ -1178,7 +1179,6 @@ class RssTray:
         row = Gtk.ListBoxRow()
         row.entry_id = entry['id']
         row.link = entry['link']
-        row.connect('button-press-event', self.on_row_button_press, entry['id'])
 
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
         box.set_margin_start(3)
@@ -1211,10 +1211,12 @@ class RssTray:
         row.add(box)
         return row
 
-    def on_row_button_press(self, _widget, event, item_id):
+    def on_listbox_button_press(self, listbox, event):
         if event.button == 3:  # right-click: mark as read without opening
-            self.on_mark_read_clicked(None, item_id)
-            return True
+            row = listbox.get_row_at_y(int(event.y))
+            if row is not None and hasattr(row, 'entry_id'):
+                self.on_mark_read_clicked(None, row.entry_id)
+                return True
         return False
 
     def _remove_unread(self, item_id):
