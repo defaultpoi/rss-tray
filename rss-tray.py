@@ -54,7 +54,7 @@ WEATHER_API_URL = (
     f"?latitude={WEATHER_LATITUDE}&longitude={WEATHER_LONGITUDE}"
     "&current=temperature_2m,wind_speed_10m,weather_code"
     "&hourly=wind_speed_10m"
-    "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+    "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,precipitation_sum"
     "&forecast_days=6&timezone=auto"
 )
 WEATHER_REFRESH_SECONDS = 1800  # 30 minutes
@@ -381,15 +381,17 @@ def fetch_weather():
         hourly = data.get('hourly', {})
         daily = data.get('daily', {})
         winds = hourly.get('wind_speed_10m', [])
+        hourly_times = hourly.get('time', [])
+        current_time = current.get('time')
 
-        today_max_wind = None
-        today_winds = [w for w in winds[:24] if w is not None]
-        if today_winds:
-            today_max_wind = max(today_winds)
+        current_hour_idx = hourly_times.index(current_time) if current_time in hourly_times else 0
+        remaining_winds = [w for w in winds[current_hour_idx:24] if w is not None]
+        today_max_wind = max(remaining_winds) if remaining_winds else None
 
         daily_max = daily.get('temperature_2m_max', [])
         daily_min = daily.get('temperature_2m_min', [])
         daily_rain_prob = daily.get('precipitation_probability_max', [])
+        daily_precip_sum = daily.get('precipitation_sum', [])
 
         forecast_days = []
         for i in range(1, 6):
@@ -408,6 +410,7 @@ def fetch_weather():
             'today_max_temp': daily_max[0] if len(daily_max) > 0 else None,
             'today_min_temp': daily_min[0] if len(daily_min) > 0 else None,
             'today_rain_prob': daily_rain_prob[0] if len(daily_rain_prob) > 0 else None,
+            'today_precip_sum': daily_precip_sum[0] if len(daily_precip_sum) > 0 else None,
             'forecast_days': forecast_days,
         }
     except Exception:
@@ -674,21 +677,25 @@ class RssTray:
         parts = []
         glyph = weather_code_glyph(d.get('weather_code'))
         if d.get('temp') is not None:
-            temp_text = GLib.markup_escape_text(f"{d['temp']:.0f}\u00b0C")
+            temp_text = GLib.markup_escape_text(f"{d['temp']:.0f}°C")
             if glyph:
-                temp_text = f'<span foreground="#2b2b2b" rise="3000">{glyph}</span>' + temp_text
+                temp_text = f'<span foreground="#2b2b2b" rise="6000">{glyph}</span>' + temp_text
             parts.append(temp_text)
         if d.get('today_max_temp') is not None and d.get('today_min_temp') is not None:
             parts.append(GLib.markup_escape_text(
-                f"{d['today_max_temp']:.0f}/{d['today_min_temp']:.0f}\u00b0C"
+                f"{d['today_max_temp']:.0f}/{d['today_min_temp']:.0f}°C"
             ))
         if d.get('wind') is not None and d.get('today_max_wind') is not None:
             parts.append(GLib.markup_escape_text(f"{d['wind']:.0f}/{d['today_max_wind']:.0f} km/h"))
         elif d.get('wind') is not None:
             parts.append(GLib.markup_escape_text(f"{d['wind']:.0f} km/h"))
-        if d.get('today_rain_prob') is not None:
-            parts.append(GLib.markup_escape_text(f"Rain {d['today_rain_prob']:.0f}%"))
-        text = "   \u00b7   ".join(parts) if parts else "Weather unavailable"
+        if d.get('today_rain_prob') is not None and d.get('today_precip_sum') is not None:
+            parts.append(GLib.markup_escape_text(
+                f"{d['today_rain_prob']:.0f}%/{d['today_precip_sum']:.1f}mm"
+            ))
+        elif d.get('today_rain_prob') is not None:
+            parts.append(GLib.markup_escape_text(f"{d['today_rain_prob']:.0f}%"))
+        text = " · ".join(parts) if parts else "Weather unavailable"
         return f'<span size="large"><b>{text}</b></span>'
 
     def update_weather_label(self):
@@ -1057,10 +1064,11 @@ class RssTray:
             row.header_feed_url = feed_url
             row.set_tooltip_text(f"Mark all '{feed_name}' items as read")
 
+        row.set_margin_top(4 if is_first else 20)
+
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         box.set_margin_start(4)
         box.set_margin_end(4)
-        box.set_margin_top(4 if is_first else 20)
         box.set_margin_bottom(2)
 
         label = Gtk.Label()
