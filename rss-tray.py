@@ -269,17 +269,25 @@ def list_all_updates():
     return updates
 
 
-def check_twitch_channel_live(channel):
+def check_twitch_live_channels(channels):
     """Uses Twitch's internal (unofficial) GraphQL API — the same one twitch.tv
     itself uses for logged-out visitors — so no app registration/secret is
     needed. Undocumented; could break if Twitch changes their internal schema.
-    Returns True/False, or None if the check itself failed (network, etc.)."""
-    payload = json.dumps({
-        "operationName": "StreamMetadata",
-        "query": "query StreamMetadata($channelLogin: String!) { "
-                 "user(login: $channelLogin) { stream { type } } }",
-        "variables": {"channelLogin": channel},
-    }).encode('utf-8')
+    Batches every channel into a single POST request (Twitch's GQL endpoint
+    accepts a JSON array of operations) instead of one request per channel.
+    Returns {channel: title} for whichever channels are currently live;
+    a failed/offline channel is simply absent from the result, not marked False."""
+    if not channels:
+        return {}
+    payload = json.dumps([
+        {
+            "operationName": "StreamMetadata",
+            "query": "query StreamMetadata($channelLogin: String!) { "
+                     "user(login: $channelLogin) { stream { type title } } }",
+            "variables": {"channelLogin": channel},
+        }
+        for channel in channels
+    ]).encode('utf-8')
     req = urllib.request.Request(
         TWITCH_GQL_URL,
         data=payload,
@@ -292,23 +300,19 @@ def check_twitch_channel_live(channel):
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            result = json.loads(resp.read().decode('utf-8'))
+            results = json.loads(resp.read().decode('utf-8'))
+    except Exception:
+        return {}
+    if not isinstance(results, list):
+        return {}
+    live = {}
+    for channel, result in zip(channels, results):
         user = (result.get('data') or {}).get('user')
         if not user:
-            return False  # channel doesn't exist / typo — treat as offline
+            continue
         stream = user.get('stream')
-        return bool(stream and stream.get('type') == 'live')
-    except Exception:
-        return None
-
-
-def check_twitch_live_channels(channels):
-    """Returns the set of channels currently live. Per-channel failures are
-    simply excluded (not assumed online or offline)."""
-    live = set()
-    for channel in channels:
-        if check_twitch_channel_live(channel):
-            live.add(channel)
+        if stream and stream.get('type') == 'live':
+            live[channel] = stream.get('title') or ''
     return live
 
 
@@ -617,10 +621,12 @@ class RssTray:
 
     def _on_twitch_checked(self, live_now):
         with self.lock:
-            was_live = set(self.state.get('live_channels', []))
-            self.state['live_channels'] = sorted(live_now)
+            was_live = {e['channel'] for e in self.state.get('live_channels', [])}
+            self.state['live_channels'] = [
+                {'channel': ch, 'title': live_now[ch]} for ch in sorted(live_now)
+            ]
             save_state(self.state)
-        newly_live = live_now - was_live
+        newly_live = set(live_now) - was_live
         if newly_live:
             self.on_new_items()
         else:
@@ -1005,8 +1011,8 @@ class RssTray:
                     '__live__', 'Live now', is_first=is_first_section, clickable=False
                 ))
                 is_first_section = False
-                for channel in live_channels:
-                    self.listbox.add(self.build_twitch_row(channel))
+                for entry in live_channels:
+                    self.listbox.add(self.build_twitch_row(entry))
 
             if unread:
                 shown = unread[:MAX_LIST_ITEMS]
@@ -1084,30 +1090,49 @@ class RssTray:
         row.add(box)
         return row
 
-    def build_twitch_row(self, channel):
+    def build_twitch_row(self, entry):
+        channel = entry['channel']
+        title = entry.get('title') or ''
+
         row = Gtk.ListBoxRow()
         row.set_selectable(False)
         row.set_activatable(True)
         row.twitch_channel = channel
-        row.set_tooltip_text(f"Watch {channel} — streamlink --player mpv twitch.tv/{channel} best")
+        tooltip = f"Watch {channel}"
+        if title:
+            tooltip += f" — {title}"
+        tooltip += f"\nstreamlink --player mpv twitch.tv/{channel} best"
+        row.set_tooltip_text(tooltip)
 
-        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
-        box.set_margin_start(3)
-        box.set_margin_end(3)
-        box.set_margin_top(0)
-        box.set_margin_bottom(0)
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        outer.set_margin_start(3)
+        outer.set_margin_end(3)
+        outer.set_margin_top(1)
+        outer.set_margin_bottom(1)
 
+        top_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         dot = Gtk.Label()
-        dot.set_markup('<span foreground="#9146FF"><b>\u25cf</b></span>')  # Twitch purple
-        box.pack_start(dot, False, False, 0)
+        dot.set_markup('<span foreground="#9146FF"><b>●</b></span>')
+        top_row.pack_start(dot, False, False, 0)
 
-        label = Gtk.Label()
-        label.set_markup(f'<span foreground="#000000"><b>{GLib.markup_escape_text(channel)}</b></span>')
-        label.set_xalign(0)
-        label.set_hexpand(True)
-        box.pack_start(label, True, True, 0)
+        name_label = Gtk.Label()
+        name_label.set_markup(f'<span foreground="#000000"><b>{GLib.markup_escape_text(channel)}</b></span>')
+        name_label.set_xalign(0)
+        name_label.set_hexpand(True)
+        top_row.pack_start(name_label, True, True, 0)
+        outer.pack_start(top_row, False, False, 0)
 
-        row.add(box)
+        if title:
+            shown_title = title if len(title) <= MAX_TITLE_LEN else title[:MAX_TITLE_LEN - 1] + '…'
+            title_label = Gtk.Label()
+            title_label.set_markup(
+                f'<span size="small" foreground="#555555">{GLib.markup_escape_text(shown_title)}</span>'
+            )
+            title_label.set_xalign(0)
+            title_label.set_margin_start(14)
+            outer.pack_start(title_label, False, False, 0)
+
+        row.add(outer)
         return row
 
     def build_info_row(self, entry):
