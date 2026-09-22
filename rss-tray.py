@@ -1334,10 +1334,14 @@ class RssTray:
         return row
 
     def on_listbox_button_press(self, listbox, event):
-        if event.button == 3:  # right-click: mark as read without opening
+        if event.button == 3:  # right-click
             row = listbox.get_row_at_y(int(event.y))
             if row is not None and hasattr(row, 'entry_id'):
-                self.on_mark_read_clicked(None, row.entry_id)
+                self.on_mark_read_clicked(None, row.entry_id)  # mark as read without opening
+                return True
+            if row is None:
+                if self.popup:
+                    self.popup.hide()  # empty space below the last item — close the popup
                 return True
         return False
 
