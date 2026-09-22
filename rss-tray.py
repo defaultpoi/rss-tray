@@ -41,7 +41,7 @@ SEEN_RETENTION_SECONDS = 30 * 24 * 3600  # prune seen-item records older than th
 PRIVILEGE_CMD = ['sudo']  # change to ['doas'] if that's what you use; requires
                           # passwordless (NOPASSWD) rules for xbps-install, since
                           # updates run headlessly with no terminal/tty attached
-WINDOW_WIDTH = 456  # 380 * 1.2
+WINDOW_WIDTH = 466  # 380 * 1.2, +10px
 UPDATE_TIMEOUT_SECONDS = 1800  # 30 minutes
 NOTIFICATION_SOUND_CANDIDATES = [
     os.path.join(CONFIG_DIR, 'notification.wav'),  # QuiteRSS's notification sound, if present
