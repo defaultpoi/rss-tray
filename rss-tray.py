@@ -469,6 +469,8 @@ class RssTray:
         self._timer_updating_ui = False
         self.timer_scale = None
         self.timer_label = None
+        self.timer_box = None
+        self.timer_visible = False
 
         self._apply_compact_css()
 
@@ -767,6 +769,14 @@ class RssTray:
         self.active_installs = max(0, self.active_installs - 1)
         self.update_icon()
 
+    def on_timer_toggle_clicked(self, _button):
+        self.timer_visible = not self.timer_visible
+        if self.timer_box is not None:
+            if self.timer_visible:
+                self.timer_box.show_all()
+            else:
+                self.timer_box.hide()
+
     def _timer_tick(self):
         if self.timer_running and self.timer_remaining_seconds > 0:
             self.timer_remaining_seconds -= 1
@@ -974,6 +984,19 @@ class RssTray:
         outer.pack_start(weather_box, False, False, 0)
         outer.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 0)
 
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroller.set_propagate_natural_height(True)
+        self.scroller = scroller
+        self.listbox = Gtk.ListBox()
+        self.listbox.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.listbox.connect('row-activated', self.on_row_activated)
+        self.listbox.connect('button-press-event', self.on_listbox_button_press)
+        scroller.add(self.listbox)
+        outer.pack_start(scroller, True, True, 0)
+
+        outer.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
+
         timer_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         timer_box.set_margin_start(8)
         timer_box.set_margin_end(8)
@@ -996,27 +1019,25 @@ class RssTray:
         self.timer_scale = timer_scale
         timer_box.pack_start(timer_scale, False, False, 0)
 
+        timer_box.set_no_show_all(True)  # only shown/hidden via the bell toggle, not blanket show_all()
+        self.timer_box = timer_box
         outer.pack_start(timer_box, False, False, 0)
-        outer.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 0)
-
-        scroller = Gtk.ScrolledWindow()
-        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        scroller.set_propagate_natural_height(True)
-        self.scroller = scroller
-        self.listbox = Gtk.ListBox()
-        self.listbox.set_selection_mode(Gtk.SelectionMode.NONE)
-        self.listbox.connect('row-activated', self.on_row_activated)
-        self.listbox.connect('button-press-event', self.on_listbox_button_press)
-        scroller.add(self.listbox)
-        outer.pack_start(scroller, True, True, 0)
-
-        outer.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
+        if self.timer_visible:
+            timer_box.show_all()
 
         footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         footer.set_margin_start(6)
         footer.set_margin_end(6)
         footer.set_margin_top(4)
         footer.set_margin_bottom(4)
+        timer_toggle_btn = Gtk.Button()
+        timer_toggle_btn.set_relief(Gtk.ReliefStyle.NONE)
+        bell_label = Gtk.Label()
+        bell_label.set_markup('<span size="large">\U0001F514</span>')
+        timer_toggle_btn.add(bell_label)
+        timer_toggle_btn.set_tooltip_text('Show/hide countdown timer')
+        timer_toggle_btn.connect('clicked', self.on_timer_toggle_clicked)
+        footer.pack_start(timer_toggle_btn, False, False, 0)
         edit_btn = Gtk.Button(label='Edit config')
         edit_btn.connect('clicked', lambda *_a: edit_file_externally(CONFIG_FILE))
         footer.pack_start(edit_btn, True, True, 0)
@@ -1055,6 +1076,7 @@ class RssTray:
             self.popup = None
             self.timer_scale = None
             self.timer_label = None
+            self.timer_box = None
         self.weather_view = 'today'
         self.build_popup_window()
         self._update_scroller_max_height()
