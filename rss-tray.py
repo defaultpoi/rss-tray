@@ -773,7 +773,7 @@ class RssTray:
         self.timer_visible = not self.timer_visible
         if self.timer_box is not None:
             if self.timer_visible:
-                self.timer_box.show_all()
+                self.timer_box.show()
             else:
                 self.timer_box.hide()
 
@@ -1019,25 +1019,24 @@ class RssTray:
         self.timer_scale = timer_scale
         timer_box.pack_start(timer_scale, False, False, 0)
 
-        timer_box.set_no_show_all(True)  # only shown/hidden via the bell toggle, not blanket show_all()
+        timer_box.show_all()  # mark box + children visible internally, BEFORE no_show_all
+        timer_box.set_no_show_all(True)  # stop the window's later show_all() from force-showing it
         self.timer_box = timer_box
         outer.pack_start(timer_box, False, False, 0)
         if self.timer_visible:
-            timer_box.show_all()
+            timer_box.show()
+        else:
+            timer_box.hide()
 
         footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         footer.set_margin_start(6)
         footer.set_margin_end(6)
         footer.set_margin_top(4)
         footer.set_margin_bottom(4)
-        timer_toggle_btn = Gtk.Button()
-        timer_toggle_btn.set_relief(Gtk.ReliefStyle.NONE)
-        bell_label = Gtk.Label()
-        bell_label.set_markup('<span size="large">\U0001F514</span>')
-        timer_toggle_btn.add(bell_label)
+        timer_toggle_btn = Gtk.Button(label='Timer')
         timer_toggle_btn.set_tooltip_text('Show/hide countdown timer')
         timer_toggle_btn.connect('clicked', self.on_timer_toggle_clicked)
-        footer.pack_start(timer_toggle_btn, False, False, 0)
+        footer.pack_start(timer_toggle_btn, True, True, 0)
         edit_btn = Gtk.Button(label='Edit config')
         edit_btn.connect('clicked', lambda *_a: edit_file_externally(CONFIG_FILE))
         footer.pack_start(edit_btn, True, True, 0)
