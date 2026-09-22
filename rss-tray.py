@@ -440,6 +440,13 @@ def weather_code_glyph(code):
     return None  # e.g. fog (45, 48) — no reliable simple glyph
 
 
+def format_timer_duration(total_seconds):
+    h = total_seconds // 3600
+    m = (total_seconds % 3600) // 60
+    s = total_seconds % 60
+    return f"{h} Hours, {m:02d} Minutes and {s:02d} Seconds"
+
+
 class RssTray:
     def __init__(self):
         ensure_config()
@@ -457,6 +464,11 @@ class RssTray:
         self.weather_view = 'today'
         self.active_installs = 0
         self.install_status = {}  # pkgname -> 'Waiting…'/'Downloading…'/'Installing…'/'Done'/'Failed'
+        self.timer_remaining_seconds = 0
+        self.timer_running = False
+        self._timer_updating_ui = False
+        self.timer_scale = None
+        self.timer_label = None
 
         self._apply_compact_css()
 
@@ -472,6 +484,7 @@ class RssTray:
         GLib.timeout_add_seconds(WEATHER_REFRESH_SECONDS, self.periodic_weather_check)
         GLib.timeout_add_seconds(3, self.initial_twitch_check)
         GLib.timeout_add_seconds(TWITCH_CHECK_INTERVAL_SECONDS, self.periodic_twitch_check)
+        GLib.timeout_add_seconds(1, self._timer_tick)
 
     def maybe_auto_show_startup(self):
         if self.has_anything_to_show():
@@ -754,6 +767,41 @@ class RssTray:
         self.active_installs = max(0, self.active_installs - 1)
         self.update_icon()
 
+    def _timer_tick(self):
+        if self.timer_running and self.timer_remaining_seconds > 0:
+            self.timer_remaining_seconds -= 1
+            if self.timer_remaining_seconds <= 0:
+                self.timer_remaining_seconds = 0
+                self.timer_running = False
+                self._fire_timer_done()
+            self._update_timer_widgets()
+        return True
+
+    def _fire_timer_done(self):
+        play_notification_sound()
+        GLib.timeout_add(700, self._play_second_beep)
+
+    def _play_second_beep(self):
+        play_notification_sound()
+        return False
+
+    def _update_timer_widgets(self):
+        if self.timer_scale is None or self.timer_label is None:
+            return
+        self._timer_updating_ui = True
+        self.timer_scale.set_value(self.timer_remaining_seconds)
+        self._timer_updating_ui = False
+        self.timer_label.set_text(format_timer_duration(self.timer_remaining_seconds))
+
+    def on_timer_slider_changed(self, scale):
+        if self._timer_updating_ui:
+            return
+        value = int(scale.get_value())
+        self.timer_remaining_seconds = value
+        self.timer_running = value > 0
+        if self.timer_label is not None:
+            self.timer_label.set_text(format_timer_duration(value))
+
     def _should_show_weather_icon(self, count):
         return (
             count == 0 and not self.has_pkg_update()
@@ -926,6 +974,31 @@ class RssTray:
         outer.pack_start(weather_box, False, False, 0)
         outer.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 0)
 
+        timer_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        timer_box.set_margin_start(8)
+        timer_box.set_margin_end(8)
+        timer_box.set_margin_top(3)
+        timer_box.set_margin_bottom(4)
+
+        timer_label = Gtk.Label()
+        timer_label.set_xalign(0.5)
+        timer_label.set_text(format_timer_duration(self.timer_remaining_seconds))
+        self.timer_label = timer_label
+        timer_box.pack_start(timer_label, False, False, 0)
+
+        timer_adjustment = Gtk.Adjustment(
+            value=self.timer_remaining_seconds, lower=0, upper=7200,
+            step_increment=60, page_increment=300, page_size=0
+        )
+        timer_scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=timer_adjustment)
+        timer_scale.set_draw_value(False)
+        timer_scale.connect('value-changed', self.on_timer_slider_changed)
+        self.timer_scale = timer_scale
+        timer_box.pack_start(timer_scale, False, False, 0)
+
+        outer.pack_start(timer_box, False, False, 0)
+        outer.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 0)
+
         scroller = Gtk.ScrolledWindow()
         scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scroller.set_propagate_natural_height(True)
@@ -980,6 +1053,8 @@ class RssTray:
         if self.popup is not None:
             self.popup.destroy()
             self.popup = None
+            self.timer_scale = None
+            self.timer_label = None
         self.weather_view = 'today'
         self.build_popup_window()
         self._update_scroller_max_height()
