@@ -668,61 +668,67 @@ class RssTray:
     def _on_weather_fetched(self, data):
         if data is not None:
             self.weather_data = data
-        self.update_weather_label()
+        self.rebuild_weather_bar()
         self.update_icon()
         return False
 
     def format_weather_markup(self):
+        """Forecast-view markup only; the 'today' view is built as separate
+        evenly-spaced widgets in rebuild_weather_bar instead of one string."""
         d = self.weather_data
         if not d:
-            return '<span size="large">Weather unavailable</span>'
-
-        if self.weather_view == 'forecast':
-            days = d.get('forecast_days', [])
-            if not days:
-                return '<span size="medium">Forecast unavailable</span>'
-            parts = []
-            for day in days:
-                segment = ''
-                if day.get('rain_prob') is not None and day['rain_prob'] > 0:
-                    segment += '<span foreground="#2b2b2b">\u2614</span> '
-                if day.get('max_temp') is not None and day.get('min_temp') is not None:
-                    segment += GLib.markup_escape_text(
-                        f"{day['max_temp']:.0f}/{day['min_temp']:.0f}\u00b0C"
-                    )
-                if segment:
-                    parts.append(segment)
-            text = " \u00b7 ".join(parts) if parts else "Forecast unavailable"
-            return f'<span size="medium"><b>{text}</b></span>'
-
+            return '<span size="medium">Weather unavailable</span>'
+        days = d.get('forecast_days', [])
+        if not days:
+            return '<span size="medium">Forecast unavailable</span>'
         parts = []
+        for day in days:
+            segment = ''
+            if day.get('rain_prob') is not None and day['rain_prob'] > 0:
+                segment += '<span foreground="#2b2b2b">☔</span> '
+            if day.get('max_temp') is not None and day.get('min_temp') is not None:
+                segment += GLib.markup_escape_text(
+                    f"{day['max_temp']:.0f}/{day['min_temp']:.0f}°C"
+                )
+            if segment:
+                parts.append(segment)
+        text = " · ".join(parts) if parts else "Forecast unavailable"
+        return f'<span size="medium"><b>{text}</b></span>'
+
+    def build_today_weather_segments(self):
+        """Returns a list of independently-markup'd segments (temp, high/low,
+        wind, rain) for the 'today' view — rendered as separate widgets so
+        they can be evenly spaced across the full row."""
+        d = self.weather_data
+        if not d:
+            return []
+        segments = []
         glyph = weather_code_glyph(d.get('weather_code'))
         if d.get('temp') is not None:
             temp_text = GLib.markup_escape_text(f"{d['temp']:.0f}°C")
             if glyph:
                 temp_text = f'<span foreground="#2b2b2b" rise="6000">{glyph}</span>' + temp_text
-            parts.append(temp_text)
+            segments.append(f'<span size="large"><b>{temp_text}</b></span>')
         if d.get('today_max_temp') is not None and d.get('today_min_temp') is not None:
-            parts.append(GLib.markup_escape_text(
+            hi_lo = GLib.markup_escape_text(
                 f"{d['today_max_temp']:.0f}/{d['today_min_temp']:.0f}°C"
-            ))
+            )
+            segments.append(f'<span size="large"><b>{hi_lo}</b></span>')
         if d.get('wind') is not None and d.get('today_max_wind') is not None:
-            parts.append(GLib.markup_escape_text(f"{d['wind']:.0f}/{d['today_max_wind']:.0f} km/h"))
+            wind_text = GLib.markup_escape_text(f"{d['wind']:.0f}/{d['today_max_wind']:.0f} km/h")
+            segments.append(f'<span size="large"><b>{wind_text}</b></span>')
         elif d.get('wind') is not None:
-            parts.append(GLib.markup_escape_text(f"{d['wind']:.0f} km/h"))
+            wind_text = GLib.markup_escape_text(f"{d['wind']:.0f} km/h")
+            segments.append(f'<span size="large"><b>{wind_text}</b></span>')
         if d.get('today_rain_prob') is not None and d.get('today_precip_sum') is not None:
-            parts.append(GLib.markup_escape_text(
+            rain_text = GLib.markup_escape_text(
                 f"{d['today_rain_prob']:.0f}%/{d['today_precip_sum']:.1f}mm"
-            ))
+            )
+            segments.append(f'<span size="large"><b>{rain_text}</b></span>')
         elif d.get('today_rain_prob') is not None:
-            parts.append(GLib.markup_escape_text(f"{d['today_rain_prob']:.0f}%"))
-        text = " · ".join(parts) if parts else "Weather unavailable"
-        return f'<span size="large"><b>{text}</b></span>'
-
-    def update_weather_label(self):
-        if self.weather_label is None:
-            return
-        self.weather_label.set_markup(self.format_weather_markup())
+            rain_text = GLib.markup_escape_text(f"{d['today_rain_prob']:.0f}%")
+            segments.append(f'<span size="large"><b>{rain_text}</b></span>')
+        return segments
 
     def rebuild_weather_bar(self):
         if self.weather_box is None:
@@ -730,26 +736,42 @@ class RssTray:
         for child in self.weather_box.get_children():
             self.weather_box.remove(child)
 
-        label = Gtk.Label()
-        label.set_xalign(0.5)
-        label.set_hexpand(True)
-        label.set_line_wrap(True)
-        label.set_max_width_chars(48)
-        label.set_justify(Gtk.Justification.CENTER)
-        self.weather_label = label
-        self.update_weather_label()
-
         if self.weather_view == 'forecast':
-            back_btn = Gtk.Button(label='\u2039')
-            back_btn.set_relief(Gtk.ReliefStyle.NONE)
+            back_btn = Gtk.Button(label='‹')
             back_btn.set_tooltip_text('Back to today')
             back_btn.connect('clicked', self.on_weather_arrow_clicked, 'today')
             self.weather_box.pack_start(back_btn, False, False, 0)
+
+            label = Gtk.Label()
+            label.set_xalign(0.5)
+            label.set_hexpand(True)
+            label.set_line_wrap(True)
+            label.set_max_width_chars(48)
+            label.set_justify(Gtk.Justification.CENTER)
+            label.set_markup(self.format_weather_markup())
+            self.weather_label = label
             self.weather_box.pack_start(label, True, True, 0)
         else:
-            self.weather_box.pack_start(label, True, True, 0)
-            fwd_btn = Gtk.Button(label='\u203a')
-            fwd_btn.set_relief(Gtk.ReliefStyle.NONE)
+            self.weather_label = None
+            segments = self.build_today_weather_segments()
+            content_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+            content_box.set_hexpand(True)
+            if not segments:
+                lbl = Gtk.Label()
+                lbl.set_markup('<span size="large">Weather unavailable</span>')
+                lbl.set_hexpand(True)
+                lbl.set_xalign(0.5)
+                content_box.pack_start(lbl, True, True, 0)
+            else:
+                for seg in segments:
+                    lbl = Gtk.Label()
+                    lbl.set_markup(seg)
+                    lbl.set_hexpand(True)
+                    lbl.set_xalign(0.5)
+                    content_box.pack_start(lbl, True, True, 0)
+            self.weather_box.pack_start(content_box, True, True, 0)
+
+            fwd_btn = Gtk.Button(label='›')
             fwd_btn.set_tooltip_text('Show 5-day forecast')
             fwd_btn.connect('clicked', self.on_weather_arrow_clicked, 'forecast')
             self.weather_box.pack_start(fwd_btn, False, False, 0)
@@ -759,6 +781,8 @@ class RssTray:
     def on_weather_arrow_clicked(self, _button, target_view):
         self.weather_view = target_view
         self.rebuild_weather_bar()
+
+    def _begin_install(self):
 
     def _begin_install(self):
         self.active_installs += 1
@@ -771,11 +795,7 @@ class RssTray:
 
     def on_timer_toggle_clicked(self, _button):
         self.timer_visible = not self.timer_visible
-        if self.timer_box is not None:
-            if self.timer_visible:
-                self.timer_box.show()
-            else:
-                self.timer_box.hide()
+        self.show_popup()  # full rebuild so the window resizes around the slider correctly
 
     def _timer_tick(self):
         if self.timer_running and self.timer_remaining_seconds > 0:
@@ -997,36 +1017,34 @@ class RssTray:
 
         outer.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
 
-        timer_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        timer_box.set_margin_start(8)
-        timer_box.set_margin_end(8)
-        timer_box.set_margin_top(3)
-        timer_box.set_margin_bottom(4)
-
-        timer_label = Gtk.Label()
-        timer_label.set_xalign(0.5)
-        timer_label.set_text(format_timer_duration(self.timer_remaining_seconds))
-        self.timer_label = timer_label
-        timer_box.pack_start(timer_label, False, False, 0)
-
-        timer_adjustment = Gtk.Adjustment(
-            value=self.timer_remaining_seconds, lower=0, upper=7200,
-            step_increment=60, page_increment=300, page_size=0
-        )
-        timer_scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=timer_adjustment)
-        timer_scale.set_draw_value(False)
-        timer_scale.connect('value-changed', self.on_timer_slider_changed)
-        self.timer_scale = timer_scale
-        timer_box.pack_start(timer_scale, False, False, 0)
-
-        timer_box.show_all()  # mark box + children visible internally, BEFORE no_show_all
-        timer_box.set_no_show_all(True)  # stop the window's later show_all() from force-showing it
-        self.timer_box = timer_box
-        outer.pack_start(timer_box, False, False, 0)
+        self.timer_box = None
+        self.timer_label = None
+        self.timer_scale = None
         if self.timer_visible:
-            timer_box.show()
-        else:
-            timer_box.hide()
+            timer_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            timer_box.set_margin_start(8)
+            timer_box.set_margin_end(8)
+            timer_box.set_margin_top(3)
+            timer_box.set_margin_bottom(4)
+
+            timer_label = Gtk.Label()
+            timer_label.set_xalign(0.5)
+            timer_label.set_text(format_timer_duration(self.timer_remaining_seconds))
+            self.timer_label = timer_label
+            timer_box.pack_start(timer_label, False, False, 0)
+
+            timer_adjustment = Gtk.Adjustment(
+                value=self.timer_remaining_seconds, lower=0, upper=7200,
+                step_increment=60, page_increment=300, page_size=0
+            )
+            timer_scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=timer_adjustment)
+            timer_scale.set_draw_value(False)
+            timer_scale.connect('value-changed', self.on_timer_slider_changed)
+            self.timer_scale = timer_scale
+            timer_box.pack_start(timer_scale, False, False, 0)
+
+            self.timer_box = timer_box
+            outer.pack_start(timer_box, False, False, 0)
 
         footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         footer.set_margin_start(6)
@@ -1115,7 +1133,12 @@ class RssTray:
 
         feeds_map = {url: (custom_name or url) for url, custom_name, _interval in load_feeds()}
 
-        if not unread and not available and not live_channels:
+        truly_empty = not unread and not available and not live_channels
+        only_live_remains = (not unread and not available) and bool(live_channels)
+        popup_already_visible = bool(self.popup and self.popup.get_visible())
+        should_hide = truly_empty or (only_live_remains and popup_already_visible)
+
+        if should_hide:
             row = Gtk.ListBoxRow()
             row.set_selectable(False)
             row.set_activatable(False)
@@ -1221,41 +1244,45 @@ class RssTray:
         row.set_selectable(False)
         row.set_activatable(True)
         row.twitch_channel = channel
-        tooltip = f"Watch {channel}"
-        if title:
-            tooltip += f" — {title}"
-        tooltip += f"\nstreamlink --player mpv twitch.tv/{channel} best"
-        row.set_tooltip_text(tooltip)
 
-        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        outer.set_margin_start(3)
-        outer.set_margin_end(3)
-        outer.set_margin_top(1)
-        outer.set_margin_bottom(1)
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        box.set_margin_start(3)
+        box.set_margin_end(3)
+        box.set_margin_top(0)
+        box.set_margin_bottom(0)
 
-        top_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         dot = Gtk.Label()
         dot.set_markup('<span foreground="#9146FF"><b>●</b></span>')
-        top_row.pack_start(dot, False, False, 0)
+        box.pack_start(dot, False, False, 0)
 
-        name_label = Gtk.Label()
-        name_label.set_markup(f'<span foreground="#000000"><b>{GLib.markup_escape_text(channel)}</b></span>')
-        name_label.set_xalign(0)
-        name_label.set_hexpand(True)
-        top_row.pack_start(name_label, True, True, 0)
-        outer.pack_start(top_row, False, False, 0)
-
+        channel_esc = GLib.markup_escape_text(channel)
+        trimmed = False
         if title:
-            shown_title = title if len(title) <= MAX_TITLE_LEN else title[:MAX_TITLE_LEN - 1] + '…'
-            title_label = Gtk.Label()
-            title_label.set_markup(
-                f'<span size="small" foreground="#555555">{GLib.markup_escape_text(shown_title)}</span>'
-            )
-            title_label.set_xalign(0)
-            title_label.set_margin_start(14)
-            outer.pack_start(title_label, False, False, 0)
+            prefix_len = len(channel) + 3  # " - "
+            available = max(0, MAX_TITLE_LEN - prefix_len)
+            if len(title) > available:
+                cut_len = max(available - 1, 0)
+                shown_title = (title[:cut_len] + '…') if cut_len > 0 else '…'
+                trimmed = True
+            else:
+                shown_title = title
+            title_esc = GLib.markup_escape_text(shown_title)
+            markup = f'<span foreground="#000000"><b>{channel_esc}</b> - {title_esc}</span>'
+        else:
+            markup = f'<span foreground="#000000"><b>{channel_esc}</b></span>'
 
-        row.add(outer)
+        label = Gtk.Label()
+        label.set_markup(markup)
+        label.set_xalign(0)
+        label.set_ellipsize(Pango.EllipsizeMode.END)
+        label.set_hexpand(True)
+        box.pack_start(label, True, True, 0)
+
+        if trimmed:
+            row.set_tooltip_text(title)
+            label.set_tooltip_text(title)
+
+        row.add(box)
         return row
 
     def build_info_row(self, entry):
