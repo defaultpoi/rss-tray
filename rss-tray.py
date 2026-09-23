@@ -793,7 +793,10 @@ class RssTray:
 
     def on_timer_toggle_clicked(self, _button):
         self.timer_visible = not self.timer_visible
-        self.show_popup()  # full rebuild so the window resizes around the slider correctly
+        if self.timer_label is not None:
+            self.timer_label.set_visible(self.timer_visible)
+        if self.timer_scale is not None:
+            self.timer_scale.set_visible(self.timer_visible)
 
     def _timer_tick(self):
         if self.timer_running and self.timer_remaining_seconds > 0:
@@ -1015,34 +1018,35 @@ class RssTray:
 
         outer.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
 
-        self.timer_box = None
-        self.timer_label = None
-        self.timer_scale = None
-        if self.timer_visible:
-            timer_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-            timer_box.set_margin_start(8)
-            timer_box.set_margin_end(8)
-            timer_box.set_margin_top(3)
-            timer_box.set_margin_bottom(4)
+        timer_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        timer_box.set_margin_start(8)
+        timer_box.set_margin_end(8)
+        timer_box.set_margin_top(3)
+        timer_box.set_margin_bottom(4)
+        timer_box.set_size_request(-1, 52)  # fixed height — always reserved, regardless of toggle state
 
-            timer_label = Gtk.Label()
-            timer_label.set_xalign(0.5)
-            timer_label.set_text(format_timer_duration(self.timer_remaining_seconds))
-            self.timer_label = timer_label
-            timer_box.pack_start(timer_label, False, False, 0)
+        timer_label = Gtk.Label()
+        timer_label.set_xalign(0.5)
+        timer_label.set_text(format_timer_duration(self.timer_remaining_seconds))
+        timer_label.set_visible(self.timer_visible)
+        timer_label.set_no_show_all(True)
+        self.timer_label = timer_label
+        timer_box.pack_start(timer_label, False, False, 0)
 
-            timer_adjustment = Gtk.Adjustment(
-                value=self.timer_remaining_seconds, lower=0, upper=7200,
-                step_increment=60, page_increment=300, page_size=0
-            )
-            timer_scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=timer_adjustment)
-            timer_scale.set_draw_value(False)
-            timer_scale.connect('value-changed', self.on_timer_slider_changed)
-            self.timer_scale = timer_scale
-            timer_box.pack_start(timer_scale, False, False, 0)
+        timer_adjustment = Gtk.Adjustment(
+            value=self.timer_remaining_seconds, lower=0, upper=7200,
+            step_increment=60, page_increment=300, page_size=0
+        )
+        timer_scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=timer_adjustment)
+        timer_scale.set_draw_value(False)
+        timer_scale.connect('value-changed', self.on_timer_slider_changed)
+        timer_scale.set_visible(self.timer_visible)
+        timer_scale.set_no_show_all(True)
+        self.timer_scale = timer_scale
+        timer_box.pack_start(timer_scale, False, False, 0)
 
-            self.timer_box = timer_box
-            outer.pack_start(timer_box, False, False, 0)
+        self.timer_box = timer_box
+        outer.pack_start(timer_box, False, False, 0)
 
         footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         footer.set_margin_start(6)
