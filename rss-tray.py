@@ -761,6 +761,7 @@ class RssTray:
                 lbl.set_markup('<span size="large">Weather unavailable</span>')
                 lbl.set_hexpand(True)
                 lbl.set_xalign(0.5)
+                lbl.set_valign(Gtk.Align.END)
                 content_box.pack_start(lbl, True, True, 0)
             else:
                 for seg in segments:
@@ -768,6 +769,7 @@ class RssTray:
                     lbl.set_markup(seg)
                     lbl.set_hexpand(True)
                     lbl.set_xalign(0.5)
+                    lbl.set_valign(Gtk.Align.END)
                     content_box.pack_start(lbl, True, True, 0)
             self.weather_box.pack_start(content_box, True, True, 0)
 
@@ -962,6 +964,7 @@ class RssTray:
         list row { padding: 1px 3px; min-height: 0px; }
         button { padding: 1px; }
         .weather-bar { background-color: #e8eef5; }
+        .timer-bar { background-color: #ffffff; }
         """
         provider = Gtk.CssProvider()
         provider.load_from_data(css)
@@ -1024,6 +1027,7 @@ class RssTray:
         timer_box.set_margin_top(3)
         timer_box.set_margin_bottom(4)
         timer_box.set_size_request(-1, 52)  # fixed height — always reserved, regardless of toggle state
+        timer_box.get_style_context().add_class('timer-bar')
 
         timer_label = Gtk.Label()
         timer_label.set_xalign(0.5)
