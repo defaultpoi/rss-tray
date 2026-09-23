@@ -783,8 +783,6 @@ class RssTray:
         self.rebuild_weather_bar()
 
     def _begin_install(self):
-
-    def _begin_install(self):
         self.active_installs += 1
         self.update_icon()
         self.refresh_list()  # show per-row status under "Updates available"
