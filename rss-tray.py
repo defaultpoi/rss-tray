@@ -38,9 +38,7 @@ MAX_LIST_ITEMS = 40
 MAX_TITLE_LEN = 60
 MAX_ITEM_AGE_SECONDS = 24 * 3600  # ignore entries older than this on first sight
 SEEN_RETENTION_SECONDS = 30 * 24 * 3600  # prune seen-item records older than this
-PRIVILEGE_CMD = ['sudo']  # change to ['doas'] if that's what you use; requires
-                          # passwordless (NOPASSWD) rules for xbps-install, since
-                          # updates run headlessly with no terminal/tty attached
+PRIVILEGE_CMD = ['sudo', '-n']  # headless update: fail fast if authentication is required
 WINDOW_WIDTH = 471  # 380 * 1.2, +15px total
 UPDATE_TIMEOUT_SECONDS = 1800  # 30 minutes
 NOTIFICATION_SOUND_CANDIDATES = [
@@ -1029,11 +1027,10 @@ class RssTray:
         self.listbox.set_selection_mode(Gtk.SelectionMode.NONE)
         self.listbox.connect('row-activated', self.on_row_activated)
         self.listbox.connect('button-press-event', self.on_listbox_button_press)
-        self.listbox.set_margin_bottom(60)  # reserved space the timer slider overlays onto
         scroller.add(self.listbox)
 
-        content_overlay = Gtk.Overlay()
-        content_overlay.add(scroller)
+        content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        content_box.pack_start(scroller, True, True, 0)
 
         timer_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         timer_box.set_margin_start(8)
@@ -1064,9 +1061,9 @@ class RssTray:
         timer_box.pack_start(timer_scale, False, False, 0)
 
         self.timer_box = timer_box
-        content_overlay.add_overlay(timer_box)
+        content_box.pack_start(timer_box, False, False, 0)
 
-        outer.pack_start(content_overlay, True, True, 0)
+        outer.pack_start(content_box, True, True, 0)
 
         outer.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
 
@@ -1112,15 +1109,13 @@ class RssTray:
     def show_popup(self, auto=False):
         if auto and is_fullscreen_active():
             return  # don't interrupt a fullscreen video/game/presentation
-        if self.popup is not None:
-            self.popup.destroy()
-            self.popup = None
-            self.timer_scale = None
-            self.timer_label = None
-            self.timer_box = None
-        self.weather_view = 'today'
-        self.build_popup_window()
-        self._update_scroller_max_height()
+        if self.popup is None:
+            self.weather_view = 'today'
+            self.build_popup_window()
+            self._update_scroller_max_height()
+        else:
+            self.weather_view = 'today'
+            self.rebuild_weather_bar()
         self.refresh_list()
         self.position_popup()
         self.popup.show_all()
@@ -1130,19 +1125,32 @@ class RssTray:
     def position_popup(self):
         display = Gdk.Display.get_default()
         monitor = display.get_primary_monitor() or display.get_monitor(0)
-        geo = monitor.get_geometry()
-
-        x = geo.x + geo.width - WINDOW_WIDTH  # flush against the right edge
-
-        y = geo.y + 2  # flush against the top, as a fallback
+        icon_area = None
         try:
             ok, _screen, area, _orientation = self.status_icon.get_geometry()
             if ok and area is not None:
-                y = area.y + area.height + 4  # 4px below the panel/tray icon
+                icon_area = area
+                monitor = display.get_monitor_at_point(
+                    area.x + area.width // 2,
+                    area.y + area.height // 2,
+                ) or monitor
         except Exception:
             pass
 
-        self.popup.move(max(x, 0), max(y, 0))
+        geo = monitor.get_geometry()
+        x = geo.x + geo.width - WINDOW_WIDTH
+        y = icon_area.y + icon_area.height + 4 if icon_area is not None else geo.y + 2
+
+        workarea = monitor.get_workarea() if hasattr(monitor, 'get_workarea') else geo
+        width, height = self.popup.get_size()
+        if width > 0:
+            x = min(x, workarea.x + workarea.width - width)
+            x = max(x, workarea.x)
+        if height > 0:
+            y = min(y, workarea.y + workarea.height - height)
+            y = max(y, workarea.y)
+
+        self.popup.move(x, y)
 
     def refresh_list(self):
         for child in self.listbox.get_children():
@@ -1439,38 +1447,31 @@ class RssTray:
         with self._xbps_lock:
             for pkgname in pkgnames:
                 self._set_status(pkgname, 'Installing…')
-                before = get_installed_version(pkgname)
-                cmd = PRIVILEGE_CMD + ['xbps-install', '-Su', '-y', pkgname]
-                returncode = -1
+
+            cmd = PRIVILEGE_CMD + ['xbps-install', '-Su', '-y']
+            returncode = -1
+            try:
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True
+                )
                 try:
-                    proc = subprocess.Popen(
-                        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        text=True, bufsize=1
-                    )
-                    # xbps-install prints section headers like "[*] Downloading
-                    # packages", "[*] Collecting package files", "[*] Unpacking
-                    # packages", "[*] Configuring unpacked packages" — the actual
-                    # per-file lines under them don't contain words like
-                    # "download" at all, so we key off these headers instead.
-                    # Since we install one package at a time, every line in this
-                    # stream belongs to the current package regardless of wording.
-                    for line in proc.stdout:
-                        stripped = line.strip()
-                        if stripped.startswith('[*] Downloading'):
-                            self._set_status(pkgname, 'Downloading…')
-                        elif stripped.startswith('[*]'):
-                            self._set_status(pkgname, 'Installing…')
-                    proc.wait(timeout=UPDATE_TIMEOUT_SECONDS)
+                    proc.communicate(timeout=UPDATE_TIMEOUT_SECONDS)
                     returncode = proc.returncode
-                except Exception:
-                    pass
-                after = get_installed_version(pkgname)
-                success = returncode == 0 and before != after
-                if success:
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.communicate()
+            except Exception:
+                pass
+
+            if returncode == 0:
+                for pkgname in pkgnames:
                     self._set_status(pkgname, 'Done')
                     GLib.timeout_add(1200, self._finalize_package_removal, pkgname)
-                else:
+            else:
+                for pkgname in pkgnames:
                     self._set_status(pkgname, 'Failed')
+
         GLib.idle_add(self._end_install)
 
     def on_row_activated(self, _listbox, row):
