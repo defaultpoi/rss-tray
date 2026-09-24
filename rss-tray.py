@@ -172,8 +172,12 @@ def load_mute_filters():
 
 
 def load_twitch_channels():
-    """Returns a list of lowercase Twitch channel login names to watch."""
-    return [line.strip().lower() for line in _read_config_sections()['twitch'] if line.strip()]
+    """Returns a de-duplicated list of lowercase Twitch channel login names to watch."""
+    return list(dict.fromkeys(
+        line.strip().lower()
+        for line in _read_config_sections()['twitch']
+        if line.strip()
+    ))
 
 
 def is_muted(title, mute_phrases):
@@ -181,23 +185,27 @@ def is_muted(title, mute_phrases):
     return any(phrase in title_lower for phrase in mute_phrases)
 
 
-def is_online():
-    """Quick, low-cost check for basic network connectivity."""
-    try:
-        socket.create_connection(("1.1.1.1", 53), timeout=2)
-        return True
-    except OSError:
-        return False
-
-
 def load_state():
+    default = {
+        "seen": {},
+        "unread": [],
+        "last_checked": {},
+        "available_updates": [],
+        "updates_last_checked": 0,
+        "live_channels": [],
+    }
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE) as f:
-                return json.load(f)
+                state = json.load(f)
+            if isinstance(state, dict):
+                for key, value in default.items():
+                    if key not in state or not isinstance(state[key], type(value)):
+                        state[key] = value
+                return state
         except (json.JSONDecodeError, OSError):
             pass
-    return {"seen": {}, "unread": []}
+    return default
 
 
 def save_state(state):
@@ -250,9 +258,9 @@ def list_all_updates():
             capture_output=True, text=True, timeout=60
         )
     except Exception:
-        return []
+        return False, []
     if result.returncode != 0:
-        return []
+        return False, []
     output = (result.stdout or '') + (result.stderr or '')
     updates = []
     for line in output.splitlines():
@@ -266,7 +274,7 @@ def list_all_updates():
         match = re.match(r'^(.+)-[0-9][^-]*$', pkgver_token)
         if match:
             updates.append(match.group(1))
-    return updates
+    return True, updates
 
 
 def check_twitch_live_channels(channels):
@@ -455,6 +463,7 @@ class RssTray:
         self._check_lock = threading.Lock()  # guards overlapping feed-check cycles only
         self._xbps_lock = threading.Lock()   # guards xbps db access (scans + installs), separately
         self._twitch_lock = threading.Lock()  # guards overlapping Twitch-check cycles
+        self._weather_lock = threading.Lock()  # guards overlapping weather fetches
         self.popup = None
         self.listbox = None
         self.scroller = None
@@ -466,6 +475,7 @@ class RssTray:
         self.install_status = {}  # pkgname -> 'Waiting…'/'Downloading…'/'Installing…'/'Done'/'Failed'
         self.timer_remaining_seconds = 0
         self.timer_running = False
+        self.timer_deadline = 0.0
         self._timer_updating_ui = False
         self.timer_scale = None
         self.timer_label = None
@@ -494,9 +504,6 @@ class RssTray:
         return False
 
     def initial_check(self):
-        if not is_online():
-            GLib.timeout_add_seconds(NETWORK_RETRY_SECONDS, self.initial_check)
-            return False
         self.start_check_thread(force=True)
         return False
 
@@ -583,7 +590,10 @@ class RssTray:
             last = self.state.get('updates_last_checked', 0)
         if not force and (now - last) < PENDING_CHECK_INTERVAL_SECONDS:
             return
-        pkgnames = list_all_updates()
+        with self._xbps_lock:
+            scan_ok, pkgnames = list_all_updates()
+        if not scan_ok:
+            return
         with self.lock:
             existing = {e['pkgname']: e for e in self.state.get('available_updates', [])}
             promoted_new = []
@@ -610,9 +620,6 @@ class RssTray:
         return False
 
     def initial_twitch_check(self):
-        if not is_online():
-            GLib.timeout_add_seconds(NETWORK_RETRY_SECONDS, self.initial_twitch_check)
-            return False
         self.start_twitch_check()
         return False
 
@@ -659,11 +666,16 @@ class RssTray:
         return True
 
     def start_weather_fetch(self):
+        if not self._weather_lock.acquire(blocking=False):
+            return
         threading.Thread(target=self._fetch_weather_bg, daemon=True).start()
 
     def _fetch_weather_bg(self):
-        data = fetch_weather()
-        GLib.idle_add(self._on_weather_fetched, data)
+        try:
+            data = fetch_weather()
+            GLib.idle_add(self._on_weather_fetched, data)
+        finally:
+            self._weather_lock.release()
 
     def _on_weather_fetched(self, data):
         if data is not None:
@@ -799,13 +811,14 @@ class RssTray:
             self.timer_box.set_visible(self.timer_visible)
 
     def _timer_tick(self):
-        if self.timer_running and self.timer_remaining_seconds > 0:
-            self.timer_remaining_seconds -= 1
-            if self.timer_remaining_seconds <= 0:
-                self.timer_remaining_seconds = 0
+        if self.timer_running:
+            remaining = max(0, int(self.timer_deadline - time_module.monotonic() + 0.5))
+            if remaining != self.timer_remaining_seconds:
+                self.timer_remaining_seconds = remaining
+                self._update_timer_widgets()
+            if remaining <= 0:
                 self.timer_running = False
                 self._fire_timer_done()
-            self._update_timer_widgets()
         return True
 
     def _fire_timer_done(self):
@@ -830,6 +843,8 @@ class RssTray:
         value = int(scale.get_value())
         self.timer_remaining_seconds = value
         self.timer_running = value > 0
+        if self.timer_running:
+            self.timer_deadline = time_module.monotonic() + value
         if self.timer_label is not None:
             self.timer_label.set_text(format_timer_duration(value))
 
