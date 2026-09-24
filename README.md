@@ -15,7 +15,7 @@ Originally built for XFCE on Void Linux, but should work on any Linux desktop wi
 - **Custom feed names** — override a feed's often-verbose title with a short display name.
 - **Per-feed check intervals** — override the global check frequency for individual feeds (e.g. check a fast-moving feed every 5 minutes, a quiet one every hour).
 - **Ignores backlog on new feeds** — when you first add a feed, only items from the last 24 hours are surfaced as unread; older entries are silently marked as seen instead of flooding your list.
-- **Void package-update detection (optional, per feed)** — flag a feed (e.g. void-packages' commit feed) as a `pkgfeed`; entries whose title matches an installed package are highlighted with an update icon, and clicking one (after a confirmation prompt) runs `xbps-install -Su <package>` in a terminal.
+- **Void package-update detection** — periodically checks the system-wide XBPS update list and shows available package updates in the popup. “Install all” runs one full `xbps-install -Su` transaction.
 - **Persistent state, pruned automatically** — read/unread status and per-feed check timestamps survive restarts; seen-item records older than 30 days are pruned so the state file doesn't grow forever.
 
 ## Requirements
@@ -26,7 +26,7 @@ Originally built for XFCE on Void Linux, but should work on any Linux desktop wi
 - `feedparser` — via your distro's package manager (`python3-feedparser` on Void) or `pip install --user feedparser`
 - A GTK3-compatible system tray / notification area in your desktop environment
 - `xbps-query` / `xbps-install` on the `PATH` if you use the package-update detection feature (Void Linux only)
-- A terminal emulator for running package updates — the script looks for `xfce4-terminal`, falling back to `x-terminal-emulator`
+- `sudo` (or adapt `PRIVILEGE_CMD` in the script if you use another privilege helper); updates run headlessly and require non-interactive authentication
 
 ### Install dependencies on Void Linux
 
@@ -67,47 +67,40 @@ Replace `YOUR_USER` with your actual username.
 
 ## Configuration
 
-On first run, a default config is created at `~/.config/rss-tray/feeds.conf`. Add one feed per line:
+On first run, a default config is created at `~/.config/rss-tray/config.conf`. It uses INI-style sections:
 
-URL|custom display name (optional)|check interval in minutes (optional)|pkgfeed flag (optional)
-
-All fields after the URL are optional but positional — leave a field empty to skip it while still setting a later one.
-
-**Examples:**
-
+```ini
+[feeds]
 https://example.com/feed.xml
 https://example.com/feed.xml|My Blog
 https://example.com/feed.xml|My Blog|5
-https://github.com/void-linux/void-packages/commits/master.atom|void-package|30|pkgfeed
 
+[mute]
+# One phrase per line, or several separated by | on one line.
+(Fashion)|spoiler
 
-The above sets a display name of "My Blog" with a 5-minute check interval for the second feed, and enables package-update detection with a 30-minute check interval for the void-packages commit feed.
+[twitch]
+# Twitch channel login names to watch, one per line.
+examplechannel
+```
 
-Edit this file directly, or use the **"Edit feeds"** button in the dropdown, which opens it in your default text editor (via `xdg-open`, falling back to a terminal editor).
+Feed fields are positional: URL, optional display name, optional check interval in minutes. The old `feeds.conf` and `mute.conf` files are migrated automatically when no `config.conf` exists; the legacy files are left untouched.
 
-Changes to `feeds.conf` take effect on the next check cycle — no restart needed for display-name changes (applied live), though newly added feeds and interval changes are picked up on the next scheduled or manual check.
+Edit the config directly, or use the **"Edit config"** button in the dropdown. Changes are picked up on the next scheduled or manual check.
 
 ### State file
 
 Read/unread status, seen-item history, and per-feed check timestamps are stored in `~/.config/rss-tray/state.json`. Delete this file to reset everything from scratch (e.g. for testing).
 
-## Passwordless package updates (optional)
+## Package updates
 
-If you use the `pkgfeed` package-update detection, clicking a matched item normally prompts for your `sudo` password in a terminal. To skip that prompt, add a scoped sudoers rule:
+The package-update check is read-only and runs `xbps-install -Mn -u`. Installing all detected updates runs one headless `sudo -n xbps-install -Su -y` transaction. If `sudo -n` cannot authenticate, the update is reported as failed rather than opening a terminal or waiting for input.
 
-```bash
-sudo visudo -f /etc/sudoers.d/rss-tray
-```
-
-Add (replacing `YOUR_USER`):
-YOUR_USER ALL=(root) NOPASSWD: /usr/bin/xbps-install -Su *
-
-
-**Security note:** this allows any process running as your user to invoke `xbps-install` as root without a password — not just this script. Only add this rule if you're comfortable with that trade-off. A confirmation dialog still appears in the app before any update command runs, regardless of whether `sudo` itself prompts.
+**Security note:** if you configure passwordless sudo for this command, scope the rule narrowly to the exact command and understand that any process running as your user could invoke it.
 
 ## How it works
 
-- A background thread checks feeds on a schedule (default: every 10 minutes per feed, overridable per feed), fetching each via `feedparser` with a 15-second timeout.
+- A background thread checks feeds on a schedule (default: every 10 minutes per feed, overridable per feed), with network timeouts applied to individual requests.
 - New entries are matched by a hash of their `id`/`link`/title+date, so previously-seen items won't reappear even after a restart.
 - Entries older than 24 hours are marked seen but not surfaced as unread the first time a feed is checked — this only matters when a feed is brand new to your config.
 - The tray icon is drawn on the fly with Cairo (a colored circle with the unread count), avoiding any dependency on icon themes for the badge itself.
@@ -115,7 +108,7 @@ YOUR_USER ALL=(root) NOPASSWD: /usr/bin/xbps-install -Su *
 
 ## Known limitations
 
-- Package-name matching for `pkgfeed` entries is a heuristic based on void-packages' `pkgname: description` commit message convention. Unusually formatted commits may not be detected.
+- XBPS update detection depends on the local Void package manager and repository metadata being available. A failed scan leaves previously detected updates intact rather than treating the failure as “no updates”.
 - `Gtk.StatusIcon` (used for the tray icon) is deprecated upstream in favor of StatusNotifier/AppIndicator APIs, but remains functional on XFCE and most X11 panels. If your desktop environment drops support for it, the tray icon may stop appearing.
 - No desktop notifications (e.g. via `notify-send`) are sent when new items arrive — the popup auto-opening is the current mechanism for surfacing new items.
 
