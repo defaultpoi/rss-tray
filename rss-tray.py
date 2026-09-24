@@ -41,7 +41,7 @@ SEEN_RETENTION_SECONDS = 30 * 24 * 3600  # prune seen-item records older than th
 PRIVILEGE_CMD = ['sudo']  # change to ['doas'] if that's what you use; requires
                           # passwordless (NOPASSWD) rules for xbps-install, since
                           # updates run headlessly with no terminal/tty attached
-WINDOW_WIDTH = 466  # 380 * 1.2, +10px
+WINDOW_WIDTH = 471  # 380 * 1.2, +15px total
 UPDATE_TIMEOUT_SECONDS = 1800  # 30 minutes
 NOTIFICATION_SOUND_CANDIDATES = [
     os.path.join(CONFIG_DIR, 'notification.wav'),  # QuiteRSS's notification sound, if present
@@ -707,7 +707,7 @@ class RssTray:
         if d.get('temp') is not None:
             temp_text = GLib.markup_escape_text(f"{d['temp']:.0f}°C")
             if glyph:
-                temp_text = f'<span foreground="#2b2b2b" rise="6000">{glyph}</span>' + temp_text
+                temp_text = f'<span foreground="#2b2b2b" rise="2000">{glyph}</span>' + temp_text
             segments.append(f'<span size="large"><b>{temp_text}</b></span>')
         if d.get('today_max_temp') is not None and d.get('today_min_temp') is not None:
             hi_lo = GLib.markup_escape_text(
@@ -795,10 +795,8 @@ class RssTray:
 
     def on_timer_toggle_clicked(self, _button):
         self.timer_visible = not self.timer_visible
-        if self.timer_label is not None:
-            self.timer_label.set_visible(self.timer_visible)
-        if self.timer_scale is not None:
-            self.timer_scale.set_visible(self.timer_visible)
+        if self.timer_box is not None:
+            self.timer_box.set_visible(self.timer_visible)
 
     def _timer_tick(self):
         if self.timer_running and self.timer_remaining_seconds > 0:
@@ -1016,24 +1014,27 @@ class RssTray:
         self.listbox.set_selection_mode(Gtk.SelectionMode.NONE)
         self.listbox.connect('row-activated', self.on_row_activated)
         self.listbox.connect('button-press-event', self.on_listbox_button_press)
+        self.listbox.set_margin_bottom(60)  # reserved space the timer slider overlays onto
         scroller.add(self.listbox)
-        outer.pack_start(scroller, True, True, 0)
 
-        outer.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
+        content_overlay = Gtk.Overlay()
+        content_overlay.add(scroller)
 
         timer_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         timer_box.set_margin_start(8)
         timer_box.set_margin_end(8)
         timer_box.set_margin_top(3)
         timer_box.set_margin_bottom(4)
-        timer_box.set_size_request(-1, 52)  # fixed height — always reserved, regardless of toggle state
+        timer_box.set_size_request(-1, 60)
+        timer_box.set_halign(Gtk.Align.FILL)
+        timer_box.set_valign(Gtk.Align.END)
         timer_box.get_style_context().add_class('timer-bar')
+        timer_box.set_no_show_all(True)
+        timer_box.set_visible(self.timer_visible)
 
         timer_label = Gtk.Label()
         timer_label.set_xalign(0.5)
         timer_label.set_text(format_timer_duration(self.timer_remaining_seconds))
-        timer_label.set_visible(self.timer_visible)
-        timer_label.set_no_show_all(True)
         self.timer_label = timer_label
         timer_box.pack_start(timer_label, False, False, 0)
 
@@ -1044,13 +1045,15 @@ class RssTray:
         timer_scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=timer_adjustment)
         timer_scale.set_draw_value(False)
         timer_scale.connect('value-changed', self.on_timer_slider_changed)
-        timer_scale.set_visible(self.timer_visible)
-        timer_scale.set_no_show_all(True)
         self.timer_scale = timer_scale
         timer_box.pack_start(timer_scale, False, False, 0)
 
         self.timer_box = timer_box
-        outer.pack_start(timer_box, False, False, 0)
+        content_overlay.add_overlay(timer_box)
+
+        outer.pack_start(content_overlay, True, True, 0)
+
+        outer.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 2)
 
         footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         footer.set_margin_start(6)
@@ -1110,23 +1113,20 @@ class RssTray:
         self.popup.grab_focus()
 
     def position_popup(self):
-        x = y = None
+        display = Gdk.Display.get_default()
+        monitor = display.get_primary_monitor() or display.get_monitor(0)
+        geo = monitor.get_geometry()
+
+        x = geo.x + geo.width - WINDOW_WIDTH  # flush against the right edge
+
+        y = geo.y + 2  # flush against the top, as a fallback
         try:
-            ok, screen, area, _orientation = self.status_icon.get_geometry()
+            ok, _screen, area, _orientation = self.status_icon.get_geometry()
+            if ok and area is not None:
+                y = area.y + area.height + 4  # 4px below the panel/tray icon
         except Exception:
-            ok = False
-        if ok and area is not None:
-            x = area.x
-            y = area.y + area.height
-            screen_width = screen.get_width() if screen else None
-            if screen_width and x + WINDOW_WIDTH > screen_width:
-                x = screen_width - WINDOW_WIDTH - 4
-        if x is None:
-            display = Gdk.Display.get_default()
-            monitor = display.get_primary_monitor() or display.get_monitor(0)
-            geo = monitor.get_geometry()
-            x = geo.x + geo.width - WINDOW_WIDTH - 10
-            y = geo.y + 30
+            pass
+
         self.popup.move(max(x, 0), max(y, 0))
 
     def refresh_list(self):
