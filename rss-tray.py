@@ -38,7 +38,8 @@ MAX_LIST_ITEMS = 40
 MAX_TITLE_LEN = 60
 MAX_ITEM_AGE_SECONDS = 24 * 3600  # ignore entries older than this on first sight
 SEEN_RETENTION_SECONDS = 30 * 24 * 3600  # prune seen-item records older than this
-PRIVILEGE_CMD = ['sudo']  # change to ['doas'] if that's what you use; requires
+PRIVILEGE_CMD = ['sudo', '-n']  # -n: fail fast rather than hang if a password would be needed;
+                          # change to ['doas'] if that's what you use; requires
                           # passwordless (NOPASSWD) rules for xbps-install, since
                           # updates run headlessly with no terminal/tty attached
 WINDOW_WIDTH = 471  # 380 * 1.2, +15px total
@@ -172,8 +173,16 @@ def load_mute_filters():
 
 
 def load_twitch_channels():
-    """Returns a list of lowercase Twitch channel login names to watch."""
-    return [line.strip().lower() for line in _read_config_sections()['twitch'] if line.strip()]
+    """Returns a list of lowercase Twitch channel login names to watch,
+    de-duplicated while preserving the order they appear in the config."""
+    seen = set()
+    channels = []
+    for line in _read_config_sections()['twitch']:
+        ch = line.strip().lower()
+        if ch and ch not in seen:
+            seen.add(ch)
+            channels.append(ch)
+    return channels
 
 
 def is_muted(title, mute_phrases):
@@ -191,13 +200,30 @@ def is_online():
 
 
 def load_state():
+    state = {"seen": {}, "unread": []}
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE) as f:
-                return json.load(f)
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                state = loaded
         except (json.JSONDecodeError, OSError):
             pass
-    return {"seen": {}, "unread": []}
+
+    # Validate shape — a corrupted/hand-edited state.json shouldn't crash
+    # the app elsewhere; reset just the offending key to a sane default.
+    if not isinstance(state.get('seen'), dict):
+        state['seen'] = {}
+    if not isinstance(state.get('unread'), list):
+        state['unread'] = []
+    if not isinstance(state.get('available_updates'), list):
+        state['available_updates'] = []
+    if not isinstance(state.get('live_channels'), list):
+        state['live_channels'] = []
+    if not isinstance(state.get('last_checked'), dict):
+        state['last_checked'] = {}
+
+    return state
 
 
 def save_state(state):
