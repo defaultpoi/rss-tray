@@ -585,9 +585,21 @@ class RssTray:
     def _check_feeds_guarded(self, force):
         try:
             self.check_feeds(force)
-            self.check_updates_if_due(force=force)
         finally:
             self._check_lock.release()
+
+    def initial_updates_check(self):
+        self.start_update_check(force=True)
+        return False
+
+    def periodic_updates_check(self):
+        self.start_update_check()
+        return True
+
+    def start_update_check(self, force=False):
+        threading.Thread(
+            target=self.check_updates_if_due, args=(force,), daemon=True
+        ).start()
 
     def check_feeds(self, force=False):
         feeds = load_feeds()
@@ -659,28 +671,49 @@ class RssTray:
     def check_updates_if_due(self, force=False):
         now = time_module.time()
         with self.lock:
-            last = self.state.get('updates_last_checked', 0)
-        if not force and (now - last) < PENDING_CHECK_INTERVAL_SECONDS:
-            return
-        pkgnames = list_all_updates()
+            last_checked = self.state.get('updates_last_checked', 0)
+            last_attempt = self.state.get('updates_last_attempt', 0)
+            retry_delay = self.state.get('updates_retry_delay', UPDATE_RETRY_INITIAL_SECONDS)
+
+        if not force:
+            if (now - last_checked) < PENDING_CHECK_INTERVAL_SECONDS:
+                return
+            if (now - last_attempt) < retry_delay:
+                return
+
+        with self._xbps_lock:
+            pkgnames = list_all_updates()
+
         with self.lock:
+            self.state['updates_last_attempt'] = now
+            if pkgnames is None:
+                self.state['updates_retry_delay'] = min(
+                    UPDATE_RETRY_MAX_SECONDS,
+                    max(UPDATE_RETRY_INITIAL_SECONDS, retry_delay * 2)
+                )
+                save_state(self.state)
+                return
+
             existing = {e['pkgname']: e for e in self.state.get('available_updates', [])}
             promoted_new = []
             for pkgname in pkgnames:
                 if pkgname not in existing:
                     entry = {
-                        'id': hashlib.sha1(f"update:{pkgname}".encode()).hexdigest(),
-                        'title': f"Update available for {pkgname}",
+                        'id': hashlib.sha1(('update:' + pkgname).encode()).hexdigest(),
+                        'title': 'Update available for ' + pkgname,
                         'link': '',
                         'pkgname': pkgname,
                     }
                     existing[pkgname] = entry
                     promoted_new.append(entry)
+
             self.state['available_updates'] = [existing[p] for p in pkgnames if p in existing]
             self.state['updates_last_checked'] = now
+            self.state['updates_retry_delay'] = UPDATE_RETRY_INITIAL_SECONDS
             save_state(self.state)
+
         if promoted_new:
-            GLib.idle_add(self.on_new_items)  # reuse: sound + auto-popup + icon refresh
+            GLib.idle_add(self.on_new_items)
 
     def on_new_items(self):
         self.update_icon()
