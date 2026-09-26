@@ -13,9 +13,10 @@ import cairo
 import feedparser
 import json
 import os
+import logging
 import re
 import shutil
-import socket
+import signal
 import subprocess
 import threading
 import webbrowser
@@ -24,7 +25,7 @@ import calendar
 import time as time_module
 import urllib.request
 
-socket.setdefaulttimeout(15)  # avoid feed fetches hanging indefinitely on slow/broken servers
+logger = logging.getLogger(__name__)
 
 CONFIG_DIR = os.path.expanduser('~/.config/rss-tray')
 CONFIG_FILE = os.path.join(CONFIG_DIR, 'config.conf')
@@ -33,7 +34,10 @@ CHECK_INTERVAL = 600  # default per-feed interval (seconds) when none is set in 
 SCHEDULER_TICK_SECONDS = 60  # how often we check whether any feed is due
 PENDING_CHECK_INTERVAL_SECONDS = 3600  # how often to check for system-wide package updates
 TWITCH_CHECK_INTERVAL_SECONDS = 1800  # how often to poll Twitch live status
-NETWORK_RETRY_SECONDS = 10  # how often to recheck connectivity if offline at startup
+NETWORK_RETRY_SECONDS = 10  # startup retry delay when the network is not ready yet
+UPDATE_SCAN_TIMEOUT_SECONDS = 60
+UPDATE_RETRY_INITIAL_SECONDS = 300
+UPDATE_RETRY_MAX_SECONDS = 3600
 MAX_LIST_ITEMS = 40
 MAX_TITLE_LEN = 60
 MAX_ITEM_AGE_SECONDS = 24 * 3600  # ignore entries older than this on first sight
@@ -191,16 +195,16 @@ def is_muted(title, mute_phrases):
 
 
 def is_online():
-    """Quick, low-cost check for basic network connectivity."""
+    """Best-effort startup network gate using an actual HTTPS endpoint."""
     try:
-        socket.create_connection(("1.1.1.1", 53), timeout=2)
-        return True
-    except OSError:
+        with urllib.request.urlopen("https://api.open-meteo.com", timeout=2):
+            return True
+    except Exception:
         return False
 
 
 def load_state():
-    state = {"seen": {}, "unread": []}
+    state = {"seen": {}, "unread": [], "available_updates": [], "live_channels": [], "last_checked": {}, "updates_last_checked": 0, "updates_last_attempt": 0, "updates_retry_delay": UPDATE_RETRY_INITIAL_SECONDS}
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE) as f:
@@ -222,6 +226,16 @@ def load_state():
         state['live_channels'] = []
     if not isinstance(state.get('last_checked'), dict):
         state['last_checked'] = {}
+    if not isinstance(state.get('updates_last_checked'), (int, float)):
+        state['updates_last_checked'] = 0
+    if not isinstance(state.get('updates_last_attempt'), (int, float)):
+        state['updates_last_attempt'] = 0
+    if not isinstance(state.get('updates_retry_delay'), (int, float)):
+        state['updates_retry_delay'] = UPDATE_RETRY_INITIAL_SECONDS
+    state['updates_retry_delay'] = max(
+        UPDATE_RETRY_INITIAL_SECONDS,
+        min(UPDATE_RETRY_MAX_SECONDS, state['updates_retry_delay'])
+    )
 
     return state
 
@@ -233,8 +247,18 @@ def save_state(state):
     os.replace(tmp, STATE_FILE)
 
 
-def entry_id(entry):
-    raw = entry.get('id') or entry.get('link') or (entry.get('title', '') + entry.get('published', ''))
+def entry_id(entry, feed_url=''):
+    """Build a stable ID, preferring GUID/link and scoping fallbacks to the feed."""
+    raw = (
+        entry.get('id')
+        or entry.get('link')
+        or '|'.join((
+            feed_url,
+            entry.get('title', ''),
+            entry.get('published', ''),
+            entry.get('updated', ''),
+        ))
+    )
     return hashlib.sha1(raw.encode('utf-8', 'ignore')).hexdigest()
 
 
@@ -258,53 +282,77 @@ def get_installed_version(pkgname):
         )
         if result.returncode == 0:
             return result.stdout.strip() or None
-    except Exception:
-        pass
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("Could not query installed version for %s: %s", pkgname, exc)
     return None
 
 
 def list_all_updates():
-    """Read-only, in-memory, system-wide dry run — no root needed, nothing written
-    to disk. Returns a list of pkgnames that have a real newer build published.
+    """Read-only system-wide XBPS update scan.
 
-    Real xbps-install -Mn -u output (per package) looks like:
-        cryptsetup-2.8.8_1 update x86_64 https://repo-default.voidlinux.org/current 3203607 568523
-    i.e. "<pkgver> <action> <arch> <repo> <dlsize> <instsize>" — no '->' arrow."""
+    Returns a list on success (possibly empty), or None when the scan fails.
+    """
+    cmd = ['xbps-install', '-Mn', '-u']
+    proc = None
     try:
-        result = subprocess.run(
-            ['xbps-install', '-Mn', '-u'],
-            capture_output=True, text=True, timeout=60
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
         )
-    except Exception:
-        return []
-    if result.returncode != 0:
-        return []
-    output = (result.stdout or '') + (result.stderr or '')
+        stdout, stderr = proc.communicate(timeout=UPDATE_SCAN_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        logger.warning("XBPS update scan timed out")
+        if proc is not None:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    logger.error("XBPS scan process group did not exit after SIGKILL")
+        return None
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("XBPS update scan failed: %s", exc)
+        return None
+
+    if proc.returncode != 0:
+        logger.warning("XBPS update scan exited with status %s: %s", proc.returncode, stderr.strip())
+        return None
+
+    output = (stdout or '') + (stderr or '')
     updates = []
+    seen = set()
     for line in output.splitlines():
-        line = line.strip()
-        parts = line.split()
-        if len(parts) < 2:
+        parts = line.strip().split()
+        if len(parts) < 2 or parts[1] != 'update':
             continue
-        pkgver_token, action = parts[0], parts[1]
-        if action != 'update':
-            continue
-        match = re.match(r'^(.+)-[0-9][^-]*$', pkgver_token)
+        match = re.match(r'^(.+)-[0-9][^-]*$', parts[0])
         if match:
-            updates.append(match.group(1))
+            pkgname = match.group(1)
+            if pkgname not in seen:
+                seen.add(pkgname)
+                updates.append(pkgname)
     return updates
 
 
+
+
 def check_twitch_live_channels(channels):
-    """Uses Twitch's internal (unofficial) GraphQL API — the same one twitch.tv
-    itself uses for logged-out visitors — so no app registration/secret is
-    needed. Undocumented; could break if Twitch changes their internal schema.
-    Batches every channel into a single POST request (Twitch's GQL endpoint
-    accepts a JSON array of operations) instead of one request per channel.
-    Returns {channel: title} for whichever channels are currently live;
-    a failed/offline channel is simply absent from the result, not marked False."""
+    """Return live channels on success, or None when the API/request failed."""
     if not channels:
         return {}
+
     payload = json.dumps([
         {
             "operationName": "StreamMetadata",
@@ -327,19 +375,38 @@ def check_twitch_live_channels(channels):
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             results = json.loads(resp.read().decode('utf-8'))
-    except Exception:
-        return {}
-    if not isinstance(results, list):
-        return {}
+    except (OSError, ValueError) as exc:
+        logger.warning("Twitch request failed: %s", exc)
+        return None
+
+    if not isinstance(results, list) or len(results) != len(channels):
+        logger.warning("Twitch returned an unexpected GraphQL response")
+        return None
+
     live = {}
     for channel, result in zip(channels, results):
-        user = (result.get('data') or {}).get('user')
-        if not user:
+        if not isinstance(result, dict) or result.get('errors'):
+            logger.warning("Twitch returned malformed/error data for %s", channel)
+            return None
+        data = result.get('data')
+        if not isinstance(data, dict):
+            logger.warning("Twitch response missing data for %s", channel)
+            return None
+        user = data.get('user')
+        if user is None:
             continue
+        if not isinstance(user, dict):
+            logger.warning("Twitch response has malformed user data for %s", channel)
+            return None
         stream = user.get('stream')
+        if stream is not None and not isinstance(stream, dict):
+            logger.warning("Twitch response has malformed stream data for %s", channel)
+            return None
         if stream and stream.get('type') == 'live':
             live[channel] = stream.get('title') or ''
     return live
+
+
 
 
 def open_twitch_stream(channel):
@@ -348,8 +415,8 @@ def open_twitch_stream(channel):
             ['streamlink', '--player', 'mpv', f'twitch.tv/{channel}', 'best'],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
-    except Exception:
-        pass
+    except OSError as exc:
+        logger.warning("Could not launch Twitch stream for %s: %s", channel, exc)
 
 
 def play_notification_sound():
@@ -481,6 +548,7 @@ class RssTray:
         self._check_lock = threading.Lock()  # guards overlapping feed-check cycles only
         self._xbps_lock = threading.Lock()   # guards xbps db access (scans + installs), separately
         self._twitch_lock = threading.Lock()  # guards overlapping Twitch-check cycles
+        self._weather_lock = threading.Lock()  # guards overlapping weather requests
         self.popup = None
         self.listbox = None
         self.scroller = None
@@ -491,6 +559,7 @@ class RssTray:
         self.active_installs = 0
         self.install_status = {}  # pkgname -> 'Waiting…'/'Downloading…'/'Installing…'/'Done'/'Failed'
         self.timer_remaining_seconds = 0
+        self.timer_deadline = None
         self.timer_running = False
         self._timer_updating_ui = False
         self.timer_scale = None
@@ -507,6 +576,8 @@ class RssTray:
 
         GLib.timeout_add_seconds(1, self.initial_check)
         GLib.timeout_add_seconds(SCHEDULER_TICK_SECONDS, self.periodic_check)
+        GLib.timeout_add_seconds(2, self.initial_updates_check)
+        GLib.timeout_add_seconds(PENDING_CHECK_INTERVAL_SECONDS, self.periodic_updates_check)
         GLib.timeout_add(800, self.maybe_auto_show_startup)
         GLib.timeout_add_seconds(2, self.initial_weather_check)
         GLib.timeout_add_seconds(WEATHER_REFRESH_SECONDS, self.periodic_weather_check)
@@ -538,9 +609,21 @@ class RssTray:
     def _check_feeds_guarded(self, force):
         try:
             self.check_feeds(force)
-            self.check_updates_if_due(force=force)
         finally:
             self._check_lock.release()
+
+    def initial_updates_check(self):
+        self.start_update_check(force=True)
+        return False
+
+    def periodic_updates_check(self):
+        self.start_update_check()
+        return True
+
+    def start_update_check(self, force=False):
+        threading.Thread(
+            target=self.check_updates_if_due, args=(force,), daemon=True
+        ).start()
 
     def check_feeds(self, force=False):
         feeds = load_feeds()
@@ -558,12 +641,18 @@ class RssTray:
                 due_urls.append(url)
         for url in due_urls:
             try:
-                parsed = feedparser.parse(url)
-            except Exception:
+                with urllib.request.urlopen(url, timeout=15) as response:
+                    parsed = feedparser.parse(response.read())
+                if getattr(parsed, 'status', 200) >= 400:
+                    raise ValueError(f"HTTP {parsed.status}")
+                if getattr(parsed, 'bozo', False) and not getattr(parsed, 'entries', None):
+                    raise ValueError(str(getattr(parsed, 'bozo_exception', 'invalid feed')))
+            except Exception as exc:
+                logger.warning("Feed check failed for %s: %s", url, exc)
                 continue
             last_checked[url] = now
             for entry in parsed.entries:
-                eid = entry_id(entry)
+                eid = entry_id(entry, url)
                 if eid in seen_ids:
                     continue
                 seen_ids.add(eid)
@@ -606,28 +695,49 @@ class RssTray:
     def check_updates_if_due(self, force=False):
         now = time_module.time()
         with self.lock:
-            last = self.state.get('updates_last_checked', 0)
-        if not force and (now - last) < PENDING_CHECK_INTERVAL_SECONDS:
-            return
-        pkgnames = list_all_updates()
+            last_checked = self.state.get('updates_last_checked', 0)
+            last_attempt = self.state.get('updates_last_attempt', 0)
+            retry_delay = self.state.get('updates_retry_delay', UPDATE_RETRY_INITIAL_SECONDS)
+
+        if not force:
+            if (now - last_checked) < PENDING_CHECK_INTERVAL_SECONDS:
+                return
+            if (now - last_attempt) < retry_delay:
+                return
+
+        with self._xbps_lock:
+            pkgnames = list_all_updates()
+
         with self.lock:
+            self.state['updates_last_attempt'] = now
+            if pkgnames is None:
+                self.state['updates_retry_delay'] = min(
+                    UPDATE_RETRY_MAX_SECONDS,
+                    max(UPDATE_RETRY_INITIAL_SECONDS, retry_delay * 2)
+                )
+                save_state(self.state)
+                return
+
             existing = {e['pkgname']: e for e in self.state.get('available_updates', [])}
             promoted_new = []
             for pkgname in pkgnames:
                 if pkgname not in existing:
                     entry = {
-                        'id': hashlib.sha1(f"update:{pkgname}".encode()).hexdigest(),
-                        'title': f"Update available for {pkgname}",
+                        'id': hashlib.sha1(('update:' + pkgname).encode()).hexdigest(),
+                        'title': 'Update available for ' + pkgname,
                         'link': '',
                         'pkgname': pkgname,
                     }
                     existing[pkgname] = entry
                     promoted_new.append(entry)
+
             self.state['available_updates'] = [existing[p] for p in pkgnames if p in existing]
             self.state['updates_last_checked'] = now
+            self.state['updates_retry_delay'] = UPDATE_RETRY_INITIAL_SECONDS
             save_state(self.state)
+
         if promoted_new:
-            GLib.idle_add(self.on_new_items)  # reuse: sound + auto-popup + icon refresh
+            GLib.idle_add(self.on_new_items)
 
     def on_new_items(self):
         self.update_icon()
@@ -654,18 +764,19 @@ class RssTray:
     def _check_twitch_guarded(self):
         try:
             channels = load_twitch_channels()
-            if channels:
-                live_now = check_twitch_live_channels(channels)
-                GLib.idle_add(self._on_twitch_checked, live_now)
+            live_now = check_twitch_live_channels(channels)
+            GLib.idle_add(self._on_twitch_checked, live_now, bool(channels))
         finally:
             self._twitch_lock.release()
 
-    def _on_twitch_checked(self, live_now):
+    def _on_twitch_checked(self, live_now, configured):
+        if live_now is None:
+            return False
         with self.lock:
             was_live = {e['channel'] for e in self.state.get('live_channels', [])}
             self.state['live_channels'] = [
                 {'channel': ch, 'title': live_now[ch]} for ch in sorted(live_now)
-            ]
+            ] if configured else []
             save_state(self.state)
         newly_live = set(live_now) - was_live
         if newly_live:
@@ -685,11 +796,16 @@ class RssTray:
         return True
 
     def start_weather_fetch(self):
+        if not self._weather_lock.acquire(blocking=False):
+            return
         threading.Thread(target=self._fetch_weather_bg, daemon=True).start()
 
     def _fetch_weather_bg(self):
-        data = fetch_weather()
-        GLib.idle_add(self._on_weather_fetched, data)
+        try:
+            data = fetch_weather()
+            GLib.idle_add(self._on_weather_fetched, data)
+        finally:
+            self._weather_lock.release()
 
     def _on_weather_fetched(self, data):
         if data is not None:
@@ -825,11 +941,12 @@ class RssTray:
             self.timer_box.set_visible(self.timer_visible)
 
     def _timer_tick(self):
-        if self.timer_running and self.timer_remaining_seconds > 0:
-            self.timer_remaining_seconds -= 1
-            if self.timer_remaining_seconds <= 0:
-                self.timer_remaining_seconds = 0
+        if self.timer_running and self.timer_deadline is not None:
+            remaining = max(0, int(self.timer_deadline - time_module.monotonic()))
+            self.timer_remaining_seconds = remaining
+            if remaining == 0:
                 self.timer_running = False
+                self.timer_deadline = None
                 self._fire_timer_done()
             self._update_timer_widgets()
         return True
@@ -856,6 +973,7 @@ class RssTray:
         value = int(scale.get_value())
         self.timer_remaining_seconds = value
         self.timer_running = value > 0
+        self.timer_deadline = time_module.monotonic() + value if self.timer_running else None
         if self.timer_label is not None:
             self.timer_label.set_text(format_timer_duration(value))
 
@@ -1000,9 +1118,8 @@ class RssTray:
 
     def _update_scroller_max_height(self):
         try:
-            display = Gdk.Display.get_default()
-            monitor = display.get_primary_monitor() or display.get_monitor(0)
-            screen_height = monitor.get_geometry().height
+            monitor, _tray_area = self._tray_monitor()
+            screen_height = monitor.get_workarea().height
         except Exception:
             screen_height = 1080
         max_height = int(screen_height * 0.75)
@@ -1095,7 +1212,9 @@ class RssTray:
         footer.pack_start(edit_btn, True, True, 0)
         refresh_btn = Gtk.Button(label='Refresh')
         refresh_btn.connect('clicked', lambda *_a: (
-            self.start_check_thread(force=True), self.start_twitch_check()
+            self.start_check_thread(force=True),
+            self.start_update_check(force=True),
+            self.start_twitch_check()
         ))
         footer.pack_start(refresh_btn, True, True, 0)
         mark_all_btn = Gtk.Button(label='Mark all read')
@@ -1138,22 +1257,34 @@ class RssTray:
         self.popup.present()
         self.popup.grab_focus()
 
-    def position_popup(self):
+    def _tray_monitor(self):
         display = Gdk.Display.get_default()
-        monitor = display.get_primary_monitor() or display.get_monitor(0)
-        geo = monitor.get_geometry()
-
-        x = geo.x + geo.width - WINDOW_WIDTH  # flush against the right edge
-
-        y = geo.y + 2  # flush against the top, as a fallback
+        fallback = display.get_primary_monitor() or display.get_monitor(0)
         try:
             ok, _screen, area, _orientation = self.status_icon.get_geometry()
             if ok and area is not None:
-                y = area.y + area.height + 4  # 4px below the panel/tray icon
+                monitor = display.get_monitor_at_point(
+                    area.x + area.width // 2,
+                    area.y + area.height // 2,
+                )
+                if monitor is not None:
+                    return monitor, area
         except Exception:
             pass
+        return fallback, None
 
-        self.popup.move(max(x, 0), max(y, 0))
+    def position_popup(self):
+        monitor, tray_area = self._tray_monitor()
+        workarea = monitor.get_workarea()
+
+        x = workarea.x + workarea.width - WINDOW_WIDTH
+        y = tray_area.y + tray_area.height + 4 if tray_area is not None else workarea.y
+
+        max_x = workarea.x + workarea.width - WINDOW_WIDTH
+        max_y = workarea.y + workarea.height - 1
+        x = min(max(x, workarea.x), max_x)
+        y = min(max(y, workarea.y), max_y)
+        self.popup.move(x, y)
 
     def refresh_list(self):
         for child in self.listbox.get_children():
@@ -1453,28 +1584,62 @@ class RssTray:
                 before = get_installed_version(pkgname)
                 cmd = PRIVILEGE_CMD + ['xbps-install', '-Su', '-y', pkgname]
                 returncode = -1
+                proc = None
+                reader = None
                 try:
                     proc = subprocess.Popen(
-                        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        text=True, bufsize=1
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        bufsize=1,
+                        start_new_session=True,
                     )
-                    # xbps-install prints section headers like "[*] Downloading
-                    # packages", "[*] Collecting package files", "[*] Unpacking
-                    # packages", "[*] Configuring unpacked packages" — the actual
-                    # per-file lines under them don't contain words like
-                    # "download" at all, so we key off these headers instead.
-                    # Since we install one package at a time, every line in this
-                    # stream belongs to the current package regardless of wording.
-                    for line in proc.stdout:
-                        stripped = line.strip()
-                        if stripped.startswith('[*] Downloading'):
-                            self._set_status(pkgname, 'Downloading…')
-                        elif stripped.startswith('[*]'):
-                            self._set_status(pkgname, 'Installing…')
-                    proc.wait(timeout=UPDATE_TIMEOUT_SECONDS)
-                    returncode = proc.returncode
-                except Exception:
-                    pass
+
+                    def read_output():
+                        try:
+                            for line in proc.stdout:
+                                stripped = line.strip()
+                                if stripped.startswith('[*] Downloading'):
+                                    self._set_status(pkgname, 'Downloading…')
+                                elif stripped.startswith('[*]'):
+                                    self._set_status(pkgname, 'Installing…')
+                        except (OSError, ValueError):
+                            pass
+
+                    reader = threading.Thread(target=read_output, daemon=True)
+                    reader.start()
+                    returncode = proc.wait(timeout=UPDATE_TIMEOUT_SECONDS)
+                except subprocess.TimeoutExpired:
+                    logger.warning("XBPS install timed out for %s", pkgname)
+                    if proc is not None:
+                        try:
+                            os.killpg(proc.pid, signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            proc.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            try:
+                                os.killpg(proc.pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                            try:
+                                proc.wait(timeout=5)
+                            except subprocess.TimeoutExpired:
+                                logger.error("XBPS process group did not exit after SIGKILL")
+                    returncode = -signal.SIGTERM
+                except (OSError, subprocess.SubprocessError) as exc:
+                    logger.warning("XBPS install failed for %s: %s", pkgname, exc)
+                finally:
+                    if reader is not None:
+                        reader.join(timeout=2)
+                    if proc is not None and proc.stdout is not None:
+                        try:
+                            proc.stdout.close()
+                        except OSError:
+                            pass
+
                 after = get_installed_version(pkgname)
                 success = returncode == 0 and before != after
                 if success:
