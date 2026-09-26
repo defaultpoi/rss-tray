@@ -14,9 +14,11 @@ import feedparser
 import json
 import os
 import re
+import select
 import shutil
-import socket
+import signal
 import subprocess
+import logging
 import threading
 import webbrowser
 import hashlib
@@ -24,7 +26,7 @@ import calendar
 import time as time_module
 import urllib.request
 
-socket.setdefaulttimeout(15)  # avoid feed fetches hanging indefinitely on slow/broken servers
+logger = logging.getLogger(__name__)
 
 CONFIG_DIR = os.path.expanduser('~/.config/rss-tray')
 CONFIG_FILE = os.path.join(CONFIG_DIR, 'config.conf')
@@ -33,7 +35,10 @@ CHECK_INTERVAL = 600  # default per-feed interval (seconds) when none is set in 
 SCHEDULER_TICK_SECONDS = 60  # how often we check whether any feed is due
 PENDING_CHECK_INTERVAL_SECONDS = 3600  # how often to check for system-wide package updates
 TWITCH_CHECK_INTERVAL_SECONDS = 1800  # how often to poll Twitch live status
-NETWORK_RETRY_SECONDS = 10  # how often to recheck connectivity if offline at startup
+NETWORK_RETRY_SECONDS = 10  # startup retry delay when the network is not ready yet
+UPDATE_SCAN_TIMEOUT_SECONDS = 60
+UPDATE_RETRY_INITIAL_SECONDS = 300
+UPDATE_RETRY_MAX_SECONDS = 3600
 MAX_LIST_ITEMS = 40
 MAX_TITLE_LEN = 60
 MAX_ITEM_AGE_SECONDS = 24 * 3600  # ignore entries older than this on first sight
@@ -191,16 +196,16 @@ def is_muted(title, mute_phrases):
 
 
 def is_online():
-    """Quick, low-cost check for basic network connectivity."""
+    """Best-effort startup network gate using an actual HTTPS endpoint."""
     try:
-        socket.create_connection(("1.1.1.1", 53), timeout=2)
-        return True
-    except OSError:
+        with urllib.request.urlopen("https://api.open-meteo.com", timeout=2):
+            return True
+    except Exception:
         return False
 
 
 def load_state():
-    state = {"seen": {}, "unread": []}
+    state = {"seen": {}, "unread": [], "available_updates": [], "live_channels": [], "last_checked": {}, "updates_last_checked": 0, "updates_last_attempt": 0, "updates_retry_delay": UPDATE_RETRY_INITIAL_SECONDS}
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE) as f:
@@ -222,6 +227,16 @@ def load_state():
         state['live_channels'] = []
     if not isinstance(state.get('last_checked'), dict):
         state['last_checked'] = {}
+    if not isinstance(state.get('updates_last_checked'), (int, float)):
+        state['updates_last_checked'] = 0
+    if not isinstance(state.get('updates_last_attempt'), (int, float)):
+        state['updates_last_attempt'] = 0
+    if not isinstance(state.get('updates_retry_delay'), (int, float)):
+        state['updates_retry_delay'] = UPDATE_RETRY_INITIAL_SECONDS
+    state['updates_retry_delay'] = max(
+        UPDATE_RETRY_INITIAL_SECONDS,
+        min(UPDATE_RETRY_MAX_SECONDS, state['updates_retry_delay'])
+    )
 
     return state
 
@@ -233,8 +248,18 @@ def save_state(state):
     os.replace(tmp, STATE_FILE)
 
 
-def entry_id(entry):
-    raw = entry.get('id') or entry.get('link') or (entry.get('title', '') + entry.get('published', ''))
+def entry_id(entry, feed_url=''):
+    """Build a stable ID, preferring GUID/link and scoping fallbacks to the feed."""
+    raw = (
+        entry.get('id')
+        or entry.get('link')
+        or '|'.join((
+            feed_url,
+            entry.get('title', ''),
+            entry.get('published', ''),
+            entry.get('updated', ''),
+        ))
+    )
     return hashlib.sha1(raw.encode('utf-8', 'ignore')).hexdigest()
 
 
