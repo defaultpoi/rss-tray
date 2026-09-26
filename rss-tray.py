@@ -1544,28 +1544,62 @@ class RssTray:
                 before = get_installed_version(pkgname)
                 cmd = PRIVILEGE_CMD + ['xbps-install', '-Su', '-y', pkgname]
                 returncode = -1
+                proc = None
+                reader = None
                 try:
                     proc = subprocess.Popen(
-                        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        text=True, bufsize=1
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        bufsize=1,
+                        start_new_session=True,
                     )
-                    # xbps-install prints section headers like "[*] Downloading
-                    # packages", "[*] Collecting package files", "[*] Unpacking
-                    # packages", "[*] Configuring unpacked packages" — the actual
-                    # per-file lines under them don't contain words like
-                    # "download" at all, so we key off these headers instead.
-                    # Since we install one package at a time, every line in this
-                    # stream belongs to the current package regardless of wording.
-                    for line in proc.stdout:
-                        stripped = line.strip()
-                        if stripped.startswith('[*] Downloading'):
-                            self._set_status(pkgname, 'Downloading…')
-                        elif stripped.startswith('[*]'):
-                            self._set_status(pkgname, 'Installing…')
-                    proc.wait(timeout=UPDATE_TIMEOUT_SECONDS)
-                    returncode = proc.returncode
-                except Exception:
-                    pass
+
+                    def read_output():
+                        try:
+                            for line in proc.stdout:
+                                stripped = line.strip()
+                                if stripped.startswith('[*] Downloading'):
+                                    self._set_status(pkgname, 'Downloading…')
+                                elif stripped.startswith('[*]'):
+                                    self._set_status(pkgname, 'Installing…')
+                        except (OSError, ValueError):
+                            pass
+
+                    reader = threading.Thread(target=read_output, daemon=True)
+                    reader.start()
+                    returncode = proc.wait(timeout=UPDATE_TIMEOUT_SECONDS)
+                except subprocess.TimeoutExpired:
+                    logger.warning("XBPS install timed out for %s", pkgname)
+                    if proc is not None:
+                        try:
+                            os.killpg(proc.pid, signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            proc.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            try:
+                                os.killpg(proc.pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                            try:
+                                proc.wait(timeout=5)
+                            except subprocess.TimeoutExpired:
+                                logger.error("XBPS process group did not exit after SIGKILL")
+                    returncode = -signal.SIGTERM
+                except (OSError, subprocess.SubprocessError) as exc:
+                    logger.warning("XBPS install failed for %s: %s", pkgname, exc)
+                finally:
+                    if reader is not None:
+                        reader.join(timeout=2)
+                    if proc is not None and proc.stdout is not None:
+                        try:
+                            proc.stdout.close()
+                        except OSError:
+                            pass
+
                 after = get_installed_version(pkgname)
                 success = returncode == 0 and before != after
                 if success:
