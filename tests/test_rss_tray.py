@@ -15,13 +15,13 @@ SOURCE = os.path.join(ROOT, "rss-tray.py")
 def load_module():
     gi = types.ModuleType("gi")
     gi.require_version = lambda *_args: None
-    gi.repository = types.SimpleNamespace(
-        Gtk=types.SimpleNamespace(),
-        GLib=types.SimpleNamespace(),
-        Gdk=types.SimpleNamespace(),
-        Pango=types.SimpleNamespace(),
-        Wnck=types.SimpleNamespace(),
-    )
+    repository = types.ModuleType("gi.repository")
+    repository.Gtk = types.SimpleNamespace()
+    repository.GLib = types.SimpleNamespace()
+    repository.Gdk = types.SimpleNamespace()
+    repository.Pango = types.SimpleNamespace()
+    repository.Wnck = types.SimpleNamespace()
+    gi.repository = repository
     cairo = types.ModuleType("cairo")
     cairo.FORMAT_ARGB32 = 0
 
