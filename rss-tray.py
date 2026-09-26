@@ -740,18 +740,19 @@ class RssTray:
     def _check_twitch_guarded(self):
         try:
             channels = load_twitch_channels()
-            if channels:
-                live_now = check_twitch_live_channels(channels)
-                GLib.idle_add(self._on_twitch_checked, live_now)
+            live_now = check_twitch_live_channels(channels)
+            GLib.idle_add(self._on_twitch_checked, live_now, bool(channels))
         finally:
             self._twitch_lock.release()
 
-    def _on_twitch_checked(self, live_now):
+    def _on_twitch_checked(self, live_now, configured):
+        if live_now is None:
+            return False
         with self.lock:
             was_live = {e['channel'] for e in self.state.get('live_channels', [])}
             self.state['live_channels'] = [
                 {'channel': ch, 'title': live_now[ch]} for ch in sorted(live_now)
-            ]
+            ] if configured else []
             save_state(self.state)
         newly_live = set(live_now) - was_live
         if newly_live:
@@ -911,11 +912,12 @@ class RssTray:
             self.timer_box.set_visible(self.timer_visible)
 
     def _timer_tick(self):
-        if self.timer_running and self.timer_remaining_seconds > 0:
-            self.timer_remaining_seconds -= 1
-            if self.timer_remaining_seconds <= 0:
-                self.timer_remaining_seconds = 0
+        if self.timer_running and self.timer_deadline is not None:
+            remaining = max(0, int(self.timer_deadline - time_module.monotonic()))
+            self.timer_remaining_seconds = remaining
+            if remaining == 0:
                 self.timer_running = False
+                self.timer_deadline = None
                 self._fire_timer_done()
             self._update_timer_widgets()
         return True
@@ -942,6 +944,7 @@ class RssTray:
         value = int(scale.get_value())
         self.timer_remaining_seconds = value
         self.timer_running = value > 0
+        self.timer_deadline = time_module.monotonic() + value if self.timer_running else None
         if self.timer_label is not None:
             self.timer_label.set_text(format_timer_duration(value))
 
