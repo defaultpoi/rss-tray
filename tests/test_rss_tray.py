@@ -67,21 +67,20 @@ class PureBehaviorTests(unittest.TestCase):
         self.assertEqual(self.mod.weather_code_glyph(95), "\u26a1")
 
     def test_update_scan_returns_none_on_failure(self):
-        completed = types.SimpleNamespace(returncode=1, stdout="", stderr="failure")
-        with mock.patch.object(self.mod.subprocess, "run", return_value=completed):
+        proc = mock.MagicMock(returncode=1)
+        proc.communicate.return_value = ("", "failure")
+        with mock.patch.object(self.mod.subprocess, "Popen", return_value=proc):
             self.assertIsNone(self.mod.list_all_updates())
 
     def test_update_scan_deduplicates_packages(self):
-        completed = types.SimpleNamespace(
-            returncode=0,
-            stdout=(
-                "foo-1.0_1 update x86_64 repo 1 1\n"
-                "foo-1.0_1 update x86_64 repo 1 1\n"
-                "bar-2.0_1 update x86_64 repo 1 1\n"
-            ),
-            stderr="",
+        proc = mock.MagicMock(returncode=0)
+        proc.communicate.return_value = (
+            "foo-1.0_1 update x86_64 repo 1 1\n"
+            "foo-1.0_1 update x86_64 repo 1 1\n"
+            "bar-2.0_1 update x86_64 repo 1 1\n",
+            "",
         )
-        with mock.patch.object(self.mod.subprocess, "run", return_value=completed):
+        with mock.patch.object(self.mod.subprocess, "Popen", return_value=proc):
             self.assertEqual(self.mod.list_all_updates(), ["foo", "bar"])
 
     def test_twitch_failure_is_distinct_from_no_live_channels(self):
