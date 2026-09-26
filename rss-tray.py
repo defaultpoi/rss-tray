@@ -292,21 +292,45 @@ def list_all_updates():
 
     Returns a list on success (possibly empty), or None when the scan fails.
     """
+    cmd = ['xbps-install', '-Mn', '-u']
+    proc = None
     try:
-        result = subprocess.run(
-            ['xbps-install', '-Mn', '-u'],
-            capture_output=True,
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=UPDATE_SCAN_TIMEOUT_SECONDS,
+            start_new_session=True,
         )
+        stdout, stderr = proc.communicate(timeout=UPDATE_SCAN_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        logger.warning("XBPS update scan timed out")
+        if proc is not None:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    logger.error("XBPS scan process group did not exit after SIGKILL")
+        return None
     except (OSError, subprocess.SubprocessError) as exc:
         logger.warning("XBPS update scan failed: %s", exc)
         return None
-    if result.returncode != 0:
-        logger.warning("XBPS update scan exited with status %s", result.returncode)
+
+    if proc.returncode != 0:
+        logger.warning("XBPS update scan exited with status %s: %s", proc.returncode, stderr.strip())
         return None
 
-    output = (result.stdout or '') + (result.stderr or '')
+    output = (stdout or '') + (stderr or '')
     updates = []
     seen = set()
     for line in output.splitlines():
