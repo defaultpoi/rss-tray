@@ -535,6 +535,7 @@ class RssTray:
         self.active_installs = 0
         self.install_status = {}  # pkgname -> 'Waiting…'/'Downloading…'/'Installing…'/'Done'/'Failed'
         self.timer_remaining_seconds = 0
+        self.timer_deadline = None
         self.timer_running = False
         self._timer_updating_ui = False
         self.timer_scale = None
@@ -551,6 +552,8 @@ class RssTray:
 
         GLib.timeout_add_seconds(1, self.initial_check)
         GLib.timeout_add_seconds(SCHEDULER_TICK_SECONDS, self.periodic_check)
+        GLib.timeout_add_seconds(2, self.initial_updates_check)
+        GLib.timeout_add_seconds(PENDING_CHECK_INTERVAL_SECONDS, self.periodic_updates_check)
         GLib.timeout_add(800, self.maybe_auto_show_startup)
         GLib.timeout_add_seconds(2, self.initial_weather_check)
         GLib.timeout_add_seconds(WEATHER_REFRESH_SECONDS, self.periodic_weather_check)
@@ -1145,7 +1148,9 @@ class RssTray:
         footer.pack_start(edit_btn, True, True, 0)
         refresh_btn = Gtk.Button(label='Refresh')
         refresh_btn.connect('clicked', lambda *_a: (
-            self.start_check_thread(force=True), self.start_twitch_check()
+            self.start_check_thread(force=True),
+            self.start_update_check(force=True),
+            self.start_twitch_check()
         ))
         footer.pack_start(refresh_btn, True, True, 0)
         mark_all_btn = Gtk.Button(label='Mark all read')
