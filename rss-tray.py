@@ -282,8 +282,8 @@ def get_installed_version(pkgname):
         )
         if result.returncode == 0:
             return result.stdout.strip() or None
-    except Exception:
-        pass
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("Could not query installed version for %s: %s", pkgname, exc)
     return None
 
 
@@ -415,8 +415,8 @@ def open_twitch_stream(channel):
             ['streamlink', '--player', 'mpv', f'twitch.tv/{channel}', 'best'],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
-    except Exception:
-        pass
+    except OSError as exc:
+        logger.warning("Could not launch Twitch stream for %s: %s", channel, exc)
 
 
 def play_notification_sound():
