@@ -289,47 +289,47 @@ def get_installed_version(pkgname):
 
 
 def list_all_updates():
-    """Read-only, in-memory, system-wide dry run — no root needed, nothing written
-    to disk. Returns a list of pkgnames that have a real newer build published.
+    """Read-only system-wide XBPS update scan.
 
-    Real xbps-install -Mn -u output (per package) looks like:
-        cryptsetup-2.8.8_1 update x86_64 https://repo-default.voidlinux.org/current 3203607 568523
-    i.e. "<pkgver> <action> <arch> <repo> <dlsize> <instsize>" — no '->' arrow."""
+    Returns a list on success (possibly empty), or None when the scan fails.
+    """
     try:
         result = subprocess.run(
             ['xbps-install', '-Mn', '-u'],
-            capture_output=True, text=True, timeout=60
+            capture_output=True,
+            text=True,
+            timeout=UPDATE_SCAN_TIMEOUT_SECONDS,
         )
-    except Exception:
-        return []
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("XBPS update scan failed: %s", exc)
+        return None
     if result.returncode != 0:
-        return []
+        logger.warning("XBPS update scan exited with status %s", result.returncode)
+        return None
+
     output = (result.stdout or '') + (result.stderr or '')
     updates = []
+    seen = set()
     for line in output.splitlines():
-        line = line.strip()
-        parts = line.split()
-        if len(parts) < 2:
+        parts = line.strip().split()
+        if len(parts) < 2 or parts[1] != 'update':
             continue
-        pkgver_token, action = parts[0], parts[1]
-        if action != 'update':
-            continue
-        match = re.match(r'^(.+)-[0-9][^-]*$', pkgver_token)
+        match = re.match(r'^(.+)-[0-9][^-]*$', parts[0])
         if match:
-            updates.append(match.group(1))
+            pkgname = match.group(1)
+            if pkgname not in seen:
+                seen.add(pkgname)
+                updates.append(pkgname)
     return updates
 
 
+
+
 def check_twitch_live_channels(channels):
-    """Uses Twitch's internal (unofficial) GraphQL API — the same one twitch.tv
-    itself uses for logged-out visitors — so no app registration/secret is
-    needed. Undocumented; could break if Twitch changes their internal schema.
-    Batches every channel into a single POST request (Twitch's GQL endpoint
-    accepts a JSON array of operations) instead of one request per channel.
-    Returns {channel: title} for whichever channels are currently live;
-    a failed/offline channel is simply absent from the result, not marked False."""
+    """Return live channels on success, or None when the API/request failed."""
     if not channels:
         return {}
+
     payload = json.dumps([
         {
             "operationName": "StreamMetadata",
@@ -352,19 +352,38 @@ def check_twitch_live_channels(channels):
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             results = json.loads(resp.read().decode('utf-8'))
-    except Exception:
-        return {}
-    if not isinstance(results, list):
-        return {}
+    except (OSError, ValueError) as exc:
+        logger.warning("Twitch request failed: %s", exc)
+        return None
+
+    if not isinstance(results, list) or len(results) != len(channels):
+        logger.warning("Twitch returned an unexpected GraphQL response")
+        return None
+
     live = {}
     for channel, result in zip(channels, results):
-        user = (result.get('data') or {}).get('user')
-        if not user:
+        if not isinstance(result, dict) or result.get('errors'):
+            logger.warning("Twitch returned malformed/error data for %s", channel)
+            return None
+        data = result.get('data')
+        if not isinstance(data, dict):
+            logger.warning("Twitch response missing data for %s", channel)
+            return None
+        user = data.get('user')
+        if user is None:
             continue
+        if not isinstance(user, dict):
+            logger.warning("Twitch response has malformed user data for %s", channel)
+            return None
         stream = user.get('stream')
+        if stream is not None and not isinstance(stream, dict):
+            logger.warning("Twitch response has malformed stream data for %s", channel)
+            return None
         if stream and stream.get('type') == 'live':
             live[channel] = stream.get('title') or ''
     return live
+
+
 
 
 def open_twitch_stream(channel):
@@ -583,12 +602,18 @@ class RssTray:
                 due_urls.append(url)
         for url in due_urls:
             try:
-                parsed = feedparser.parse(url)
-            except Exception:
+                with urllib.request.urlopen(url, timeout=15) as response:
+                    parsed = feedparser.parse(response.read())
+                if getattr(parsed, 'status', 200) >= 400:
+                    raise ValueError(f"HTTP {parsed.status}")
+                if getattr(parsed, 'bozo', False) and not getattr(parsed, 'entries', None):
+                    raise ValueError(str(getattr(parsed, 'bozo_exception', 'invalid feed')))
+            except Exception as exc:
+                logger.warning("Feed check failed for %s: %s", url, exc)
                 continue
             last_checked[url] = now
             for entry in parsed.entries:
-                eid = entry_id(entry)
+                eid = entry_id(entry, url)
                 if eid in seen_ids:
                     continue
                 seen_ids.add(eid)
