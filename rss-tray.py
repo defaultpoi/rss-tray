@@ -548,6 +548,7 @@ class RssTray:
         self._check_lock = threading.Lock()  # guards overlapping feed-check cycles only
         self._xbps_lock = threading.Lock()   # guards xbps db access (scans + installs), separately
         self._twitch_lock = threading.Lock()  # guards overlapping Twitch-check cycles
+        self._weather_lock = threading.Lock()  # guards overlapping weather requests
         self.popup = None
         self.listbox = None
         self.scroller = None
@@ -795,11 +796,16 @@ class RssTray:
         return True
 
     def start_weather_fetch(self):
+        if not self._weather_lock.acquire(blocking=False):
+            return
         threading.Thread(target=self._fetch_weather_bg, daemon=True).start()
 
     def _fetch_weather_bg(self):
-        data = fetch_weather()
-        GLib.idle_add(self._on_weather_fetched, data)
+        try:
+            data = fetch_weather()
+            GLib.idle_add(self._on_weather_fetched, data)
+        finally:
+            self._weather_lock.release()
 
     def _on_weather_fetched(self, data):
         if data is not None:
