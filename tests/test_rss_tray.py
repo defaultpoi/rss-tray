@@ -31,7 +31,7 @@ def load_module():
 
     with mock.patch.dict(
         sys.modules,
-        {"gi": gi, "cairo": cairo, "feedparser": feedparser},
+        {"gi": gi, "gi.repository": repository, "cairo": cairo, "feedparser": feedparser},
     ):
         spec = importlib.util.spec_from_file_location("rss_tray_under_test", SOURCE)
         module = importlib.util.module_from_spec(spec)
