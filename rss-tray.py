@@ -1089,9 +1089,8 @@ class RssTray:
 
     def _update_scroller_max_height(self):
         try:
-            display = Gdk.Display.get_default()
-            monitor = display.get_primary_monitor() or display.get_monitor(0)
-            screen_height = monitor.get_geometry().height
+            monitor, _tray_area = self._tray_monitor()
+            screen_height = monitor.get_workarea().height
         except Exception:
             screen_height = 1080
         max_height = int(screen_height * 0.75)
@@ -1229,22 +1228,34 @@ class RssTray:
         self.popup.present()
         self.popup.grab_focus()
 
-    def position_popup(self):
+    def _tray_monitor(self):
         display = Gdk.Display.get_default()
-        monitor = display.get_primary_monitor() or display.get_monitor(0)
-        geo = monitor.get_geometry()
-
-        x = geo.x + geo.width - WINDOW_WIDTH  # flush against the right edge
-
-        y = geo.y + 2  # flush against the top, as a fallback
+        fallback = display.get_primary_monitor() or display.get_monitor(0)
         try:
             ok, _screen, area, _orientation = self.status_icon.get_geometry()
             if ok and area is not None:
-                y = area.y + area.height + 4  # 4px below the panel/tray icon
+                monitor = display.get_monitor_at_point(
+                    area.x + area.width // 2,
+                    area.y + area.height // 2,
+                )
+                if monitor is not None:
+                    return monitor, area
         except Exception:
             pass
+        return fallback, None
 
-        self.popup.move(max(x, 0), max(y, 0))
+    def position_popup(self):
+        monitor, tray_area = self._tray_monitor()
+        workarea = monitor.get_workarea()
+
+        x = workarea.x + workarea.width - WINDOW_WIDTH
+        y = tray_area.y + tray_area.height + 4 if tray_area is not None else workarea.y
+
+        max_x = workarea.x + workarea.width - WINDOW_WIDTH
+        max_y = workarea.y + workarea.height - 1
+        x = min(max(x, workarea.x), max_x)
+        y = min(max(y, workarea.y), max_y)
+        self.popup.move(x, y)
 
     def refresh_list(self):
         for child in self.listbox.get_children():
