@@ -13,12 +13,11 @@ import cairo
 import feedparser
 import json
 import os
+import logging
 import re
-import select
 import shutil
 import signal
 import subprocess
-import logging
 import threading
 import webbrowser
 import hashlib
