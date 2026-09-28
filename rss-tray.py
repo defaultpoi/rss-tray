@@ -190,13 +190,28 @@ def is_muted(title, mute_phrases):
     return any(phrase in title_lower for phrase in mute_phrases)
 
 
+ONLINE_PROBE_TARGETS = [
+    ("1.1.1.1", 443),  # Cloudflare
+    ("8.8.8.8", 443),  # Google
+    ("9.9.9.9", 443),  # Quad9
+]
+
+
 def is_online():
-    """Quick, low-cost check for basic network connectivity."""
-    try:
-        socket.create_connection(("1.1.1.1", 53), timeout=2)
-        return True
-    except OSError:
-        return False
+    """Quick check for basic network connectivity: True if ANY of several
+    independent, well-known public endpoints accepts a TCP connection on the
+    HTTPS port. Raw IPs (no DNS lookup involved), port 443 rather than 53
+    (some networks block outbound DNS to arbitrary servers but allow HTTPS),
+    and deliberately NOT tied to any of this app's own feature dependencies
+    (weather, Twitch, feed hosts) — an outage of one of those shouldn't get
+    misread as 'the network isn't up' and stall unrelated startup polling."""
+    for host, port in ONLINE_PROBE_TARGETS:
+        try:
+            with socket.create_connection((host, port), timeout=1):
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def load_state():
