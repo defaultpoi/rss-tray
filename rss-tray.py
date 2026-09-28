@@ -532,6 +532,7 @@ class RssTray:
         self.install_status = {}  # pkgname -> 'Waiting…'/'Downloading…'/'Installing…'/'Done'/'Failed'
         self.timer_remaining_seconds = 0
         self.timer_running = False
+        self.timer_deadline = None  # time_module.monotonic() value at which the timer fires
         self._timer_updating_ui = False
         self.timer_scale = None
         self.timer_label = None
@@ -879,11 +880,12 @@ class RssTray:
             self.timer_box.set_visible(self.timer_visible)
 
     def _timer_tick(self):
-        if self.timer_running and self.timer_remaining_seconds > 0:
-            self.timer_remaining_seconds -= 1
+        if self.timer_running and self.timer_deadline is not None:
+            left = self.timer_deadline - time_module.monotonic()
+            self.timer_remaining_seconds = max(0, int(-(-left // 1)))  # ceil
             if self.timer_remaining_seconds <= 0:
-                self.timer_remaining_seconds = 0
                 self.timer_running = False
+                self.timer_deadline = None
                 self._fire_timer_done()
             self._update_timer_widgets()
         return True
@@ -910,6 +912,7 @@ class RssTray:
         value = int(scale.get_value())
         self.timer_remaining_seconds = value
         self.timer_running = value > 0
+        self.timer_deadline = (time_module.monotonic() + value) if value > 0 else None
         if self.timer_label is not None:
             self.timer_label.set_text(format_timer_duration(value))
 
