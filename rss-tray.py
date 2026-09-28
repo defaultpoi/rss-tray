@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import socket
+import signal
 import subprocess
 import threading
 import webbrowser
@@ -278,6 +279,24 @@ def get_installed_version(pkgname):
     return None
 
 
+def _kill_process_group(proc, grace=5):
+    """SIGTERM the whole process group (sudo relays it to the root-owned
+    child), then SIGKILL after a grace period. The child may be root-owned,
+    so EPERM from killpg is expected and ignored."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            proc.wait(timeout=grace)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+        except Exception:
+            return
+
+
 def list_all_updates():
     """Read-only, in-memory, system-wide dry run — no root needed, nothing written
     to disk. Returns a list of pkgnames that have a real newer build published.
@@ -286,15 +305,21 @@ def list_all_updates():
         cryptsetup-2.8.8_1 update x86_64 https://repo-default.voidlinux.org/current 3203607 568523
     i.e. "<pkgver> <action> <arch> <repo> <dlsize> <instsize>" — no '->' arrow."""
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             ['xbps-install', '-Mn', '-u'],
-            capture_output=True, text=True, timeout=60
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, start_new_session=True
         )
+        try:
+            out, err = proc.communicate(timeout=60)
+        except subprocess.TimeoutExpired:
+            _kill_process_group(proc)
+            return []
     except Exception:
         return []
-    if result.returncode != 0:
+    if proc.returncode != 0:
         return []
-    output = (result.stdout or '') + (result.stderr or '')
+    output = (out or '') + (err or '')
     updates = []
     for line in output.splitlines():
         line = line.strip()
@@ -1468,11 +1493,19 @@ class RssTray:
                 before = get_installed_version(pkgname)
                 cmd = PRIVILEGE_CMD + ['xbps-install', '-Su', '-y', pkgname]
                 returncode = -1
+                watchdog = None
                 try:
                     proc = subprocess.Popen(
                         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        text=True, bufsize=1
+                        text=True, bufsize=1, start_new_session=True
                     )
+                    # stdout iteration blocks until EOF, so a wait(timeout=)
+                    # afterwards can never fire on a hang; the watchdog can.
+                    watchdog = threading.Timer(
+                        UPDATE_TIMEOUT_SECONDS, _kill_process_group, args=(proc,)
+                    )
+                    watchdog.daemon = True
+                    watchdog.start()
                     # xbps-install prints section headers like "[*] Downloading
                     # packages", "[*] Collecting package files", "[*] Unpacking
                     # packages", "[*] Configuring unpacked packages" — the actual
@@ -1486,10 +1519,13 @@ class RssTray:
                             self._set_status(pkgname, 'Downloading…')
                         elif stripped.startswith('[*]'):
                             self._set_status(pkgname, 'Installing…')
-                    proc.wait(timeout=UPDATE_TIMEOUT_SECONDS)
+                    proc.wait()
                     returncode = proc.returncode
                 except Exception:
                     pass
+                finally:
+                    if watchdog is not None:
+                        watchdog.cancel()
                 after = get_installed_version(pkgname)
                 success = returncode == 0 and before != after
                 if success:
