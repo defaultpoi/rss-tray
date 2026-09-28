@@ -297,6 +297,21 @@ def _kill_process_group(proc, grace=5):
             return
 
 
+def parse_xbps_updates(output):
+    """Pure parser for `xbps-install -Mn -u` output: returns the pkgnames whose
+    action is 'update'. Lines look like
+        cryptsetup-2.8.8_1 update x86_64 https://... 3203607 568523"""
+    updates = []
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) < 2 or parts[1] != 'update':
+            continue
+        match = re.match(r'^(.+)-[0-9][^-]*$', parts[0])
+        if match:
+            updates.append(match.group(1))
+    return updates
+
+
 def list_all_updates():
     """Read-only, in-memory, system-wide dry run — no root needed, nothing written
     to disk. Returns a list of pkgnames that have a real newer build published.
@@ -320,19 +335,7 @@ def list_all_updates():
     if proc.returncode != 0:
         return None
     output = (out or '') + (err or '')
-    updates = []
-    for line in output.splitlines():
-        line = line.strip()
-        parts = line.split()
-        if len(parts) < 2:
-            continue
-        pkgver_token, action = parts[0], parts[1]
-        if action != 'update':
-            continue
-        match = re.match(r'^(.+)-[0-9][^-]*$', pkgver_token)
-        if match:
-            updates.append(match.group(1))
-    return updates
+    return parse_xbps_updates(output)
 
 
 def check_twitch_live_channels(channels):

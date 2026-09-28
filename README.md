@@ -65,7 +65,7 @@ Everything lives in `~/.config/rss-tray/`:
 https://example.com/feed.xml|My Blog|5
 
 [mute]
-# one phrase per line; matching items are dropped
+# case-insensitive phrases, several per line separated by |; titles containing any are dropped
 sponsored
 
 [twitch]
@@ -102,6 +102,10 @@ The `zz-` prefix matters: sudoers uses the last matching rule, so this file must
 - `Gtk.StatusIcon` is deprecated upstream but still works on XFCE and most X11 panels.
 - Twitch's GQL API is unofficial and undocumented; it can break without notice.
 - Update detection and installs are Void-specific.
+
+## Tests
+
+Run `python3 -m unittest discover -s tests -v` (needs PyGObject and feedparser installed). CI runs the same on every push.
 
 ## License
 
