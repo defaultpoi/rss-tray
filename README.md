@@ -1,37 +1,31 @@
 # rss-tray
 
-A minimal, fast tray-based RSS/Atom reader for Linux desktops — a lightweight alternative to QuiteRSS. Built with Python and GTK3, it sits in your system tray, shows an unread count, and lets you triage feed items from a compact dropdown without a full application window.
-
-Originally built for XFCE on Void Linux, but should work on any Linux desktop with a GTK3-compatible system tray (KDE, GNOME with an extension, most other X11/Wayland-via-XWayland setups).
+A minimal tray-based RSS/Atom reader for Linux, built with Python and GTK3 as a lightweight replacement for QuiteRSS. It also shows weather, Void package updates, Twitch live channels and a countdown timer in the same popup. Written for XFCE on Void Linux; it should work on any desktop with a `Gtk.StatusIcon`-compatible tray.
 
 ## Features
 
-- **Tray icon with unread badge** — the icon itself shows the unread count and changes color:
-  - 🟢 green — nothing unread
-  - 🟠 orange — unread items waiting
-  - 🔴 red — a followed package has an update available (see below)
-- **Compact dropdown list** — click the tray icon to see unread items, grouped by feed with a header divider between groups. The list auto-opens whenever new items arrive, and stays open as you clear items until the list is empty.
-- **Per-item actions** — click a title to open it in your browser and mark it read; click the small mail icon on a row to mark it read without opening it; click a feed's header to mark that entire feed's items read at once.
-- **Custom feed names** — override a feed's often-verbose title with a short display name.
-- **Per-feed check intervals** — override the global check frequency for individual feeds (e.g. check a fast-moving feed every 5 minutes, a quiet one every hour).
-- **Ignores backlog on new feeds** — when you first add a feed, only items from the last 24 hours are surfaced as unread; older entries are silently marked as seen instead of flooding your list.
-- **Void package-update detection (optional, per feed)** — flag a feed (e.g. void-packages' commit feed) as a `pkgfeed`; entries whose title matches an installed package are highlighted with an update icon, and clicking one (after a confirmation prompt) runs `xbps-install -Su <package>` in a terminal.
-- **Persistent state, pruned automatically** — read/unread status and per-feed check timestamps survive restarts; seen-item records older than 30 days are pruned so the state file doesn't grow forever.
+- **Tray icon** with three states:
+  - green: nothing unread (shows the current temperature)
+  - orange: unread news
+  - red: package updates available
+
+  Live Twitch channels are deliberately not counted in the badge.
+- **Popup list** grouped by feed. Left-click a row to open it and mark it read, right-click a row to mark it read only, click a feed header to mark the whole feed read. The popup auto-opens on new items and closes on focus-out.
+- **Feeds:** per-feed check intervals, custom display names, mute phrases. Items older than 24 h are silently marked seen the first time they are seen.
+- **Weather** (Open-Meteo): today's temperature, high/low, wind and rain, with a 5-day forecast behind the `›` button.
+- **Void package updates:** a system-wide `xbps-install -Mn -u` dry run every hour. Click the "Updates available" header to install everything, one package at a time, with live status.
+- **Twitch:** live channels are polled every 30 minutes through Twitch's unofficial GQL API (no app registration). Click a row to open the stream with `streamlink --player mpv`.
+- **Timer:** a 0-2 h slider behind the "Timer" footer button. It keeps counting with the popup closed and plays the notification sound twice at zero.
 
 ## Requirements
 
-- Python 3
-- PyGObject (GTK3 bindings) — package `python3-gobject` on Void
-- `python3-cairo` (pycairo) — for rendering the tray icon badge
-- `feedparser` — via your distro's package manager (`python3-feedparser` on Void) or `pip install --user feedparser`
-- A GTK3-compatible system tray / notification area in your desktop environment
-- `xbps-query` / `xbps-install` on the `PATH` if you use the package-update detection feature (Void Linux only)
-- A terminal emulator for running package updates — the script looks for `xfce4-terminal`, falling back to `x-terminal-emulator`
-
-### Install dependencies on Void Linux
+- Python 3, PyGObject (GTK3), pycairo, `feedparser`
+- `xbps-install` / `xbps-query` for update detection (Void Linux only)
+- `streamlink` and `mpv` for Twitch streams
+- A command-line audio player for the notification sound
 
 ```bash
-sudo xbps-install -Sy python3-gobject python3-cairo python3-feedparser
+sudo xbps-install -S python3-gobject python3-cairo python3-feedparser streamlink mpv
 ```
 
 ## Installation
@@ -39,86 +33,76 @@ sudo xbps-install -Sy python3-gobject python3-cairo python3-feedparser
 ```bash
 git clone https://github.com/defaultpoi/rss-tray.git
 cd rss-tray
-cp rss-tray.py ~/.local/bin/rss-tray.py
-chmod +x ~/.local/bin/rss-tray.py
+install -Dm755 rss-tray.py ~/.local/bin/rss-tray.py
+~/.local/bin/rss-tray.py   # run once in the foreground to see any tracebacks
 ```
 
-Run it once manually to check for errors and confirm the tray icon appears:
-
-```bash
-~/.local/bin/rss-tray.py
-```
-
-### Autostart on login (XFCE / most desktop environments)
-
-Create `~/.config/autostart/rss-tray.desktop` with:
+Autostart: create `~/.config/autostart/rss-tray.desktop`:
 
 ```ini
 [Desktop Entry]
 Type=Application
 Name=RSS Tray
 Exec=/home/YOUR_USER/.local/bin/rss-tray.py
-Icon=application-rss+xml
 Terminal=false
-X-GNOME-Autostart-enabled=true
 ```
-
-Replace `YOUR_USER` with your actual username.
 
 ## Configuration
 
-On first run, a default config is created at `~/.config/rss-tray/feeds.conf`. Add one feed per line:
+Everything lives in `~/.config/rss-tray/`:
 
-URL|custom display name (optional)|check interval in minutes (optional)|pkgfeed flag (optional)
+| File | Purpose |
+|------|---------|
+| `config.conf` | feeds, mute phrases, Twitch channels |
+| `state.json` | read/unread state, timestamps, cached updates and live channels (safe to delete to reset) |
+| `notification.wav` | sound played on new items and when the timer ends |
 
-All fields after the URL are optional but positional — leave a field empty to skip it while still setting a later one.
+`config.conf` is INI-like:
 
-**Examples:**
-
-https://example.com/feed.xml
-https://example.com/feed.xml|My Blog
+```ini
+[feeds]
+# URL|display name|check interval in minutes   (name and interval optional)
 https://example.com/feed.xml|My Blog|5
-https://github.com/void-linux/void-packages/commits/master.atom|void-package|30|pkgfeed
 
+[mute]
+# one phrase per line; matching items are dropped
+sponsored
 
-The above sets a display name of "My Blog" with a 5-minute check interval for the second feed, and enables package-update detection with a 30-minute check interval for the void-packages commit feed.
-
-Edit this file directly, or use the **"Edit feeds"** button in the dropdown, which opens it in your default text editor (via `xdg-open`, falling back to a terminal editor).
-
-Changes to `feeds.conf` take effect on the next check cycle — no restart needed for display-name changes (applied live), though newly added feeds and interval changes are picked up on the next scheduled or manual check.
-
-### State file
-
-Read/unread status, seen-item history, and per-feed check timestamps are stored in `~/.config/rss-tray/state.json`. Delete this file to reset everything from scratch (e.g. for testing).
-
-## Passwordless package updates (optional)
-
-If you use the `pkgfeed` package-update detection, clicking a matched item normally prompts for your `sudo` password in a terminal. To skip that prompt, add a scoped sudoers rule:
-
-```bash
-sudo visudo -f /etc/sudoers.d/rss-tray
+[twitch]
+# one channel name per line
+somechannel
 ```
 
-Add (replacing `YOUR_USER`):
-YOUR_USER ALL=(root) NOPASSWD: /usr/bin/xbps-install -Su *
+## Passwordless updates (optional)
 
+Installs run `sudo -n xbps-install -Su -y <pkg>`, which fails immediately if a password would be needed. To allow it without a password, add a scoped rule:
 
-**Security note:** this allows any process running as your user to invoke `xbps-install` as root without a password — not just this script. Only add this rule if you're comfortable with that trade-off. A confirmation dialog still appears in the app before any update command runs, regardless of whether `sudo` itself prompts.
+```bash
+sudo visudo -f /etc/sudoers.d/zz-rss-tray
+```
 
-## How it works
+```
+YOUR_USER ALL=(root) NOPASSWD: /usr/bin/xbps-install -Su -y *
+```
 
-- A background thread checks feeds on a schedule (default: every 10 minutes per feed, overridable per feed), fetching each via `feedparser` with a 15-second timeout.
-- New entries are matched by a hash of their `id`/`link`/title+date, so previously-seen items won't reappear even after a restart.
-- Entries older than 24 hours are marked seen but not surfaced as unread the first time a feed is checked — this only matters when a feed is brand new to your config.
-- The tray icon is drawn on the fly with Cairo (a colored circle with the unread count), avoiding any dependency on icon themes for the badge itself.
-- The dropdown is a plain `Gtk.Window` styled as a borderless popup (not a `Gtk.Menu`), which is what allows it to stay open across multiple clicks — necessary for "mark as read without closing" and "auto-reopen with new items" to work.
+The `zz-` prefix matters: sudoers uses the last matching rule, so this file must sort after anything that might override it.
+
+**Security note:** this lets any process running as your user run `xbps-install -Su -y` as root without a password, not just this app.
+
+## Design notes
+
+- The popup is a borderless `Gtk.Window` that is destroyed and rebuilt on every open. This avoids stuck-size bugs; do not make it persistent or call `resize()` on it.
+- Package updates are system-wide rather than feed-based, because GitHub's atom feed is a sliding window and version bumps get missed.
+- Threading: `lock` guards state, `_check_lock` RSS cycles, `_xbps_lock` xbps scans and installs, `_twitch_lock` Twitch checks. All GTK mutations from threads go through `GLib.idle_add`.
+- A failed xbps scan or Twitch request keeps the previous state; failed scans back off exponentially up to the normal hourly interval.
+- The install timeout kills the whole process group (`sudo` and the `xbps-install` it forked).
 
 ## Known limitations
 
-- Package-name matching for `pkgfeed` entries is a heuristic based on void-packages' `pkgname: description` commit message convention. Unusually formatted commits may not be detected.
-- `Gtk.StatusIcon` (used for the tray icon) is deprecated upstream in favor of StatusNotifier/AppIndicator APIs, but remains functional on XFCE and most X11 panels. If your desktop environment drops support for it, the tray icon may stop appearing.
-- No desktop notifications (e.g. via `notify-send`) are sent when new items arrive — the popup auto-opening is the current mechanism for surfacing new items.
+- `Gtk.StatusIcon` is deprecated upstream but still works on XFCE and most X11 panels.
+- Twitch's GQL API is unofficial and undocumented; it can break without notice.
+- Update detection and installs are Void-specific.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).
