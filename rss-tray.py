@@ -314,11 +314,11 @@ def list_all_updates():
             out, err = proc.communicate(timeout=60)
         except subprocess.TimeoutExpired:
             _kill_process_group(proc)
-            return []
+            return None  # None = scan failed (distinct from [] = no updates)
     except Exception:
-        return []
+        return None
     if proc.returncode != 0:
-        return []
+        return None
     output = (out or '') + (err or '')
     updates = []
     for line in output.splitlines():
@@ -368,9 +368,9 @@ def check_twitch_live_channels(channels):
         with urllib.request.urlopen(req, timeout=10) as resp:
             results = json.loads(resp.read().decode('utf-8'))
     except Exception:
-        return {}
+        return None  # None = request failed (distinct from {} = nobody live)
     if not isinstance(results, list):
-        return {}
+        return None
     live = {}
     for channel, result in zip(channels, results):
         user = (result.get('data') or {}).get('user')
@@ -647,9 +647,21 @@ class RssTray:
         now = time_module.time()
         with self.lock:
             last = self.state.get('updates_last_checked', 0)
-        if not force and (now - last) < PENDING_CHECK_INTERVAL_SECONDS:
-            return
+            last_attempt = self.state.get('updates_last_attempt', 0)
+            fails = self.state.get('updates_fail_count', 0)
+        if not force:
+            if (now - last) < PENDING_CHECK_INTERVAL_SECONDS:
+                return
+            if fails and (now - last_attempt) < min(300 * 2 ** (fails - 1),
+                                                     PENDING_CHECK_INTERVAL_SECONDS):
+                return  # backing off after failed scans
         pkgnames = list_all_updates()
+        if pkgnames is None:
+            with self.lock:
+                self.state['updates_last_attempt'] = now
+                self.state['updates_fail_count'] = min(fails + 1, 10)
+                save_state(self.state)
+            return  # keep the previous available_updates untouched
         with self.lock:
             existing = {e['pkgname']: e for e in self.state.get('available_updates', [])}
             promoted_new = []
@@ -665,6 +677,7 @@ class RssTray:
                     promoted_new.append(entry)
             self.state['available_updates'] = [existing[p] for p in pkgnames if p in existing]
             self.state['updates_last_checked'] = now
+            self.state['updates_fail_count'] = 0
             save_state(self.state)
         if promoted_new:
             GLib.idle_add(self.on_new_items)  # reuse: sound + auto-popup + icon refresh
@@ -696,7 +709,8 @@ class RssTray:
             channels = load_twitch_channels()
             if channels:
                 live_now = check_twitch_live_channels(channels)
-                GLib.idle_add(self._on_twitch_checked, live_now)
+                if live_now is not None:  # failed check: keep last known live state
+                    GLib.idle_add(self._on_twitch_checked, live_now)
         finally:
             self._twitch_lock.release()
 
