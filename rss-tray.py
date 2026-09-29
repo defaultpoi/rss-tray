@@ -249,9 +249,17 @@ def save_state(state):
     os.replace(tmp, STATE_FILE)
 
 
-def entry_id(entry):
-    raw = entry.get('id') or entry.get('link') or (entry.get('title', '') + entry.get('published', ''))
-    return hashlib.sha1(raw.encode('utf-8', 'ignore')).hexdigest()
+def entry_id(entry, feed_url=None):
+    """A stable id for entries with a real id/link. Entries lacking both
+    (the fallback: title+published) are hashed together with feed_url when
+    given, so the same title+date on two different feeds doesn't collide."""
+    raw = entry.get('id') or entry.get('link')
+    if raw:
+        return hashlib.sha1(raw.encode('utf-8', 'ignore')).hexdigest()
+    fallback = entry.get('title', '') + entry.get('published', '')
+    if feed_url:
+        fallback = feed_url + '\x00' + fallback
+    return hashlib.sha1(fallback.encode('utf-8', 'ignore')).hexdigest()
 
 
 def entry_age_seconds(entry):
@@ -607,8 +615,11 @@ class RssTray:
                 continue
             last_checked[url] = now
             for entry in parsed.entries:
-                eid = entry_id(entry)
-                if eid in seen_ids:
+                eid = entry_id(entry, url)
+                # legacy (pre-collision-fix) hash for the same fallback entry —
+                # checked too so items already recorded as seen don't resurface
+                legacy_eid = entry_id(entry)
+                if eid in seen_ids or legacy_eid in seen_ids:
                     continue
                 seen_ids.add(eid)
                 newly_seen_ids.add(eid)

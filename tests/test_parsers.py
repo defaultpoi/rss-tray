@@ -248,3 +248,17 @@ class TestTwitchLive(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestEntryIdFeedScoping(unittest.TestCase):
+    def test_fallback_scoped_by_feed_url(self):
+        entry = {'title': 't', 'published': 'd'}
+        a = rt.entry_id(entry, feed_url='https://a')
+        b = rt.entry_id(entry, feed_url='https://b')
+        legacy = rt.entry_id(entry)
+        self.assertNotEqual(a, b)
+        self.assertNotEqual(a, legacy)
+
+    def test_id_or_link_present_ignores_feed_url(self):
+        entry = {'id': 'x'}
+        self.assertEqual(rt.entry_id(entry, feed_url='https://a'), rt.entry_id(entry))
