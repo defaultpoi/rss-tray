@@ -1127,8 +1127,8 @@ class RssTray:
         self.listbox.set_selection_mode(Gtk.SelectionMode.NONE)
         self.listbox.connect('row-activated', self.on_row_activated)
         self.listbox.connect('button-press-event', self.on_listbox_button_press)
-        self.listbox.set_margin_bottom(70)  # timer_box is 60px tall, valign END; the extra
-                                             # 10px keeps a visible gap above it instead of
+        self.listbox.set_margin_bottom(85)  # timer_box is 60px tall, valign END; the extra
+                                             # 25px keeps a visible gap above it instead of
                                              # timer_box's top edge sitting flush against the
                                              # last row
         scroller.add(self.listbox)
