@@ -63,6 +63,10 @@ def build_weather_api_url(lat, lon):
         "&forecast_days=6&timezone=auto"
     )
 WEATHER_REFRESH_SECONDS = 1800  # 30 minutes
+ALERTS_REGION_REFRESH_SECONDS = 7 * 24 * 3600  # re-resolve county from lat/lon weekly
+METEOALARM_Exampleland_ATOM_URL = "https://feeds.meteoalarm.org/feeds/meteoalarm-legacy-atom-Exampleland"
+NOMINATIM_REVERSE_URL = "https://nominatim.openstreetmap.org/reverse"
+ALERT_PULSE_INTERVAL_MS = 600
 TWITCH_GQL_URL = "https://gql.twitch.tv/gql"
 TWITCH_GQL_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"  # Twitch's own public web-client ID —
                                                           # used by twitch.tv itself for logged-out
@@ -107,6 +111,14 @@ def ensure_config():
             "# Uses Open-Meteo, no account/key needed. Falls back to the built-in\n"
             "# default below if this section or line is missing/unparsable.\n"
             f"# {DEFAULT_WEATHER_LATITUDE}|{DEFAULT_WEATHER_LONGITUDE}\n"
+            "#\n"
+            "# alerts=true enables MeteoAlarm severe-weather alerts for the county\n"
+            "# matching the coordinates above (reverse-geocoded automatically via\n"
+            "# OpenStreetMap, re-checked weekly). When an alert is active, the\n"
+            "# matching weather value pulses red and the tray badge pulses red.\n"
+            "# Exampleland only. The app writes region=/region_updated= back into this\n"
+            "# section itself once resolved -- leave those two alone.\n"
+            "alerts=false\n"
         )
 
 
@@ -195,19 +207,110 @@ def load_twitch_channels():
     return channels
 
 
+def load_weather_settings():
+    """Returns {'lat', 'lon', 'alerts_enabled', 'region', 'region_updated'}
+    from config.conf's [weather] section. The coordinates line has no '='
+    ('lat|lon'); everything else is a 'key=value' line. 'region' and
+    'region_updated' are written back automatically by the app itself
+    (see _update_weather_region_cache) once alerts are enabled and the
+    county has been resolved from the coordinates -- not meant to be
+    hand-edited, though nothing breaks if they're missing or wrong."""
+    lat, lon = DEFAULT_WEATHER_LATITUDE, DEFAULT_WEATHER_LONGITUDE
+    alerts_enabled = False
+    region = None
+    region_updated = 0.0
+    for line in _read_config_sections()['weather']:
+        if '=' in line:
+            key, _, val = line.partition('=')
+            key = key.strip().lower()
+            val = val.strip()
+            if key == 'alerts':
+                alerts_enabled = val.lower() in ('1', 'true', 'yes', 'on')
+            elif key == 'region':
+                region = val or None
+            elif key == 'region_updated':
+                try:
+                    region_updated = float(val)
+                except ValueError:
+                    pass
+        else:
+            parts = [p.strip() for p in line.split('|')]
+            if len(parts) >= 2:
+                try:
+                    lat, lon = float(parts[0]), float(parts[1])
+                except ValueError:
+                    pass
+    return {
+        'lat': lat, 'lon': lon, 'alerts_enabled': alerts_enabled,
+        'region': region, 'region_updated': region_updated,
+    }
+
+
 def load_weather_coords():
-    """Returns (lat, lon) from config.conf's [weather] section (first line,
-    'lat|lon'), falling back to the built-in default on any parse problem or
-    if the section/line is absent."""
-    lines = _read_config_sections()['weather']
-    if lines:
-        parts = [p.strip() for p in lines[0].split('|')]
-        if len(parts) >= 2:
-            try:
-                return float(parts[0]), float(parts[1])
-            except ValueError:
-                pass
-    return DEFAULT_WEATHER_LATITUDE, DEFAULT_WEATHER_LONGITUDE
+    """Back-compat wrapper: just the (lat, lon) from load_weather_settings()."""
+    settings = load_weather_settings()
+    return settings['lat'], settings['lon']
+
+
+def _update_weather_region_cache(region, timestamp):
+    """Rewrites config.conf in place, setting region=/region_updated= inside
+    the [weather] section (creating the section at the end of the file if
+    it's somehow missing) while leaving every other line -- including
+    comments and other sections -- untouched. Best-effort: any error here
+    just means the county gets re-resolved next poll instead of using the
+    weekly cache, so failures are swallowed."""
+    try:
+        with open(CONFIG_FILE) as f:
+            lines = f.readlines()
+    except OSError:
+        lines = []
+
+    def is_section(line, name=None):
+        s = line.strip()
+        if not (s.startswith('[') and s.endswith(']')):
+            return False
+        return name is None or s[1:-1].strip().lower() == name
+
+    start = next((i for i, l in enumerate(lines) if is_section(l, 'weather')), None)
+    if start is None:
+        if lines and not lines[-1].endswith('\n'):
+            lines.append('\n')
+        lines.append('[weather]\n')
+        start = len(lines) - 1
+    end = next((i for i in range(start + 1, len(lines)) if is_section(lines[i])), len(lines))
+
+    kept = [
+        l for l in lines[start + 1:end]
+        if not l.strip().lower().startswith('region=')
+        and not l.strip().lower().startswith('region_updated=')
+    ]
+    new_section = kept + [f'region={region}\n', f'region_updated={int(timestamp)}\n']
+    lines[start + 1:end] = new_section
+
+    try:
+        tmp = CONFIG_FILE + '.tmp'
+        with open(tmp, 'w') as f:
+            f.writelines(lines)
+        os.replace(tmp, CONFIG_FILE)
+    except OSError:
+        pass
+
+
+def reverse_geocode_county(lat, lon):
+    """Best-effort reverse geocode via Nominatim; returns the local county
+    name (e.g. 'Northshire') or None on any failure. Rate-limited by design to
+    once a week (see ALERTS_REGION_REFRESH_SECONDS) by the caller."""
+    url = (
+        f"{NOMINATIM_REVERSE_URL}?lat={lat}&lon={lon}"
+        "&format=jsonv2&zoom=8&accept-language=en"
+    )
+    req = urllib.request.Request(url, headers={'User-Agent': 'rss-tray/1.0 (personal use)'})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+        return (data.get('address') or {}).get('county') or None
+    except Exception:
+        return None
 
 
 def is_muted(title, mute_phrases):
@@ -474,6 +577,73 @@ def edit_file_externally(path):
             print(f"Couldn't open an editor — edit manually: {path}")
 
 
+ALERT_HAZARD_SEGMENT_MAP = (
+    # (substring to look for in the hazard text, lowercased) -> segment key.
+    # Checked in order; first match wins. 'glyph' recolors the weather-icon
+    # glyph in the temp segment; the others recolor that value's own label.
+    ('wind', 'wind'),
+    ('temperature', 'hilo'),
+    ('snow', 'glyph'),
+    ('ice', 'glyph'),
+    ('rain', 'rain'),
+    ('thunderstorm', 'rain'),
+    ('flood', 'rain'),
+    ('coastal', 'rain'),
+)
+
+
+def _hazard_to_segment(hazard_text):
+    h = hazard_text.lower()
+    for needle, segment in ALERT_HAZARD_SEGMENT_MAP:
+        if needle in h:
+            return segment
+    return None  # e.g. Fog, Forest fire, Avalanches -- badge-only, no matching value
+
+
+_METEOALARM_TITLE_RE = re.compile(
+    r'^\s*\S+\s+(.+?)\s+Warning\s+issued\s+for\s+\S+\s*-\s*(.+?)\s*$', re.IGNORECASE
+)
+
+
+def parse_meteoalarm_title(title):
+    """Splits a MeteoAlarm entry title like 'Yellow Wind Warning issued for
+    Exampleland - Eastshire' into (hazard, region). Returns (None, None) if the
+    title doesn't match the expected shape."""
+    m = _METEOALARM_TITLE_RE.match(title or '')
+    if not m:
+        return None, None
+    return m.group(1), m.group(2)
+
+
+def fetch_meteoalarm_alerts(region):
+    """Fetches Exampleland's MeteoAlarm feed and returns the entries whose area
+    matches `region` (case-insensitive), as a list of
+    {'hazard', 'segment', 'title', 'expires'} dicts. Returns None on a feed
+    fetch failure (distinct from [] = feed fetched fine, nothing active for
+    this region)."""
+    try:
+        parsed = feedparser.parse(METEOALARM_Exampleland_ATOM_URL)
+    except Exception:
+        return None
+    if getattr(parsed, 'bozo', False) and not parsed.entries:
+        return None
+    region_lower = (region or '').strip().lower()
+    alerts = []
+    for entry in parsed.entries:
+        if entry.get('cap_areadesc', '').strip().lower() != region_lower:
+            continue
+        hazard, _area = parse_meteoalarm_title(entry.get('title', ''))
+        if not hazard:
+            continue
+        alerts.append({
+            'hazard': hazard,
+            'segment': _hazard_to_segment(hazard),
+            'title': entry.get('title', ''),
+            'expires': entry.get('cap_expires', ''),
+        })
+    return alerts
+
+
 def fetch_weather():
     """Best-effort fetch from Open-Meteo. Returns a dict or None on any failure."""
     lat, lon = load_weather_coords()
@@ -565,6 +735,8 @@ class RssTray:
         self.weather_label = None
         self.weather_box = None
         self.weather_view = 'today'
+        self.active_alerts = []
+        self._alert_pulse_on = True
         self.active_installs = 0
         self.install_status = {}  # pkgname -> 'Waiting…'/'Downloading…'/'Installing…'/'Done'/'Failed'
         self.timer_remaining_seconds = 0
@@ -588,6 +760,7 @@ class RssTray:
         GLib.timeout_add(800, self.maybe_auto_show_startup)
         GLib.timeout_add_seconds(2, self.initial_weather_check)
         GLib.timeout_add_seconds(WEATHER_REFRESH_SECONDS, self.periodic_weather_check)
+        GLib.timeout_add(ALERT_PULSE_INTERVAL_MS, self._alert_pulse_tick)
         GLib.timeout_add_seconds(3, self.initial_twitch_check)
         GLib.timeout_add_seconds(TWITCH_CHECK_INTERVAL_SECONDS, self.periodic_twitch_check)
         GLib.timeout_add_seconds(1, self._timer_tick)
@@ -784,14 +957,53 @@ class RssTray:
 
     def _fetch_weather_bg(self):
         data = fetch_weather()
-        GLib.idle_add(self._on_weather_fetched, data)
+        alerts = self._fetch_alerts_bg()
+        GLib.idle_add(self._on_weather_fetched, data, alerts)
 
-    def _on_weather_fetched(self, data):
+    def _fetch_alerts_bg(self):
+        """Resolves the alert region (from lat/lon, cached weekly in
+        config.conf) and fetches active MeteoAlarm alerts for it. Returns
+        None on failure (caller keeps the previous alerts), [] if alerts
+        are disabled or the region genuinely has nothing active."""
+        settings = load_weather_settings()
+        if not settings['alerts_enabled']:
+            return []
+        region = settings['region']
+        now = time_module.time()
+        if not region or (now - settings['region_updated']) >= ALERTS_REGION_REFRESH_SECONDS:
+            resolved = reverse_geocode_county(settings['lat'], settings['lon'])
+            if resolved:
+                region = resolved
+                _update_weather_region_cache(region, now)
+            elif not region:
+                return None  # never resolved, and this attempt also failed
+            # else: geocoding failed but a stale region is cached -- keep
+            # using it; region_updated is left untouched so it retries
+            # next poll instead of waiting a full week
+        return fetch_meteoalarm_alerts(region)
+
+    def _on_weather_fetched(self, data, alerts=None):
         if data is not None:
             self.weather_data = data
+        if alerts is not None:
+            self.active_alerts = alerts
         self.rebuild_weather_bar()
         self.update_icon()
         return False
+
+    def has_active_alerts(self):
+        return bool(self.active_alerts)
+
+    def active_alert_segments(self):
+        return {a['segment'] for a in self.active_alerts if a.get('segment')}
+
+    def _alert_pulse_tick(self):
+        self._alert_pulse_on = not self._alert_pulse_on
+        if self.has_active_alerts():
+            self.update_icon()
+            if self.popup and self.popup.get_visible():
+                self.rebuild_weather_bar()
+        return True
 
     def format_weather_markup(self):
         """Forecast-view markup only; the 'today' view is built as separate
@@ -823,31 +1035,42 @@ class RssTray:
         d = self.weather_data
         if not d:
             return []
+        active_segments = self.active_alert_segments()
+        alert_color = '#cc0000' if self._alert_pulse_on else '#7a1414'
+
+        def colorize(text, segment):
+            if segment in active_segments:
+                return f'<span foreground="{alert_color}">{text}</span>'
+            return text
+
         segments = []
         glyph = weather_code_glyph(d.get('weather_code'))
         if d.get('temp') is not None:
             temp_text = GLib.markup_escape_text(f"{d['temp']:.0f}°C")
             if glyph:
-                temp_text = f'<span foreground="#2b2b2b" rise="2000">{glyph}</span>' + temp_text
+                glyph_color = alert_color if 'glyph' in active_segments else '#2b2b2b'
+                temp_text = f'<span foreground="{glyph_color}" rise="2000">{glyph}</span>' + temp_text
             segments.append(f'<span size="large"><b>{temp_text}</b></span>')
         if d.get('today_max_temp') is not None and d.get('today_min_temp') is not None:
-            hi_lo = GLib.markup_escape_text(
+            hi_lo = colorize(GLib.markup_escape_text(
                 f"{d['today_max_temp']:.0f}/{d['today_min_temp']:.0f}°C"
-            )
+            ), 'hilo')
             segments.append(f'<span size="large"><b>{hi_lo}</b></span>')
         if d.get('wind') is not None and d.get('today_max_wind') is not None:
-            wind_text = GLib.markup_escape_text(f"{d['wind']:.0f}/{d['today_max_wind']:.0f} km/h")
+            wind_text = colorize(GLib.markup_escape_text(
+                f"{d['wind']:.0f}/{d['today_max_wind']:.0f} km/h"
+            ), 'wind')
             segments.append(f'<span size="large"><b>{wind_text}</b></span>')
         elif d.get('wind') is not None:
-            wind_text = GLib.markup_escape_text(f"{d['wind']:.0f} km/h")
+            wind_text = colorize(GLib.markup_escape_text(f"{d['wind']:.0f} km/h"), 'wind')
             segments.append(f'<span size="large"><b>{wind_text}</b></span>')
         if d.get('today_rain_prob') is not None and d.get('today_precip_sum') is not None:
-            rain_text = GLib.markup_escape_text(
+            rain_text = colorize(GLib.markup_escape_text(
                 f"{d['today_rain_prob']:.0f}%/{d['today_precip_sum']:.1f}mm"
-            )
+            ), 'rain')
             segments.append(f'<span size="large"><b>{rain_text}</b></span>')
         elif d.get('today_rain_prob') is not None:
-            rain_text = GLib.markup_escape_text(f"{d['today_rain_prob']:.0f}%")
+            rain_text = colorize(GLib.markup_escape_text(f"{d['today_rain_prob']:.0f}%"), 'rain')
             segments.append(f'<span size="large"><b>{rain_text}</b></span>')
         return segments
 
@@ -958,7 +1181,7 @@ class RssTray:
 
     def _should_show_weather_icon(self, count):
         return (
-            count == 0 and not self.has_pkg_update()
+            count == 0 and not self.has_pkg_update() and not self.has_active_alerts()
             and self.weather_data and self.weather_data.get('temp') is not None
         )
 
@@ -986,7 +1209,10 @@ class RssTray:
     def update_icon(self):
         count = self.total_badge_count()
         self.status_icon.set_from_pixbuf(self.render_icon(count))
-        if self._should_show_weather_icon(count):
+        if self.has_active_alerts():
+            hazards = ', '.join(sorted({a['hazard'] for a in self.active_alerts}))
+            tooltip = f"\u26a0 {hazards} warning"
+        elif self._should_show_weather_icon(count):
             tooltip = self.format_weather_tooltip_text()
         elif self.has_pkg_update():
             tooltip = f"{count} unread — package update available"
@@ -1050,7 +1276,12 @@ class RssTray:
             ctx.move_to((size - tw) / 2 - xb, size / 2 - th / 2 - yb)
             ctx.show_text(temp_text)
         else:
-            if self.has_pkg_update():
+            if self.has_active_alerts():
+                if self._alert_pulse_on:
+                    ctx.set_source_rgba(0.90, 0.05, 0.05, 1)   # red: MeteoAlarm alert (bright)
+                else:
+                    ctx.set_source_rgba(0.50, 0.05, 0.05, 1)   # red: MeteoAlarm alert (dim, pulsing)
+            elif self.has_pkg_update():
                 ctx.set_source_rgba(0.82, 0.18, 0.18, 1)   # red: update available
             elif count > 0:
                 ctx.set_source_rgba(0.92, 0.55, 0.10, 1)   # orange: unread news / live channel

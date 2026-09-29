@@ -282,3 +282,138 @@ class TestWeatherCoords(TmpConfigCase):
         self.conf('[weather]\n40.0\n')
         self.assertEqual(rt.load_weather_coords(),
                           (rt.DEFAULT_WEATHER_LATITUDE, rt.DEFAULT_WEATHER_LONGITUDE))
+
+
+class TestWeatherSettings(TmpConfigCase):
+    def test_defaults(self):
+        s = rt.load_weather_settings()
+        self.assertEqual(s['lat'], rt.DEFAULT_WEATHER_LATITUDE)
+        self.assertEqual(s['lon'], rt.DEFAULT_WEATHER_LONGITUDE)
+        self.assertFalse(s['alerts_enabled'])
+        self.assertIsNone(s['region'])
+        self.assertEqual(s['region_updated'], 0.0)
+
+    def test_full_section(self):
+        self.conf('[weather]\n40.0|-3.7\nalerts=true\nregion=Northshire\nregion_updated=123.0\n')
+        s = rt.load_weather_settings()
+        self.assertEqual((s['lat'], s['lon']), (40.0, -3.7))
+        self.assertTrue(s['alerts_enabled'])
+        self.assertEqual(s['region'], 'Northshire')
+        self.assertEqual(s['region_updated'], 123.0)
+
+    def test_alerts_case_insensitive_and_variants(self):
+        for val in ('True', 'YES', '1', 'on'):
+            self.conf(f'[weather]\nalerts={val}\n')
+            self.assertTrue(rt.load_weather_settings()['alerts_enabled'])
+        for val in ('false', '0', 'no', ''):
+            self.conf(f'[weather]\nalerts={val}\n')
+            self.assertFalse(rt.load_weather_settings()['alerts_enabled'])
+
+
+class TestUpdateWeatherRegionCache(TmpConfigCase):
+    def test_round_trip_preserves_other_content(self):
+        self.conf(
+            '[feeds]\nhttps://a\n'
+            '\n[weather]\n45.0|26.0\nalerts=true\n# a comment\n'
+            '\n[twitch]\nsomechannel\n'
+        )
+        rt._update_weather_region_cache('Northshire', 100.0)
+        s = rt.load_weather_settings()
+        self.assertEqual(s['region'], 'Northshire')
+        self.assertEqual(s['region_updated'], 100.0)
+        self.assertEqual((s['lat'], s['lon']), (45.0, 26.0))
+        self.assertTrue(s['alerts_enabled'])
+        self.assertEqual(rt.load_twitch_channels(), ['somechannel'])
+        self.assertEqual([f[0] for f in rt.load_feeds()], ['https://a'])
+
+    def test_overwrites_previous_region_values(self):
+        self.conf('[weather]\n45.0|26.0\nregion=Old\nregion_updated=1\n')
+        rt._update_weather_region_cache('New', 200.0)
+        s = rt.load_weather_settings()
+        self.assertEqual(s['region'], 'New')
+        self.assertEqual(s['region_updated'], 200.0)
+
+    def test_creates_section_if_missing(self):
+        self.conf('[feeds]\nhttps://a\n')
+        rt._update_weather_region_cache('Northshire', 50.0)
+        self.assertEqual(rt.load_weather_settings()['region'], 'Northshire')
+
+
+class TestReverseGeocodeCounty(unittest.TestCase):
+    def _resp(self, payload):
+        resp = mock.MagicMock()
+        resp.__enter__.return_value.read.return_value = json.dumps(payload).encode()
+        return resp
+
+    def test_success(self):
+        payload = {'address': {'county': 'Northshire'}}
+        with mock.patch.object(rt.urllib.request, 'urlopen', return_value=self._resp(payload)):
+            self.assertEqual(rt.reverse_geocode_county(10.0, 20.0), 'Northshire')
+
+    def test_missing_county_is_none(self):
+        with mock.patch.object(rt.urllib.request, 'urlopen', return_value=self._resp({'address': {}})):
+            self.assertIsNone(rt.reverse_geocode_county(10.0, 20.0))
+
+    def test_request_error_is_none(self):
+        with mock.patch.object(rt.urllib.request, 'urlopen', side_effect=OSError):
+            self.assertIsNone(rt.reverse_geocode_county(10.0, 20.0))
+
+
+class TestMeteoalarmTitleParsing(unittest.TestCase):
+    def test_parse_title(self):
+        self.assertEqual(
+            rt.parse_meteoalarm_title('Yellow Wind Warning issued for Exampleland - Eastshire'),
+            ('Wind', 'Eastshire'),
+        )
+
+    def test_parse_title_multiword_hazard(self):
+        self.assertEqual(
+            rt.parse_meteoalarm_title('Orange High Temperature Warning issued for Exampleland - Northshire'),
+            ('High Temperature', 'Northshire'),
+        )
+
+    def test_parse_title_no_match(self):
+        self.assertEqual(rt.parse_meteoalarm_title('not a real title'), (None, None))
+
+    def test_hazard_segment_mapping(self):
+        self.assertEqual(rt._hazard_to_segment('Wind'), 'wind')
+        self.assertEqual(rt._hazard_to_segment('High Temperature'), 'hilo')
+        self.assertEqual(rt._hazard_to_segment('Low Temperature'), 'hilo')
+        self.assertEqual(rt._hazard_to_segment('Snow/Ice'), 'glyph')
+        self.assertEqual(rt._hazard_to_segment('Rain'), 'rain')
+        self.assertEqual(rt._hazard_to_segment('Thunderstorm'), 'rain')
+        self.assertEqual(rt._hazard_to_segment('Coastal Event'), 'rain')
+        self.assertIsNone(rt._hazard_to_segment('Fog'))
+        self.assertIsNone(rt._hazard_to_segment('Forest Fire'))
+
+
+class TestFetchMeteoalarmAlerts(unittest.TestCase):
+    def _entry(self, area, title, expires='2026-01-01T00:00:00+00:00'):
+        return {'cap_areadesc': area, 'title': title, 'cap_expires': expires}
+
+    def test_filters_by_region_case_insensitive(self):
+        parsed = mock.MagicMock(bozo=False, entries=[
+            self._entry('Eastshire', 'Yellow Wind Warning issued for Exampleland - Eastshire'),
+            self._entry('northshire', 'Orange Rain Warning issued for Exampleland - Northshire'),
+        ])
+        with mock.patch.object(rt.feedparser, 'parse', return_value=parsed):
+            alerts = rt.fetch_meteoalarm_alerts('Northshire')
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]['hazard'], 'Rain')
+        self.assertEqual(alerts[0]['segment'], 'rain')
+
+    def test_no_match_is_empty_list(self):
+        parsed = mock.MagicMock(bozo=False, entries=[
+            self._entry('Eastshire', 'Yellow Wind Warning issued for Exampleland - Eastshire'),
+        ])
+        with mock.patch.object(rt.feedparser, 'parse', return_value=parsed):
+            self.assertEqual(rt.fetch_meteoalarm_alerts('Northshire'), [])
+
+    def test_bozo_with_no_entries_is_failure(self):
+        parsed = mock.MagicMock(bozo=True, entries=[])
+        with mock.patch.object(rt.feedparser, 'parse', return_value=parsed):
+            self.assertIsNone(rt.fetch_meteoalarm_alerts('Northshire'))
+
+    def test_parse_exception_is_failure(self):
+        with mock.patch.object(rt.feedparser, 'parse', side_effect=Exception):
+            self.assertIsNone(rt.fetch_meteoalarm_alerts('Northshire'))
