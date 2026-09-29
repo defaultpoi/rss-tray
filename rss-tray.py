@@ -49,16 +49,19 @@ NOTIFICATION_SOUND_CANDIDATES = [
     os.path.join(CONFIG_DIR, 'notification.wav'),  # QuiteRSS's notification sound, if present
     '/usr/share/sounds/alsa/Front_Center.wav',      # fallback if the above is missing
 ]
-WEATHER_LATITUDE = 10.0
-WEATHER_LONGITUDE = 20.0
-WEATHER_API_URL = (
-    "https://api.open-meteo.com/v1/forecast"
-    f"?latitude={WEATHER_LATITUDE}&longitude={WEATHER_LONGITUDE}"
-    "&current=temperature_2m,wind_speed_10m,weather_code"
-    "&hourly=wind_speed_10m"
-    "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,precipitation_sum"
-    "&forecast_days=6&timezone=auto"
-)
+DEFAULT_WEATHER_LATITUDE = 10.0
+DEFAULT_WEATHER_LONGITUDE = 20.0
+
+
+def build_weather_api_url(lat, lon):
+    return (
+        "https://api.open-meteo.com/v1/forecast"
+        f"?latitude={lat}&longitude={lon}"
+        "&current=temperature_2m,wind_speed_10m,weather_code"
+        "&hourly=wind_speed_10m"
+        "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,precipitation_sum"
+        "&forecast_days=6&timezone=auto"
+    )
 WEATHER_REFRESH_SECONDS = 1800  # 30 minutes
 TWITCH_GQL_URL = "https://gql.twitch.tv/gql"
 TWITCH_GQL_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"  # Twitch's own public web-client ID —
@@ -98,6 +101,12 @@ def ensure_config():
             "# Uses Twitch's own internal (unofficial) API — no account/app needed.\n"
             "# Clicking a live channel runs: streamlink --player mpv twitch.tv/<name> best\n"
             "# examplechannel\n"
+            "\n"
+            "[weather]\n"
+            "# Coordinates for the weather bar: lat|lon (one line, decimal degrees).\n"
+            "# Uses Open-Meteo, no account/key needed. Falls back to the built-in\n"
+            "# default below if this section or line is missing/unparsable.\n"
+            f"# {DEFAULT_WEATHER_LATITUDE}|{DEFAULT_WEATHER_LONGITUDE}\n"
         )
 
 
@@ -129,7 +138,7 @@ def _migrate_legacy_config(legacy_feeds, legacy_mute):
 def _read_config_sections():
     """Parses config.conf into {'feeds': [...], 'mute': [...], 'twitch': [...]},
     each a list of raw non-comment, non-empty lines under that [section]."""
-    sections = {'feeds': [], 'mute': [], 'twitch': []}
+    sections = {'feeds': [], 'mute': [], 'twitch': [], 'weather': []}
     current = None
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE) as f:
@@ -184,6 +193,21 @@ def load_twitch_channels():
             seen.add(ch)
             channels.append(ch)
     return channels
+
+
+def load_weather_coords():
+    """Returns (lat, lon) from config.conf's [weather] section (first line,
+    'lat|lon'), falling back to the built-in default on any parse problem or
+    if the section/line is absent."""
+    lines = _read_config_sections()['weather']
+    if lines:
+        parts = [p.strip() for p in lines[0].split('|')]
+        if len(parts) >= 2:
+            try:
+                return float(parts[0]), float(parts[1])
+            except ValueError:
+                pass
+    return DEFAULT_WEATHER_LATITUDE, DEFAULT_WEATHER_LONGITUDE
 
 
 def is_muted(title, mute_phrases):
@@ -452,8 +476,10 @@ def edit_file_externally(path):
 
 def fetch_weather():
     """Best-effort fetch from Open-Meteo. Returns a dict or None on any failure."""
+    lat, lon = load_weather_coords()
+    url = build_weather_api_url(lat, lon)
     try:
-        with urllib.request.urlopen(WEATHER_API_URL, timeout=10) as resp:
+        with urllib.request.urlopen(url, timeout=10) as resp:
             data = json.loads(resp.read().decode('utf-8'))
     except Exception:
         return None

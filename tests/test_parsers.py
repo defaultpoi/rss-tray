@@ -262,3 +262,23 @@ class TestEntryIdFeedScoping(unittest.TestCase):
     def test_id_or_link_present_ignores_feed_url(self):
         entry = {'id': 'x'}
         self.assertEqual(rt.entry_id(entry, feed_url='https://a'), rt.entry_id(entry))
+
+
+class TestWeatherCoords(TmpConfigCase):
+    def test_no_section_gives_default(self):
+        self.assertEqual(rt.load_weather_coords(),
+                          (rt.DEFAULT_WEATHER_LATITUDE, rt.DEFAULT_WEATHER_LONGITUDE))
+
+    def test_valid_coords_parsed(self):
+        self.conf('[weather]\n40.0|-3.7\n')
+        self.assertEqual(rt.load_weather_coords(), (40.0, -3.7))
+
+    def test_garbage_falls_back_to_default(self):
+        self.conf('[weather]\nnot-a-number|also-not\n')
+        self.assertEqual(rt.load_weather_coords(),
+                          (rt.DEFAULT_WEATHER_LATITUDE, rt.DEFAULT_WEATHER_LONGITUDE))
+
+    def test_missing_second_field_falls_back(self):
+        self.conf('[weather]\n40.0\n')
+        self.assertEqual(rt.load_weather_coords(),
+                          (rt.DEFAULT_WEATHER_LATITUDE, rt.DEFAULT_WEATHER_LONGITUDE))
