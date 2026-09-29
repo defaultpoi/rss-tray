@@ -71,6 +71,11 @@ sponsored
 [twitch]
 # one channel name per line
 somechannel
+
+[weather]
+# lat|lon for the weather bar (Open-Meteo, no key needed); optional —
+# falls back to the built-in default if omitted
+10.0|20.0
 ```
 
 ## Passwordless updates (optional)
