@@ -892,17 +892,6 @@ class RssTray:
         self.timer_visible = not self.timer_visible
         if self.timer_box is not None:
             self.timer_box.set_visible(self.timer_visible)
-            GLib.idle_add(self._debug_timer_alloc)
-
-    def _debug_timer_alloc(self):
-        b, s, l = self.timer_box, self.timer_scale, self.timer_label
-        print('BOX', b.get_allocation().width, b.get_allocation().height,
-              'vis=', b.get_visible(), 'mapped=', b.get_mapped(), 'novisall=', b.get_no_show_all())
-        print('SCALE', s.get_allocation().width, s.get_allocation().height,
-              'vis=', s.get_visible(), 'mapped=', s.get_mapped(), 'novisall=', s.get_no_show_all())
-        print('LABEL', l.get_allocation().width, l.get_allocation().height,
-              'vis=', l.get_visible(), 'mapped=', l.get_mapped())
-        return False
 
     def _timer_tick(self):
         if self.timer_running and self.timer_deadline is not None:
