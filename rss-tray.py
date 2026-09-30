@@ -151,7 +151,7 @@ def _migrate_legacy_config(legacy_feeds, legacy_mute):
 def _read_config_sections():
     """Parses config.conf into {'feeds': [...], 'mute': [...], 'twitch': [...]},
     each a list of raw non-comment, non-empty lines under that [section]."""
-    sections = {'feeds': [], 'mute': [], 'twitch': [], 'weather': []}
+    sections = {'feeds': [], 'mute': [], 'twitch': [], 'weather': [], 'timer': []}
     current = None
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE) as f:
@@ -208,6 +208,41 @@ def load_twitch_channels():
             seen.add(ch)
             channels.append(ch)
     return channels
+
+
+DEFAULT_TIMER_MAX_MINUTES = 120
+DEFAULT_TIMER_STEP_SECONDS = 60
+
+
+def load_timer_settings():
+    """Returns {'max_seconds', 'step_seconds'} from config.conf's [timer]
+    section: 'max=<minutes>' and 'step=<seconds>' key=value lines, in any
+    order/combination. Missing or unparsable values fall back to the
+    built-in defaults (120 minutes, 60 second steps -- the app's previous
+    fixed behavior)."""
+    max_minutes = DEFAULT_TIMER_MAX_MINUTES
+    step_seconds = DEFAULT_TIMER_STEP_SECONDS
+    for line in _read_config_sections()['timer']:
+        if '=' not in line:
+            continue
+        key, _, val = line.partition('=')
+        key = key.strip().lower()
+        val = val.split('#', 1)[0].strip()  # allow a trailing '#comment'
+        if key == 'max':
+            try:
+                parsed = int(val)
+                if parsed > 0:
+                    max_minutes = parsed
+            except ValueError:
+                pass
+        elif key == 'step':
+            try:
+                parsed = int(val)
+                if parsed > 0:
+                    step_seconds = parsed
+            except ValueError:
+                pass
+    return {'max_seconds': max_minutes * 60, 'step_seconds': step_seconds}
 
 
 def load_twitch_qualities():
@@ -1514,9 +1549,16 @@ class RssTray:
         self.timer_label = timer_label
         timer_box.pack_start(timer_label, False, False, 0)
 
+        timer_settings = load_timer_settings()
+        max_seconds = timer_settings['max_seconds']
+        step_seconds = timer_settings['step_seconds']
+        if self.timer_remaining_seconds > max_seconds:
+            self.timer_remaining_seconds = max_seconds  # clamp: config may have
+                                                          # lowered max since a
+                                                          # timer was last set
         timer_adjustment = Gtk.Adjustment(
-            value=self.timer_remaining_seconds, lower=0, upper=7200,
-            step_increment=60, page_increment=300, page_size=0
+            value=self.timer_remaining_seconds, lower=0, upper=max_seconds,
+            step_increment=step_seconds, page_increment=step_seconds * 5, page_size=0
         )
         timer_scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=timer_adjustment)
         timer_scale.set_draw_value(False)
