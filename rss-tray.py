@@ -570,14 +570,23 @@ def check_twitch_live_channels(channels):
     return live
 
 
-def open_twitch_stream(channel, quality='best'):
+def open_twitch_stream(channel, quality='best', site='Twitch'):
     """Plays the stream with streamlink+mpv if both are installed; falls
     back to opening the channel in the browser otherwise, or if launching
-    the player fails for any reason."""
+    the player fails for any reason. --title is passed so mpv's window
+    title (and OSD title) shows '<site> > <channel> > <category> > <stream
+    title>'; streamlink substitutes {author}/{category}/{title} per-stream
+    and handles the mpv-specific --force-media-title translation itself.
+    site will become a real per-call argument once a non-Twitch caller
+    (e.g. YouTube Live) exists; for now every caller is Twitch."""
     if shutil.which('streamlink') and shutil.which('mpv'):
         try:
             subprocess.Popen(
-                ['streamlink', '--player', 'mpv', f'twitch.tv/{channel}', quality],
+                [
+                    'streamlink', '--player', 'mpv',
+                    '--title', f'{site} > {{author}} > {{category}} > {{title}}',
+                    f'twitch.tv/{channel}', quality,
+                ],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
             return
