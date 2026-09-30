@@ -16,6 +16,7 @@ A minimal tray-based RSS/Atom reader for Linux, built with Python and GTK3 as a 
 - **Void package updates:** a system-wide `xbps-install -Mn -u` dry run every hour. Click the "Updates available" header to install everything, one package at a time, with live status.
 - **Twitch:** live channels are polled every 30 minutes through Twitch's unofficial GQL API (no app registration). Click a row to play it with `streamlink --player mpv` at the configured quality (default `best`); if either isn't installed, or launching fails, it opens the channel in your browser instead.
 - **Timer:** a 0-2 h slider behind the "Timer" footer button. It keeps counting with the popup closed and plays the notification sound twice at zero.
+- **Severe-weather alerts** (optional, `alerts=true` in `[weather]`): polls MeteoAlarm's Exampleland feed every 30 minutes for the county matching the configured coordinates (reverse-geocoded via OpenStreetMap, re-checked weekly). An active alert is color-coded by severity (yellow/orange/red for moderate/severe/extreme) and pulses the matching weather value and the tray badge, faster for more severe alerts.
 
 ## Requirements
 
@@ -78,6 +79,13 @@ somechannel2|720p60
 # lat|lon for the weather bar (Open-Meteo, no key needed); optional —
 # falls back to the built-in default if omitted
 10.0|20.0
+alerts=true
+
+[timer]
+# max=<minutes> caps the slider (default 120); step=<seconds> sets the
+# arrow-key/scroll increment (default 60). Both optional.
+max=120
+step=60
 ```
 
 ## Passwordless updates (optional)
