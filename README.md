@@ -14,7 +14,7 @@ A minimal tray-based RSS/Atom reader for Linux, built with Python and GTK3 as a 
 - **Feeds:** per-feed check intervals, custom display names, mute phrases. Items older than 24 h are silently marked seen the first time they are seen.
 - **Weather** (Open-Meteo): today's temperature, high/low, wind and rain, with a 5-day forecast behind the `›` button.
 - **Void package updates:** a system-wide `xbps-install -Mn -u` dry run every hour. Click the "Updates available" header to install everything, one package at a time, with live status.
-- **Twitch:** live channels are polled every 30 minutes through Twitch's unofficial GQL API (no app registration). Click a row to open the stream with `streamlink --player mpv`.
+- **Twitch:** live channels are polled every 30 minutes through Twitch's unofficial GQL API (no app registration). Click a row to play it with `streamlink --player mpv` at the configured quality (default `best`); if either isn't installed, or launching fails, it opens the channel in your browser instead.
 - **Timer:** a 0-2 h slider behind the "Timer" footer button. It keeps counting with the popup closed and plays the notification sound twice at zero.
 
 ## Requirements
@@ -69,8 +69,10 @@ https://example.com/feed.xml|My Blog|5
 sponsored
 
 [twitch]
-# one channel name per line
+# one channel name per line; optionally |quality (streamlink format, e.g.
+# 720p60, 1080p60) -- defaults to "best" if omitted
 somechannel
+somechannel2|720p60
 
 [weather]
 # lat|lon for the weather bar (Open-Meteo, no key needed); optional —

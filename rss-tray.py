@@ -197,15 +197,29 @@ def load_mute_filters():
 
 def load_twitch_channels():
     """Returns a list of lowercase Twitch channel login names to watch,
-    de-duplicated while preserving the order they appear in the config."""
+    de-duplicated while preserving the order they appear in the config.
+    A line may optionally have |quality after the name (see
+    load_twitch_qualities); only the name is used here."""
     seen = set()
     channels = []
     for line in _read_config_sections()['twitch']:
-        ch = line.strip().lower()
+        ch = line.split('|', 1)[0].strip().lower()
         if ch and ch not in seen:
             seen.add(ch)
             channels.append(ch)
     return channels
+
+
+def load_twitch_qualities():
+    """Returns {channel: quality} for config lines shaped 'channel|quality'
+    (e.g. 'channel1|720p60'). A channel with no '|quality' part is simply
+    absent here; callers should default missing entries to 'best'."""
+    qualities = {}
+    for line in _read_config_sections()['twitch']:
+        parts = [p.strip() for p in line.split('|', 1)]
+        if len(parts) == 2 and parts[0] and parts[1]:
+            qualities[parts[0].lower()] = parts[1]
+    return qualities
 
 
 def load_weather_settings():
@@ -521,14 +535,20 @@ def check_twitch_live_channels(channels):
     return live
 
 
-def open_twitch_stream(channel):
-    try:
-        subprocess.Popen(
-            ['streamlink', '--player', 'mpv', f'twitch.tv/{channel}', 'best'],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-    except Exception:
-        pass
+def open_twitch_stream(channel, quality='best'):
+    """Plays the stream with streamlink+mpv if both are installed; falls
+    back to opening the channel in the browser otherwise, or if launching
+    the player fails for any reason."""
+    if shutil.which('streamlink') and shutil.which('mpv'):
+        try:
+            subprocess.Popen(
+                ['streamlink', '--player', 'mpv', f'twitch.tv/{channel}', quality],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            return
+        except Exception:
+            pass
+    webbrowser.open(f'https://twitch.tv/{channel}')
 
 
 def play_notification_sound():
@@ -1714,6 +1734,7 @@ class RssTray:
         row.set_selectable(False)
         row.set_activatable(True)
         row.twitch_channel = channel
+        row.twitch_quality = load_twitch_qualities().get(channel, 'best')
 
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         box.set_margin_start(3)
@@ -1941,7 +1962,7 @@ class RssTray:
             self.mark_feed_read(row.header_feed_url)
             return
         if hasattr(row, 'twitch_channel'):
-            open_twitch_stream(row.twitch_channel)
+            open_twitch_stream(row.twitch_channel, getattr(row, 'twitch_quality', 'best'))
             return
         if not hasattr(row, 'entry_id'):
             return

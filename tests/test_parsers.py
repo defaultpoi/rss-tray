@@ -477,3 +477,52 @@ class TestAlertSeverityAndTiming(unittest.TestCase):
         self.assertEqual(flips('red'), 15)
         self.assertIn(flips('orange'), (7, 8))
         self.assertIn(flips('yellow'), (3, 4))
+
+
+class TestTwitchQuality(TmpConfigCase):
+    def test_channels_still_just_names(self):
+        self.conf('[twitch]\nfoo\nbar|720p60\n')
+        self.assertEqual(rt.load_twitch_channels(), ['foo', 'bar'])
+
+    def test_qualities_parsed(self):
+        self.conf('[twitch]\nfoo\nbar|720p60\nbaz|1080p60\n')
+        self.assertEqual(rt.load_twitch_qualities(), {'bar': '720p60', 'baz': '1080p60'})
+
+    def test_channel_without_quality_absent_from_qualities(self):
+        self.conf('[twitch]\nfoo\n')
+        self.assertEqual(rt.load_twitch_qualities(), {})
+
+
+class TestOpenTwitchStream(unittest.TestCase):
+    def test_uses_streamlink_when_both_installed(self):
+        with mock.patch.object(rt.shutil, 'which', side_effect=lambda x: '/usr/bin/' + x), \
+                mock.patch.object(rt.subprocess, 'Popen') as popen, \
+                mock.patch.object(rt.webbrowser, 'open') as wb_open:
+            rt.open_twitch_stream('somechan', '720p60')
+        popen.assert_called_once()
+        args = popen.call_args[0][0]
+        self.assertEqual(args, ['streamlink', '--player', 'mpv', 'twitch.tv/somechan', '720p60'])
+        wb_open.assert_not_called()
+
+    def test_defaults_to_best_quality(self):
+        with mock.patch.object(rt.shutil, 'which', side_effect=lambda x: '/usr/bin/' + x), \
+                mock.patch.object(rt.subprocess, 'Popen') as popen, \
+                mock.patch.object(rt.webbrowser, 'open'):
+            rt.open_twitch_stream('somechan')
+        args = popen.call_args[0][0]
+        self.assertEqual(args[-1], 'best')
+
+    def test_falls_back_to_browser_when_streamlink_missing(self):
+        with mock.patch.object(rt.shutil, 'which', return_value=None), \
+                mock.patch.object(rt.subprocess, 'Popen') as popen, \
+                mock.patch.object(rt.webbrowser, 'open') as wb_open:
+            rt.open_twitch_stream('somechan')
+        popen.assert_not_called()
+        wb_open.assert_called_once_with('https://twitch.tv/somechan')
+
+    def test_falls_back_to_browser_when_launch_raises(self):
+        with mock.patch.object(rt.shutil, 'which', side_effect=lambda x: '/usr/bin/' + x), \
+                mock.patch.object(rt.subprocess, 'Popen', side_effect=OSError), \
+                mock.patch.object(rt.webbrowser, 'open') as wb_open:
+            rt.open_twitch_stream('somechan')
+        wb_open.assert_called_once_with('https://twitch.tv/somechan')
