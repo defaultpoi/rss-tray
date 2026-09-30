@@ -24,6 +24,7 @@ import hashlib
 import calendar
 import time as time_module
 import urllib.request
+from datetime import datetime, timezone
 
 socket.setdefaulttimeout(15)  # avoid feed fetches hanging indefinitely on slow/broken servers
 
@@ -615,18 +616,66 @@ def parse_meteoalarm_title(title):
     return m.group(1), m.group(2)
 
 
-def fetch_meteoalarm_alerts(region):
+ALERT_SEVERITY_RANK = {'yellow': 1, 'orange': 2, 'red': 3}
+
+# (bright, dim) hex pairs for weather-bar text/glyph coloring, and (bright, dim)
+# RGBA tuples for the tray badge, per awareness color.
+ALERT_TEXT_COLORS = {
+    'yellow': ('#c9a600', '#6b5800'),
+    'orange': ('#d97300', '#6b3900'),
+    'red': ('#cc0000', '#7a1414'),
+}
+ALERT_BADGE_COLORS = {
+    'yellow': ((0.90, 0.75, 0.0, 1), (0.55, 0.46, 0.0, 1)),
+    'orange': ((0.90, 0.45, 0.0, 1), (0.55, 0.28, 0.0, 1)),
+    'red': ((0.90, 0.05, 0.05, 1), (0.50, 0.05, 0.05, 1)),
+}
+
+
+def _severity_to_color(cap_severity):
+    """Maps a CAP severity string to MeteoAlarm's own awareness-level color:
+    Moderate=yellow, Severe=orange, Extreme=red. Minor or an unrecognized
+    value defaults to yellow (the least visually urgent), since overstating
+    urgency for an unrecognized value is worse than understating it."""
+    s = (cap_severity or '').strip().lower()
+    if s == 'extreme':
+        return 'red'
+    if s == 'severe':
+        return 'orange'
+    return 'yellow'
+
+
+def _parse_meteoalarm_time(value):
+    """Parses a MeteoAlarm CAP timestamp like '2026-09-28T17:00:00+00:00'.
+    Returns None if missing or unparsable."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def fetch_meteoalarm_alerts(region, now=None):
     """Fetches Exampleland's MeteoAlarm feed and returns the entries whose area
-    matches `region` (case-insensitive), as a list of
-    {'hazard', 'segment', 'title', 'expires'} dicts. Returns None on a feed
-    fetch failure (distinct from [] = feed fetched fine, nothing active for
-    this region)."""
+    matches `region` (case-insensitive) AND whose time window currently
+    covers `now` (defaults to the real current time), as a list of
+    {'hazard', 'segment', 'title', 'expires', 'severity_color'} dicts.
+    Returns None on a feed fetch failure (distinct from [] = feed fetched
+    fine, nothing active for this region right now).
+
+    The feed can retain entries past their own expiry (observed in
+    practice), so onset/expires are checked here rather than trusting
+    presence in the feed alone. Missing or unparsable timestamps err on the
+    side of showing the alert rather than hiding a possibly-real one."""
     try:
         parsed = feedparser.parse(METEOALARM_Exampleland_ATOM_URL)
     except Exception:
         return None
     if getattr(parsed, 'bozo', False) and not parsed.entries:
         return None
+    if now is None:
+        now = datetime.now(timezone.utc)
     region_lower = (region or '').strip().lower()
     alerts = []
     for entry in parsed.entries:
@@ -635,11 +684,21 @@ def fetch_meteoalarm_alerts(region):
         hazard, _area = parse_meteoalarm_title(entry.get('title', ''))
         if not hazard:
             continue
+        onset = (
+            _parse_meteoalarm_time(entry.get('cap_onset'))
+            or _parse_meteoalarm_time(entry.get('cap_effective'))
+        )
+        if onset is not None and now < onset:
+            continue  # not started yet
+        expires = _parse_meteoalarm_time(entry.get('cap_expires'))
+        if expires is not None and now > expires:
+            continue  # expired
         alerts.append({
             'hazard': hazard,
             'segment': _hazard_to_segment(hazard),
             'title': entry.get('title', ''),
             'expires': entry.get('cap_expires', ''),
+            'severity_color': _severity_to_color(entry.get('cap_severity')),
         })
     return alerts
 
@@ -736,7 +795,7 @@ class RssTray:
         self.weather_box = None
         self.weather_view = 'today'
         self.active_alerts = []
-        self._alert_pulse_on = True
+        self._alert_pulse_counter = 0
         self.active_installs = 0
         self.install_status = {}  # pkgname -> 'Waiting…'/'Downloading…'/'Installing…'/'Done'/'Failed'
         self.timer_remaining_seconds = 0
@@ -994,11 +1053,40 @@ class RssTray:
     def has_active_alerts(self):
         return bool(self.active_alerts)
 
-    def active_alert_segments(self):
-        return {a['segment'] for a in self.active_alerts if a.get('segment')}
+    def _segment_alert_colors(self):
+        """{segment_key: color_name}, using the worst-severity alert
+        targeting each segment when more than one does."""
+        info = {}
+        for a in self.active_alerts:
+            seg = a.get('segment')
+            if not seg:
+                continue
+            color = a.get('severity_color', 'yellow')
+            if seg not in info or ALERT_SEVERITY_RANK[color] > ALERT_SEVERITY_RANK[info[seg]]:
+                info[seg] = color
+        return info
+
+    def _worst_alert_color(self):
+        colors = [a.get('severity_color', 'yellow') for a in self.active_alerts]
+        if not colors:
+            return None
+        return max(colors, key=lambda c: ALERT_SEVERITY_RANK.get(c, 0))
+
+    def _pulse_on_for(self, color_name):
+        """Whether `color_name`'s pulse is in its bright phase right now.
+        Extreme (red) flips every tick (the base/fastest rate); severe
+        (orange) flips half as often; moderate (yellow) a quarter as often
+        -- all derived from one shared counter/timer rather than separate
+        timers per color."""
+        c = self._alert_pulse_counter
+        if color_name == 'red':
+            return (c % 2) == 0
+        if color_name == 'orange':
+            return (c % 4) < 2
+        return (c % 8) < 4  # yellow
 
     def _alert_pulse_tick(self):
-        self._alert_pulse_on = not self._alert_pulse_on
+        self._alert_pulse_counter += 1
         if self.has_active_alerts():
             self.update_icon()
             if self.popup and self.popup.get_visible():
@@ -1035,20 +1123,27 @@ class RssTray:
         d = self.weather_data
         if not d:
             return []
-        active_segments = self.active_alert_segments()
-        alert_color = '#cc0000' if self._alert_pulse_on else '#7a1414'
+        seg_colors = self._segment_alert_colors()
 
         def colorize(text, segment):
-            if segment in active_segments:
-                return f'<span foreground="{alert_color}">{text}</span>'
-            return text
+            color_name = seg_colors.get(segment)
+            if not color_name:
+                return text
+            bright, dim = ALERT_TEXT_COLORS[color_name]
+            hexcolor = bright if self._pulse_on_for(color_name) else dim
+            return f'<span foreground="{hexcolor}">{text}</span>'
 
         segments = []
         glyph = weather_code_glyph(d.get('weather_code'))
         if d.get('temp') is not None:
             temp_text = GLib.markup_escape_text(f"{d['temp']:.0f}°C")
             if glyph:
-                glyph_color = alert_color if 'glyph' in active_segments else '#2b2b2b'
+                glyph_color_name = seg_colors.get('glyph')
+                if glyph_color_name:
+                    bright, dim = ALERT_TEXT_COLORS[glyph_color_name]
+                    glyph_color = bright if self._pulse_on_for(glyph_color_name) else dim
+                else:
+                    glyph_color = '#2b2b2b'
                 temp_text = f'<span foreground="{glyph_color}" rise="2000">{glyph}</span>' + temp_text
             segments.append(f'<span size="large"><b>{temp_text}</b></span>')
         if d.get('today_max_temp') is not None and d.get('today_min_temp') is not None:
@@ -1276,11 +1371,10 @@ class RssTray:
             ctx.move_to((size - tw) / 2 - xb, size / 2 - th / 2 - yb)
             ctx.show_text(temp_text)
         else:
-            if self.has_active_alerts():
-                if self._alert_pulse_on:
-                    ctx.set_source_rgba(0.90, 0.05, 0.05, 1)   # red: MeteoAlarm alert (bright)
-                else:
-                    ctx.set_source_rgba(0.50, 0.05, 0.05, 1)   # red: MeteoAlarm alert (dim, pulsing)
+            worst_alert_color = self._worst_alert_color()
+            if worst_alert_color:
+                bright, dim = ALERT_BADGE_COLORS[worst_alert_color]
+                ctx.set_source_rgba(*(bright if self._pulse_on_for(worst_alert_color) else dim))
             elif self.has_pkg_update():
                 ctx.set_source_rgba(0.82, 0.18, 0.18, 1)   # red: update available
             elif count > 0:

@@ -388,7 +388,7 @@ class TestMeteoalarmTitleParsing(unittest.TestCase):
 
 
 class TestFetchMeteoalarmAlerts(unittest.TestCase):
-    def _entry(self, area, title, expires='2026-01-01T00:00:00+00:00'):
+    def _entry(self, area, title, expires='2099-01-01T00:00:00+00:00'):
         return {'cap_areadesc': area, 'title': title, 'cap_expires': expires}
 
     def test_filters_by_region_case_insensitive(self):
@@ -417,3 +417,63 @@ class TestFetchMeteoalarmAlerts(unittest.TestCase):
     def test_parse_exception_is_failure(self):
         with mock.patch.object(rt.feedparser, 'parse', side_effect=Exception):
             self.assertIsNone(rt.fetch_meteoalarm_alerts('Northshire'))
+
+
+class TestAlertSeverityAndTiming(unittest.TestCase):
+    def test_severity_mapping(self):
+        self.assertEqual(rt._severity_to_color('Moderate'), 'yellow')
+        self.assertEqual(rt._severity_to_color('Severe'), 'orange')
+        self.assertEqual(rt._severity_to_color('Extreme'), 'red')
+        self.assertEqual(rt._severity_to_color('Minor'), 'yellow')
+        self.assertEqual(rt._severity_to_color(None), 'yellow')
+
+    def _entry(self, effective, onset, expires, severity='Moderate',
+               title='Yellow Wind Warning issued for Exampleland - Northshire', area='Northshire'):
+        return {
+            'cap_areadesc': area, 'title': title, 'cap_effective': effective,
+            'cap_onset': onset, 'cap_expires': expires, 'cap_severity': severity,
+        }
+
+    def test_expired_entry_filtered_out(self):
+        now = rt.datetime(2026, 9, 29, 19, 14, 58, tzinfo=rt.timezone.utc)
+        parsed = mock.MagicMock(bozo=False, entries=[
+            self._entry('2026-09-28T06:53:00+00:00', '2026-09-28T07:00:00+00:00',
+                         '2026-09-28T17:00:00+00:00'),
+        ])
+        with mock.patch.object(rt.feedparser, 'parse', return_value=parsed):
+            self.assertEqual(rt.fetch_meteoalarm_alerts('Northshire', now=now), [])
+
+    def test_future_entry_filtered_out(self):
+        now = rt.datetime(2026, 9, 29, 19, 14, 58, tzinfo=rt.timezone.utc)
+        parsed = mock.MagicMock(bozo=False, entries=[
+            self._entry('2026-09-29T18:00:00+00:00', '2026-09-30T08:00:00+00:00',
+                         '2026-09-30T20:00:00+00:00', severity='Extreme'),
+        ])
+        with mock.patch.object(rt.feedparser, 'parse', return_value=parsed):
+            self.assertEqual(rt.fetch_meteoalarm_alerts('Northshire', now=now), [])
+
+    def test_currently_active_entry_kept_with_severity_color(self):
+        now = rt.datetime(2026, 9, 29, 19, 14, 58, tzinfo=rt.timezone.utc)
+        parsed = mock.MagicMock(bozo=False, entries=[
+            self._entry('2026-09-29T06:00:00+00:00', '2026-09-29T10:00:00+00:00',
+                         '2026-09-30T10:00:00+00:00', severity='Severe',
+                         title='Orange Rain Warning issued for Exampleland - Northshire'),
+        ])
+        with mock.patch.object(rt.feedparser, 'parse', return_value=parsed):
+            alerts = rt.fetch_meteoalarm_alerts('Northshire', now=now)
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]['severity_color'], 'orange')
+
+    def test_pulse_speed_ratios(self):
+        class Stub:
+            _pulse_on_for = rt.RssTray._pulse_on_for
+        s = Stub()
+        def flips(color):
+            states = []
+            for i in range(16):
+                s._alert_pulse_counter = i
+                states.append(s._pulse_on_for(color))
+            return sum(1 for i in range(1, 16) if states[i] != states[i - 1])
+        self.assertEqual(flips('red'), 15)
+        self.assertIn(flips('orange'), (7, 8))
+        self.assertIn(flips('yellow'), (3, 4))
