@@ -526,3 +526,34 @@ class TestOpenTwitchStream(unittest.TestCase):
                 mock.patch.object(rt.webbrowser, 'open') as wb_open:
             rt.open_twitch_stream('somechan')
         wb_open.assert_called_once_with('https://twitch.tv/somechan')
+
+
+class TestTimerSettings(TmpConfigCase):
+    def test_defaults(self):
+        s = rt.load_timer_settings()
+        self.assertEqual(s['max_seconds'], rt.DEFAULT_TIMER_MAX_MINUTES * 60)
+        self.assertEqual(s['step_seconds'], rt.DEFAULT_TIMER_STEP_SECONDS)
+
+    def test_custom_values(self):
+        self.conf('[timer]\nmax=90\nstep=5\n')
+        s = rt.load_timer_settings()
+        self.assertEqual(s['max_seconds'], 90 * 60)
+        self.assertEqual(s['step_seconds'], 5)
+
+    def test_inline_comments_ignored(self):
+        self.conf('[timer]\nmax=120 #minutes\nstep=5 #seconds\n')
+        s = rt.load_timer_settings()
+        self.assertEqual(s['max_seconds'], 120 * 60)
+        self.assertEqual(s['step_seconds'], 5)
+
+    def test_bad_values_fall_back_to_defaults(self):
+        self.conf('[timer]\nmax=abc\nstep=-5\n')
+        s = rt.load_timer_settings()
+        self.assertEqual(s['max_seconds'], rt.DEFAULT_TIMER_MAX_MINUTES * 60)
+        self.assertEqual(s['step_seconds'], rt.DEFAULT_TIMER_STEP_SECONDS)
+
+    def test_partial_section_keeps_other_default(self):
+        self.conf('[timer]\nmax=30\n')
+        s = rt.load_timer_settings()
+        self.assertEqual(s['max_seconds'], 30 * 60)
+        self.assertEqual(s['step_seconds'], rt.DEFAULT_TIMER_STEP_SECONDS)
