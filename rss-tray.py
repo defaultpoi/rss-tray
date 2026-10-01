@@ -151,7 +151,7 @@ def _migrate_legacy_config(legacy_feeds, legacy_mute):
 def _read_config_sections():
     """Parses config.conf into {'feeds': [...], 'mute': [...], 'twitch': [...]},
     each a list of raw non-comment, non-empty lines under that [section]."""
-    sections = {'feeds': [], 'mute': [], 'twitch': [], 'weather': [], 'timer': []}
+    sections = {'feeds': [], 'mute': [], 'twitch': [], 'weather': [], 'timer': [], 'youtube': []}
     current = None
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE) as f:
@@ -254,6 +254,36 @@ def load_twitch_qualities():
         parts = [p.strip() for p in line.split('|', 1)]
         if len(parts) == 2 and parts[0] and parts[1]:
             qualities[parts[0].lower()] = parts[1]
+    return qualities
+
+
+def load_youtube_channels():
+    """Returns a list of YouTube channel identifiers to watch (as typed --
+    e.g. '@somehandle' or 'channel/UCxxxxxxxxxxxxxxxxxxxxxx' -- YouTube
+    identifiers are case-sensitive, unlike Twitch logins), de-duplicated
+    case-insensitively while preserving the first-seen casing and the
+    order they appear in the config."""
+    seen = set()
+    channels = []
+    for line in _read_config_sections()['youtube']:
+        ch = line.split('|', 1)[0].strip()
+        key = ch.lower()
+        if ch and key not in seen:
+            seen.add(key)
+            channels.append(ch)
+    return channels
+
+
+def load_youtube_qualities():
+    """Returns {channel: quality} for config lines shaped 'channel|quality'
+    (e.g. '@somehandle|720p60'). Keyed by the channel identifier exactly as
+    typed (case-sensitive). A channel with no '|quality' part is simply
+    absent here; callers should default missing entries to 'best'."""
+    qualities = {}
+    for line in _read_config_sections()['youtube']:
+        parts = [p.strip() for p in line.split('|', 1)]
+        if len(parts) == 2 and parts[0] and parts[1]:
+            qualities[parts[0]] = parts[1]
     return qualities
 
 
@@ -413,6 +443,8 @@ def load_state():
         state['available_updates'] = []
     if not isinstance(state.get('live_channels'), list):
         state['live_channels'] = []
+    if not isinstance(state.get('live_youtube_channels'), list):
+        state['live_youtube_channels'] = []
     if not isinstance(state.get('last_checked'), dict):
         state['last_checked'] = {}
 
@@ -593,6 +625,70 @@ def open_twitch_stream(channel, quality='best', site='Twitch'):
         except Exception:
             pass
     webbrowser.open(f'https://twitch.tv/{channel}')
+
+
+YOUTUBE_CHECK_INTERVAL_SECONDS = 1800  # how often to poll YouTube live status
+YOUTUBE_CHECK_TIMEOUT_SECONDS = 20  # per-channel; this check shells out to
+                                     # streamlink itself (no lightweight
+                                     # keyless batch API exists for YouTube),
+                                     # so it's checked sequentially, one
+                                     # subprocess per channel
+
+
+def check_youtube_live_channels(channels):
+    """Uses `streamlink --json <channel>/live` per channel -- the same
+    extraction path used for actual playback, so there's no risk of this
+    check disagreeing with what clicking the row would actually do. No
+    keyless YouTube API exists for batch-checking many channels in one
+    request, so this is sequential, one streamlink invocation per channel.
+    Returns {channel: title} for whichever channels are currently live (a
+    not-live channel is simply absent, same convention as Twitch's check);
+    returns None only if every single channel's check failed (e.g.
+    streamlink isn't installed) -- an individual channel's request failing
+    is treated the same as that channel not being live, and is simply
+    retried next poll."""
+    if not channels:
+        return {}
+    live = {}
+    any_success = False
+    for channel in channels:
+        url = f'https://www.youtube.com/{channel}/live'
+        try:
+            result = subprocess.run(
+                ['streamlink', '--json', url],
+                capture_output=True, text=True, timeout=YOUTUBE_CHECK_TIMEOUT_SECONDS
+            )
+            parsed = json.loads(result.stdout)
+        except Exception:
+            continue  # this channel's check failed; left absent, retried next poll
+        any_success = True
+        metadata = parsed.get('metadata')
+        if metadata and metadata.get('title'):
+            live[channel] = metadata['title']
+    if not any_success:
+        return None  # every channel's check failed (e.g. streamlink missing)
+    return live
+
+
+def open_youtube_stream(channel, quality='best'):
+    """Plays the stream with streamlink+mpv if both are installed; falls
+    back to opening the channel's page in the browser otherwise, or if
+    launching the player fails for any reason. See open_twitch_stream for
+    the --title scheme (same pattern, site fixed to 'YouTube')."""
+    if shutil.which('streamlink') and shutil.which('mpv'):
+        try:
+            subprocess.Popen(
+                [
+                    'streamlink', '--player', 'mpv',
+                    '--title', 'YouTube > {author} > {category} > {title}',
+                    f'https://www.youtube.com/{channel}/live', quality,
+                ],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            return
+        except Exception:
+            pass
+    webbrowser.open(f'https://www.youtube.com/{channel}')
 
 
 def play_notification_sound():
@@ -851,6 +947,7 @@ class RssTray:
         self._check_lock = threading.Lock()  # guards overlapping feed-check cycles only
         self._xbps_lock = threading.Lock()   # guards xbps db access (scans + installs), separately
         self._twitch_lock = threading.Lock()  # guards overlapping Twitch-check cycles
+        self._youtube_lock = threading.Lock()  # guards overlapping YouTube-check cycles
         self.popup = None
         self.listbox = None
         self.scroller = None
@@ -886,6 +983,8 @@ class RssTray:
         GLib.timeout_add(ALERT_PULSE_INTERVAL_MS, self._alert_pulse_tick)
         GLib.timeout_add_seconds(3, self.initial_twitch_check)
         GLib.timeout_add_seconds(TWITCH_CHECK_INTERVAL_SECONDS, self.periodic_twitch_check)
+        GLib.timeout_add_seconds(4, self.initial_youtube_check)
+        GLib.timeout_add_seconds(YOUTUBE_CHECK_INTERVAL_SECONDS, self.periodic_youtube_check)
         GLib.timeout_add_seconds(1, self._timer_tick)
 
     def maybe_auto_show_startup(self):
@@ -1055,6 +1154,48 @@ class RssTray:
         with self.lock:
             was_live = {e['channel'] for e in self.state.get('live_channels', [])}
             self.state['live_channels'] = [
+                {'channel': ch, 'title': live_now[ch]} for ch in sorted(live_now)
+            ]
+            save_state(self.state)
+        newly_live = set(live_now) - was_live
+        if newly_live:
+            self.on_new_items()
+        else:
+            self.update_icon()
+            if self.popup and self.popup.get_visible():
+                self.refresh_list()
+        return False
+
+    def initial_youtube_check(self):
+        if not is_online():
+            GLib.timeout_add_seconds(NETWORK_RETRY_SECONDS, self.initial_youtube_check)
+            return False
+        self.start_youtube_check()
+        return False
+
+    def periodic_youtube_check(self):
+        self.start_youtube_check()
+        return True
+
+    def start_youtube_check(self):
+        if not self._youtube_lock.acquire(blocking=False):
+            return  # a check is already in flight — skip this tick
+        threading.Thread(target=self._check_youtube_guarded, daemon=True).start()
+
+    def _check_youtube_guarded(self):
+        try:
+            channels = load_youtube_channels()
+            if channels:
+                live_now = check_youtube_live_channels(channels)
+                if live_now is not None:  # failed check: keep last known live state
+                    GLib.idle_add(self._on_youtube_checked, live_now)
+        finally:
+            self._youtube_lock.release()
+
+    def _on_youtube_checked(self, live_now):
+        with self.lock:
+            was_live = {e['channel'] for e in self.state.get('live_youtube_channels', [])}
+            self.state['live_youtube_channels'] = [
                 {'channel': ch, 'title': live_now[ch]} for ch in sorted(live_now)
             ]
             save_state(self.state)
@@ -1398,6 +1539,7 @@ class RssTray:
                 bool(self.state.get('unread'))
                 or bool(self.state.get('available_updates'))
                 or bool(self.state.get('live_channels'))
+                or bool(self.state.get('live_youtube_channels'))
             )
 
     def has_pkg_update(self):
@@ -1671,11 +1813,13 @@ class RssTray:
             unread = list(self.state.get('unread', []))
             available = list(self.state.get('available_updates', []))
             live_channels = list(self.state.get('live_channels', []))
+            live_youtube_channels = list(self.state.get('live_youtube_channels', []))
 
         feeds_map = {url: (custom_name or url) for url, custom_name, _interval in load_feeds()}
 
-        truly_empty = not unread and not available and not live_channels
-        only_live_remains = (not unread and not available) and bool(live_channels)
+        any_live = bool(live_channels or live_youtube_channels)
+        truly_empty = not unread and not available and not any_live
+        only_live_remains = (not unread and not available) and any_live
         popup_already_visible = bool(self.popup and self.popup.get_visible())
         should_hide = truly_empty or (only_live_remains and popup_already_visible)
 
@@ -1693,13 +1837,15 @@ class RssTray:
         else:
             is_first_section = True
 
-            if live_channels:
+            if any_live:
                 self.listbox.add(self.build_header_row(
                     '__live__', 'Live now', is_first=is_first_section, clickable=False
                 ))
                 is_first_section = False
                 for entry in live_channels:
                     self.listbox.add(self.build_twitch_row(entry))
+                for entry in live_youtube_channels:
+                    self.listbox.add(self.build_youtube_row(entry))
 
             if unread:
                 shown = unread[:MAX_LIST_ITEMS]
@@ -1805,6 +1951,56 @@ class RssTray:
             if len(title) > available:
                 cut_len = max(available - 1, 0)
                 shown_title = (title[:cut_len] + '…') if cut_len > 0 else '…'
+                trimmed = True
+            else:
+                shown_title = title
+            title_esc = GLib.markup_escape_text(shown_title)
+            markup = f'<span foreground="#000000"><b>{channel_esc}</b> - {title_esc}</span>'
+        else:
+            markup = f'<span foreground="#000000"><b>{channel_esc}</b></span>'
+
+        label = Gtk.Label()
+        label.set_markup(markup)
+        label.set_xalign(0)
+        label.set_ellipsize(Pango.EllipsizeMode.END)
+        label.set_hexpand(True)
+        box.pack_start(label, True, True, 0)
+
+        if trimmed:
+            row.set_tooltip_text(title)
+            label.set_tooltip_text(title)
+
+        row.add(box)
+        return row
+
+    def build_youtube_row(self, entry):
+        channel = entry['channel']
+        title = entry.get('title') or ''
+
+        row = Gtk.ListBoxRow()
+        row.set_selectable(False)
+        row.set_activatable(True)
+        row.youtube_channel = channel
+        row.youtube_quality = load_youtube_qualities().get(channel, 'best')
+
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        box.set_margin_start(3)
+        box.set_margin_end(3)
+        box.set_margin_top(0)
+        box.set_margin_bottom(0)
+
+        dot = Gtk.Label()
+        dot.set_markup('<span foreground="#FF0000"><b>\u25cf</b></span>')
+        box.pack_start(dot, False, False, 0)
+
+        channel_esc = GLib.markup_escape_text(channel)
+        trimmed = False
+        if title:
+            prefix_len = len(channel) + 3  # " - "
+            available = max(0, MAX_TITLE_LEN - prefix_len)
+            if len(title) > available:
+                cut_len = max(available - 1, 0)
+                shown_title = (title[:cut_len] + '\u2026') if cut_len > 0 else '\u2026'
                 trimmed = True
             else:
                 shown_title = title
@@ -2014,6 +2210,9 @@ class RssTray:
             return
         if hasattr(row, 'twitch_channel'):
             open_twitch_stream(row.twitch_channel, getattr(row, 'twitch_quality', 'best'))
+            return
+        if hasattr(row, 'youtube_channel'):
+            open_youtube_stream(row.youtube_channel, getattr(row, 'youtube_quality', 'best'))
             return
         if not hasattr(row, 'entry_id'):
             return
