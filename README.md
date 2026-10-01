@@ -1,6 +1,6 @@
 # rss-tray
 
-A minimal tray-based RSS/Atom reader for Linux, built with Python and GTK3 as a lightweight replacement for QuiteRSS. It also shows weather, Void package updates, Twitch live channels and a countdown timer in the same popup. Written for XFCE on Void Linux; it should work on any desktop with a `Gtk.StatusIcon`-compatible tray.
+A minimal tray-based RSS/Atom reader for Linux, built with Python and GTK3 as a lightweight replacement for QuiteRSS. It also shows weather, Void package updates, Twitch and YouTube live channels, and a countdown timer in the same popup. Written for XFCE on Void Linux; it should work on any desktop with a `Gtk.StatusIcon`-compatible tray.
 
 ## Features
 
@@ -15,6 +15,8 @@ A minimal tray-based RSS/Atom reader for Linux, built with Python and GTK3 as a 
 - **Weather** (Open-Meteo): today's temperature, high/low, wind and rain, with a 5-day forecast behind the `›` button.
 - **Void package updates:** a system-wide `xbps-install -Mn -u` dry run every hour. Click the "Updates available" header to install everything, one package at a time, with live status.
 - **Twitch:** live channels are polled every 30 minutes through Twitch's unofficial GQL API (no app registration). Click a row to play it with `streamlink --player mpv` at the configured quality (default `best`); if either isn't installed, or launching fails, it opens the channel in your browser instead.
+- **YouTube Live:** live channels are polled every 30 minutes via `streamlink --json <channel>/live` per channel -- no API key, and the same extraction path used for actual playback, so the check can't disagree with what clicking the row does. There's no keyless batch API for YouTube, so this is one streamlink call per channel (heavier than Twitch's single batched request). Shares the same "Live now" list, quality config, and browser fallback as Twitch.
+- **Player window titles:** mpv's title is set via streamlink's `--title` to `<Site> > <channel> > <category> > <stream title>` for both platforms.
 - **Timer:** a 0-2 h slider behind the "Timer" footer button. It keeps counting with the popup closed and plays the notification sound twice at zero.
 - **Severe-weather alerts** (optional, `alerts=true` in `[weather]`): polls MeteoAlarm's Exampleland feed every 30 minutes for the county matching the configured coordinates (reverse-geocoded via OpenStreetMap, re-checked weekly). An active alert is color-coded by severity (yellow/orange/red for moderate/severe/extreme) and pulses the matching weather value and the tray badge, faster for more severe alerts.
 
@@ -22,7 +24,7 @@ A minimal tray-based RSS/Atom reader for Linux, built with Python and GTK3 as a 
 
 - Python 3, PyGObject (GTK3), pycairo, `feedparser`
 - `xbps-install` / `xbps-query` for update detection (Void Linux only)
-- `streamlink` and `mpv` for Twitch streams
+- `streamlink` and `mpv` for Twitch and YouTube Live streams
 - A command-line audio player for the notification sound
 
 ```bash
@@ -54,7 +56,7 @@ Everything lives in `~/.config/rss-tray/`:
 
 | File | Purpose |
 |------|---------|
-| `config.conf` | feeds, mute phrases, Twitch channels |
+| `config.conf` | feeds, mute phrases, Twitch and YouTube channels |
 | `state.json` | read/unread state, timestamps, cached updates and live channels (safe to delete to reset) |
 | `notification.wav` | sound played on new items and when the timer ends |
 
@@ -74,6 +76,13 @@ sponsored
 # 720p60, 1080p60) -- defaults to "best" if omitted
 somechannel
 somechannel2|720p60
+
+[youtube]
+# one channel identifier per line -- whatever goes after youtube.com/, so
+# either @handle or channel/UCxxxxxxxxxxxxxxxxxxxxxx (case-sensitive,
+# unlike Twitch names). Optionally |quality, same as [twitch].
+@somehandle
+channel/UCxxxxxxxxxxxxxxxxxxxxxx|720p60
 
 [weather]
 # lat|lon for the weather bar (Open-Meteo, no key needed); optional —
@@ -108,7 +117,7 @@ The `zz-` prefix matters: sudoers uses the last matching rule, so this file must
 
 - The popup is a borderless `Gtk.Window` that is destroyed and rebuilt on every open. This avoids stuck-size bugs; do not make it persistent or call `resize()` on it.
 - Package updates are system-wide rather than feed-based, because GitHub's atom feed is a sliding window and version bumps get missed.
-- Threading: `lock` guards state, `_check_lock` RSS cycles, `_xbps_lock` xbps scans and installs, `_twitch_lock` Twitch checks. All GTK mutations from threads go through `GLib.idle_add`.
+- Threading: `lock` guards state, `_check_lock` RSS cycles, `_xbps_lock` xbps scans and installs, `_twitch_lock`/`_youtube_lock` their respective live-channel checks. All GTK mutations from threads go through `GLib.idle_add`.
 - A failed xbps scan or Twitch request keeps the previous state; failed scans back off exponentially up to the normal hourly interval.
 - The install timeout kills the whole process group (`sudo` and the `xbps-install` it forked).
 
@@ -116,6 +125,7 @@ The `zz-` prefix matters: sudoers uses the last matching rule, so this file must
 
 - `Gtk.StatusIcon` is deprecated upstream but still works on XFCE and most X11 panels.
 - Twitch's GQL API is unofficial and undocumented; it can break without notice.
+- YouTube Live detection depends on streamlink's own YouTube plugin staying current with YouTube's changes; a channel's liveness check takes a few seconds (full streamlink extraction), unlike Twitch's near-instant batched check.
 - Update detection and installs are Void-specific.
 
 ## Tests
