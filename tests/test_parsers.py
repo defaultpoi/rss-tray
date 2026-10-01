@@ -501,7 +501,11 @@ class TestOpenTwitchStream(unittest.TestCase):
             rt.open_twitch_stream('somechan', '720p60')
         popen.assert_called_once()
         args = popen.call_args[0][0]
-        self.assertEqual(args, ['streamlink', '--player', 'mpv', 'twitch.tv/somechan', '720p60'])
+        self.assertEqual(args, [
+            'streamlink', '--player', 'mpv', '--title',
+            'Twitch > {author} > {category} > {title}',
+            'twitch.tv/somechan', '720p60',
+        ])
         wb_open.assert_not_called()
 
     def test_defaults_to_best_quality(self):
@@ -557,3 +561,104 @@ class TestTimerSettings(TmpConfigCase):
         s = rt.load_timer_settings()
         self.assertEqual(s['max_seconds'], 30 * 60)
         self.assertEqual(s['step_seconds'], rt.DEFAULT_TIMER_STEP_SECONDS)
+
+
+class TestYoutubeChannelsAndQualities(TmpConfigCase):
+    def test_channels_case_preserved_dedup_case_insensitive(self):
+        self.conf('[youtube]\n@SomeHandle\nchannel/UCxxxx|720p60\n@somehandle\n')
+        self.assertEqual(rt.load_youtube_channels(), ['@SomeHandle', 'channel/UCxxxx'])
+
+    def test_qualities_keyed_case_sensitive(self):
+        self.conf('[youtube]\n@SomeHandle|1080p60\nchannel/UCxxxx|720p60\n')
+        self.assertEqual(rt.load_youtube_qualities(),
+                          {'@SomeHandle': '1080p60', 'channel/UCxxxx': '720p60'})
+
+    def test_channel_without_quality_absent_from_qualities(self):
+        self.conf('[youtube]\n@foo\n')
+        self.assertEqual(rt.load_youtube_qualities(), {})
+
+
+class TestCheckYoutubeLiveChannels(unittest.TestCase):
+    def _fake_run(self, live_substring='live_channel', offline_substring='offline_channel'):
+        def run(cmd, capture_output, text, timeout):
+            url = cmd[-1]
+            result = mock.MagicMock()
+            if live_substring in url:
+                result.stdout = json.dumps({'metadata': {'id': 'x', 'author': 'A',
+                                                           'category': 'Gaming', 'title': 'Live now!'}})
+            elif offline_substring in url:
+                result.stdout = json.dumps({'error': 'No playable streams found'})
+            else:
+                raise OSError('boom')
+            return result
+        return run
+
+    def test_empty_channels_no_subprocess(self):
+        with mock.patch.object(rt.subprocess, 'run') as run:
+            self.assertEqual(rt.check_youtube_live_channels([]), {})
+            run.assert_not_called()
+
+    def test_live_and_offline_distinguished(self):
+        with mock.patch.object(rt.subprocess, 'run', side_effect=self._fake_run()):
+            live = rt.check_youtube_live_channels(['live_channel', 'offline_channel'])
+        self.assertEqual(live, {'live_channel': 'Live now!'})
+
+    def test_total_failure_returns_none(self):
+        with mock.patch.object(rt.subprocess, 'run', side_effect=OSError('no streamlink')):
+            self.assertIsNone(rt.check_youtube_live_channels(['a', 'b']))
+
+    def test_partial_failure_keeps_successful_results(self):
+        def run(cmd, capture_output, text, timeout):
+            if 'bad' in cmd[-1]:
+                raise OSError('network blip')
+            result = mock.MagicMock()
+            result.stdout = json.dumps({'error': 'No playable streams found'})
+            return result
+        with mock.patch.object(rt.subprocess, 'run', side_effect=run):
+            result = rt.check_youtube_live_channels(['bad', 'good'])
+        self.assertEqual(result, {})  # good determined not-live; bad simply absent, not a crash
+
+    def test_unparseable_json_treated_as_this_channel_failed(self):
+        def run(cmd, capture_output, text, timeout):
+            result = mock.MagicMock()
+            result.stdout = 'not json'
+            return result
+        with mock.patch.object(rt.subprocess, 'run', side_effect=run):
+            self.assertIsNone(rt.check_youtube_live_channels(['a']))
+
+
+class TestOpenYoutubeStream(unittest.TestCase):
+    def test_uses_streamlink_when_both_installed(self):
+        with mock.patch.object(rt.shutil, 'which', side_effect=lambda x: '/usr/bin/' + x), \
+                mock.patch.object(rt.subprocess, 'Popen') as popen, \
+                mock.patch.object(rt.webbrowser, 'open') as wb_open:
+            rt.open_youtube_stream('@somehandle', '720p60')
+        args = popen.call_args[0][0]
+        self.assertEqual(args, [
+            'streamlink', '--player', 'mpv', '--title',
+            'YouTube > {author} > {category} > {title}',
+            'https://www.youtube.com/@somehandle/live', '720p60',
+        ])
+        wb_open.assert_not_called()
+
+    def test_defaults_to_best_quality(self):
+        with mock.patch.object(rt.shutil, 'which', side_effect=lambda x: '/usr/bin/' + x), \
+                mock.patch.object(rt.subprocess, 'Popen') as popen, \
+                mock.patch.object(rt.webbrowser, 'open'):
+            rt.open_youtube_stream('@somehandle')
+        self.assertEqual(popen.call_args[0][0][-1], 'best')
+
+    def test_falls_back_to_browser_channel_page_when_streamlink_missing(self):
+        with mock.patch.object(rt.shutil, 'which', return_value=None), \
+                mock.patch.object(rt.subprocess, 'Popen') as popen, \
+                mock.patch.object(rt.webbrowser, 'open') as wb_open:
+            rt.open_youtube_stream('@somehandle')
+        popen.assert_not_called()
+        wb_open.assert_called_once_with('https://www.youtube.com/@somehandle')
+
+    def test_falls_back_to_browser_when_launch_raises(self):
+        with mock.patch.object(rt.shutil, 'which', side_effect=lambda x: '/usr/bin/' + x), \
+                mock.patch.object(rt.subprocess, 'Popen', side_effect=OSError), \
+                mock.patch.object(rt.webbrowser, 'open') as wb_open:
+            rt.open_youtube_stream('@somehandle')
+        wb_open.assert_called_once_with('https://www.youtube.com/@somehandle')
