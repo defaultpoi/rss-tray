@@ -1651,6 +1651,9 @@ class RssTray:
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         row.set_hexpand(True)
         row.set_valign(Gtk.Align.CENTER)
+        # Align the values on their text baselines (not by box edges): the raised
+        # glyph makes the first label taller, which otherwise shifts its text.
+        row.set_baseline_position(Gtk.BaselinePosition.CENTER)
         if not segments:
             segments, separate = [empty_markup], False
         else:
@@ -1659,13 +1662,13 @@ class RssTray:
             if separate and n > 0:
                 bullet = Gtk.Label()
                 bullet.set_markup(WEATHER_BULLET_MARKUP)
-                bullet.set_valign(Gtk.Align.CENTER)
+                bullet.set_valign(Gtk.Align.BASELINE)
                 row.pack_start(bullet, False, False, 0)
             lbl = Gtk.Label()
             lbl.set_markup(seg)
             lbl.set_hexpand(True)
             lbl.set_xalign(0.5)
-            lbl.set_valign(Gtk.Align.CENTER)
+            lbl.set_valign(Gtk.Align.BASELINE)
             row.pack_start(lbl, True, True, 0)
         return row
 
