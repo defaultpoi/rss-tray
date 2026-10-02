@@ -1189,6 +1189,15 @@ def glyph_rise_units(glyph, widget=None):
     return int(em * 1.2 * size)
 
 
+def rise_spacer_markup(rise):
+    """Zero-width run with the same font and rise as a raised glyph. Appended
+    to the other values so every label gets the exact same line height (and so
+    the same text baseline) as the one holding the raised glyph."""
+    if not rise:
+        return ''
+    return f'<span font_family="DejaVu Sans" rise="{rise}">\u200b</span>'
+
+
 def mono_glyph_markup(glyph, color=WEATHER_GLYPH_COLOR, rise=0):
     """Weather glyph forced to the monochrome text form (U+FE0E variation
     selector + a text font), so it's drawn in `color` and stays readable on
@@ -1609,6 +1618,8 @@ class RssTray:
 
         segments = []
         glyph = weather_code_glyph(d.get('weather_code'))
+        rise = glyph_rise_units(glyph, getattr(self, 'weather_box', None)) if glyph else 0
+        pad = rise_spacer_markup(rise) if d.get('temp') is not None else ''
         if d.get('temp') is not None:
             temp_text = GLib.markup_escape_text(f"{d['temp']:.0f}°C")
             if glyph:
@@ -1618,30 +1629,29 @@ class RssTray:
                     glyph_color = bright if self._pulse_on_for(glyph_color_name) else dim
                 else:
                     glyph_color = WEATHER_GLYPH_COLOR
-                rise = glyph_rise_units(glyph, getattr(self, 'weather_box', None))
                 temp_text = mono_glyph_markup(glyph, glyph_color, rise) + ' ' + temp_text
             segments.append(f'<span size="large"><b>{temp_text}</b></span>')
         if d.get('today_max_temp') is not None and d.get('today_min_temp') is not None:
             hi_lo = colorize(GLib.markup_escape_text(
                 f"{d['today_max_temp']:.0f}/{d['today_min_temp']:.0f}°C"
             ), 'hilo')
-            segments.append(f'<span size="large"><b>{hi_lo}</b></span>')
+            segments.append(f'<span size="large"><b>{hi_lo}{pad}</b></span>')
         if d.get('wind') is not None and d.get('today_max_wind') is not None:
             wind_text = colorize(GLib.markup_escape_text(
                 f"{d['wind']:.0f}/{d['today_max_wind']:.0f} km/h"
             ), 'wind')
-            segments.append(f'<span size="large"><b>{wind_text}</b></span>')
+            segments.append(f'<span size="large"><b>{wind_text}{pad}</b></span>')
         elif d.get('wind') is not None:
             wind_text = colorize(GLib.markup_escape_text(f"{d['wind']:.0f} km/h"), 'wind')
-            segments.append(f'<span size="large"><b>{wind_text}</b></span>')
+            segments.append(f'<span size="large"><b>{wind_text}{pad}</b></span>')
         if d.get('today_rain_prob') is not None and d.get('today_precip_sum') is not None:
             rain_text = colorize(GLib.markup_escape_text(
                 f"{d['today_rain_prob']:.0f}%/{d['today_precip_sum']:.1f}mm"
             ), 'rain')
-            segments.append(f'<span size="large"><b>{rain_text}</b></span>')
+            segments.append(f'<span size="large"><b>{rain_text}{pad}</b></span>')
         elif d.get('today_rain_prob') is not None:
             rain_text = colorize(GLib.markup_escape_text(f"{d['today_rain_prob']:.0f}%"), 'rain')
-            segments.append(f'<span size="large"><b>{rain_text}</b></span>')
+            segments.append(f'<span size="large"><b>{rain_text}{pad}</b></span>')
         return segments
 
     def _build_weather_row(self, segments, empty_markup):
