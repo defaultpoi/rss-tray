@@ -1584,7 +1584,7 @@ class RssTray:
                     glyph_color = bright if self._pulse_on_for(glyph_color_name) else dim
                 else:
                     glyph_color = '#2b2b2b'
-                temp_text = f'<span foreground="{glyph_color}" rise="2000">{glyph}</span>' + temp_text
+                temp_text = f'<span foreground="{glyph_color}">{glyph}</span> ' + temp_text
             segments.append(f'<span size="large"><b>{temp_text}</b></span>')
         if d.get('today_max_temp') is not None and d.get('today_min_temp') is not None:
             hi_lo = colorize(GLib.markup_escape_text(
@@ -1643,6 +1643,7 @@ class RssTray:
             back_btn = Gtk.Button(label='‹')
             back_btn.set_tooltip_text('Back to today')
             back_btn.connect('clicked', self.on_weather_arrow_clicked, 'today')
+            back_btn.set_valign(Gtk.Align.CENTER)
             self.weather_box.pack_start(back_btn, False, False, 0)
 
             empty = ('<span size="large">Weather unavailable</span>' if not self.weather_data
@@ -1658,6 +1659,7 @@ class RssTray:
             fwd_btn = Gtk.Button(label='›')
             fwd_btn.set_tooltip_text('Show 5-day forecast')
             fwd_btn.connect('clicked', self.on_weather_arrow_clicked, 'forecast')
+            fwd_btn.set_valign(Gtk.Align.CENTER)
             self.weather_box.pack_start(fwd_btn, False, False, 0)
 
         self.weather_box.show_all()
