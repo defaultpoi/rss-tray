@@ -349,6 +349,31 @@ class TestTodayGlyph(unittest.TestCase):
         self.assertNotIn('\ufe0f', seg)
 
 
+class TestGlyphRise(unittest.TestCase):
+    def test_cloud_is_lifted_others_are_not(self):
+        self.assertGreater(rt.glyph_rise_units('\u2601'), 0)
+        for g in ('\u2600', '\u2744', '\u26a1', '\u2614'):
+            self.assertEqual(rt.glyph_rise_units(g), 0)
+
+    def test_rise_scales_with_widget_font_size(self):
+        widget = mock.MagicMock()
+        widget.get_pango_context.return_value.get_font_description.return_value.get_size.return_value = 20 * 1024
+        self.assertEqual(rt.glyph_rise_units('\u2601', widget), 2 * rt.glyph_rise_units('\u2601'))
+
+    def test_markup_includes_rise_only_when_nonzero(self):
+        self.assertIn('rise="500"', rt.mono_glyph_markup('\u2601', rise=500))
+        self.assertNotIn('rise', rt.mono_glyph_markup('\u2600'))
+
+    def test_today_cloud_segment_is_raised(self):
+        class Stub(TestTodayGlyph.Stub):
+            def __init__(self):
+                super().__init__()
+                self.weather_data = {'temp': 12.0, 'weather_code': 3}
+        with mock.patch.object(rt.GLib, 'markup_escape_text', side_effect=lambda x: x):
+            seg = Stub().build_today_weather_segments()[0]
+        self.assertIn('rise="', seg)
+
+
 class TestMonoGlyph(unittest.TestCase):
     def test_markup(self):
         m = rt.mono_glyph_markup('\u2614')
