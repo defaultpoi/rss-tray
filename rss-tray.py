@@ -1146,8 +1146,8 @@ def fetch_weather():
 
 
 def weather_code_glyph(code):
-    """Maps a WMO weather_code to a Unicode glyph (the caller picks text or
-    emoji presentation).
+    """Maps a WMO weather_code to a plain Unicode glyph (rendered via
+    mono_glyph_markup, never as a color emoji).
     Returns None for codes without a good simple symbol (e.g. fog), so the
     icon is just omitted rather than showing something misleading."""
     if code is None:
@@ -1163,6 +1163,16 @@ def weather_code_glyph(code):
     if code in (95, 96, 99):
         return '\u26a1'  # thunderstorm
     return None  # e.g. fog (45, 48) — no reliable simple glyph
+
+
+WEATHER_GLYPH_COLOR = '#2b2b2b'
+
+
+def mono_glyph_markup(glyph, color=WEATHER_GLYPH_COLOR):
+    """Weather glyph forced to the monochrome text form (U+FE0E variation
+    selector + a text font), so it's drawn in `color` and stays readable on
+    the light weather bar instead of becoming a pale color emoji."""
+    return f'<span foreground="{color}" font_family="DejaVu Sans">{glyph}\ufe0e</span>'
 
 
 def format_timer_duration(total_seconds):
@@ -1548,7 +1558,7 @@ class RssTray:
         for day in d.get('forecast_days', []):
             segment = ''
             if day.get('rain_prob') is not None and day['rain_prob'] > 0:
-                segment += '<span foreground="#2b2b2b">☔</span> '
+                segment += mono_glyph_markup('\u2614') + ' '
             if day.get('max_temp') is not None and day.get('min_temp') is not None:
                 segment += GLib.markup_escape_text(
                     f"{day['max_temp']:.0f}/{day['min_temp']:.0f}°C"
@@ -1581,15 +1591,11 @@ class RssTray:
             if glyph:
                 glyph_color_name = seg_colors.get('glyph')
                 if glyph_color_name:
-                    # an active alert recolors the glyph, which only works on
-                    # the monochrome (text-presentation) form
                     bright, dim = ALERT_TEXT_COLORS[glyph_color_name]
                     glyph_color = bright if self._pulse_on_for(glyph_color_name) else dim
-                    temp_text = f'<span foreground="{glyph_color}">{glyph}</span> ' + temp_text
                 else:
-                    # U+FE0F = emoji presentation, so the glyph renders as
-                    # a color emoji like the forecast's umbrella does
-                    temp_text = f'{glyph}\ufe0f ' + temp_text
+                    glyph_color = WEATHER_GLYPH_COLOR
+                temp_text = mono_glyph_markup(glyph, glyph_color) + ' ' + temp_text
             segments.append(f'<span size="large"><b>{temp_text}</b></span>')
         if d.get('today_max_temp') is not None and d.get('today_min_temp') is not None:
             hi_lo = colorize(GLib.markup_escape_text(
