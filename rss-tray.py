@@ -75,6 +75,7 @@ METEOALARM_COUNTRY_CODES = frozenset({
 })
 NOMINATIM_REVERSE_URL = "https://nominatim.openstreetmap.org/reverse"
 ALERT_PULSE_INTERVAL_MS = 600
+WEATHER_BULLET_MARKUP = '<span size="large"><b>·</b></span>'  # between weather-bar values
 TWITCH_GQL_URL = "https://gql.twitch.tv/gql"
 TWITCH_GQL_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"  # Twitch's own public web-client ID —
                                                           # used by twitch.tv itself for logged-out
@@ -1183,7 +1184,6 @@ class RssTray:
         self.listbox = None
         self.scroller = None
         self.weather_data = None
-        self.weather_label = None
         self.weather_box = None
         self.weather_view = 'today'
         self.active_alerts = []
@@ -1536,17 +1536,15 @@ class RssTray:
                 self.rebuild_weather_bar()
         return True
 
-    def format_weather_markup(self):
-        """Forecast-view markup only; the 'today' view is built as separate
-        evenly-spaced widgets in rebuild_weather_bar instead of one string."""
+    def build_forecast_weather_segments(self):
+        """Returns one markup segment per forecast day (rain glyph + high/low),
+        or [] if there's no forecast. Rendered by rebuild_weather_bar exactly
+        like the 'today' segments: spread across the bar, bullet-separated."""
         d = self.weather_data
         if not d:
-            return '<span size="medium">Weather unavailable</span>'
-        days = d.get('forecast_days', [])
-        if not days:
-            return '<span size="medium">Forecast unavailable</span>'
-        parts = []
-        for day in days:
+            return []
+        segments = []
+        for day in d.get('forecast_days', []):
             segment = ''
             if day.get('rain_prob') is not None and day['rain_prob'] > 0:
                 segment += '<span foreground="#2b2b2b">☔</span> '
@@ -1555,14 +1553,13 @@ class RssTray:
                     f"{day['max_temp']:.0f}/{day['min_temp']:.0f}°C"
                 )
             if segment:
-                parts.append(segment)
-        text = " · ".join(parts) if parts else "Forecast unavailable"
-        return f'<span size="medium"><b>{text}</b></span>'
+                segments.append(f'<span size="medium"><b>{segment}</b></span>')
+        return segments
 
     def build_today_weather_segments(self):
         """Returns a list of independently-markup'd segments (temp, high/low,
         wind, rain) for the 'today' view — rendered as separate widgets so
-        they can be evenly spaced across the full row."""
+        they can be evenly spaced across the full row, bullet-separated."""
         d = self.weather_data
         if not d:
             return []
@@ -1612,6 +1609,30 @@ class RssTray:
             segments.append(f'<span size="large"><b>{rain_text}</b></span>')
         return segments
 
+    def _build_weather_row(self, segments, empty_markup):
+        """Spreads `segments` evenly across the bar's full width with a bullet
+        between each pair; shared by the 'today' and 'forecast' views so
+        they look identical."""
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        row.set_hexpand(True)
+        if not segments:
+            segments, separate = [empty_markup], False
+        else:
+            separate = True
+        for n, seg in enumerate(segments):
+            if separate and n > 0:
+                bullet = Gtk.Label()
+                bullet.set_markup(WEATHER_BULLET_MARKUP)
+                bullet.set_valign(Gtk.Align.END)
+                row.pack_start(bullet, False, False, 0)
+            lbl = Gtk.Label()
+            lbl.set_markup(seg)
+            lbl.set_hexpand(True)
+            lbl.set_xalign(0.5)
+            lbl.set_valign(Gtk.Align.END)
+            row.pack_start(lbl, True, True, 0)
+        return row
+
     def rebuild_weather_bar(self):
         if self.weather_box is None:
             return
@@ -1624,36 +1645,15 @@ class RssTray:
             back_btn.connect('clicked', self.on_weather_arrow_clicked, 'today')
             self.weather_box.pack_start(back_btn, False, False, 0)
 
-            label = Gtk.Label()
-            label.set_xalign(0.5)
-            label.set_hexpand(True)
-            label.set_line_wrap(True)
-            label.set_max_width_chars(48)
-            label.set_justify(Gtk.Justification.CENTER)
-            label.set_markup(self.format_weather_markup())
-            self.weather_label = label
-            self.weather_box.pack_start(label, True, True, 0)
+            empty = ('<span size="medium">Weather unavailable</span>' if not self.weather_data
+                     else '<span size="medium">Forecast unavailable</span>')
+            row = self._build_weather_row(self.build_forecast_weather_segments(), empty)
+            self.weather_box.pack_start(row, True, True, 0)
         else:
-            self.weather_label = None
-            segments = self.build_today_weather_segments()
-            content_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
-            content_box.set_hexpand(True)
-            if not segments:
-                lbl = Gtk.Label()
-                lbl.set_markup('<span size="large">Weather unavailable</span>')
-                lbl.set_hexpand(True)
-                lbl.set_xalign(0.5)
-                lbl.set_valign(Gtk.Align.END)
-                content_box.pack_start(lbl, True, True, 0)
-            else:
-                for seg in segments:
-                    lbl = Gtk.Label()
-                    lbl.set_markup(seg)
-                    lbl.set_hexpand(True)
-                    lbl.set_xalign(0.5)
-                    lbl.set_valign(Gtk.Align.END)
-                    content_box.pack_start(lbl, True, True, 0)
-            self.weather_box.pack_start(content_box, True, True, 0)
+            row = self._build_weather_row(
+                self.build_today_weather_segments(),
+                '<span size="large">Weather unavailable</span>')
+            self.weather_box.pack_start(row, True, True, 0)
 
             fwd_btn = Gtk.Button(label='›')
             fwd_btn.set_tooltip_text('Show 5-day forecast')
