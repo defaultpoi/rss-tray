@@ -319,6 +319,34 @@ class TestForecastSegments(unittest.TestCase):
         self.assertEqual(len(segs), 1)
 
 
+class TestTodayGlyph(unittest.TestCase):
+    class Stub:
+        build_today_weather_segments = rt.RssTray.build_today_weather_segments
+        _pulse_on_for = rt.RssTray._pulse_on_for
+        _alert_pulse_counter = 0
+
+        def __init__(self, alerts=None):
+            self.weather_data = {'temp': 12.0, 'weather_code': 71}  # snow
+            self._alerts = alerts or {}
+
+        def _segment_alert_colors(self):
+            return self._alerts
+
+    def _first(self, stub):
+        with mock.patch.object(rt.GLib, 'markup_escape_text', side_effect=lambda x: x):
+            return stub.build_today_weather_segments()[0]
+
+    def test_glyph_uses_emoji_presentation_without_alert(self):
+        seg = self._first(self.Stub())
+        self.assertIn('\u2744\ufe0f ', seg)
+        self.assertNotIn('foreground', seg)
+
+    def test_alert_on_glyph_uses_colored_text_presentation(self):
+        seg = self._first(self.Stub({'glyph': 'red'}))
+        self.assertIn('foreground', seg)
+        self.assertNotIn('\ufe0f', seg)
+
+
 class TestWeatherSettings(TmpConfigCase):
     def test_defaults(self):
         s = rt.load_weather_settings()
