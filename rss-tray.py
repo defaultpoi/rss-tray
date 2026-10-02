@@ -64,6 +64,15 @@ def build_weather_api_url(lat, lon):
 WEATHER_REFRESH_SECONDS = 1800  # 30 minutes
 ALERTS_REGION_REFRESH_SECONDS = 7 * 24 * 3600  # re-resolve country/region from lat/lon weekly
 METEOALARM_FEED_URL_TEMPLATE = "https://feeds.meteoalarm.org/feeds/meteoalarm-legacy-atom-{country}"
+# ISO 3166-1 alpha-2 codes of the countries MeteoAlarm publishes feeds for.
+# Anywhere else (reverse-geocoded country_code not in here) alerts are
+# switched off in config.conf, since there's no feed to poll.
+METEOALARM_COUNTRY_CODES = frozenset({
+    'AT', 'BA', 'BE', 'BG', 'CH', 'CY', 'CZ', 'DE', 'DK', 'EE', 'ES', 'FI',
+    'FR', 'GB', 'GR', 'HR', 'HU', 'IE', 'IL', 'IS', 'IT', 'LT', 'LU', 'LV',
+    'MD', 'ME', 'MK', 'MT', 'NL', 'NO', 'PL', 'PT', 'RO', 'RS', 'SE', 'SI',
+    'SK', 'UA',
+})
 NOMINATIM_REVERSE_URL = "https://nominatim.openstreetmap.org/reverse"
 ALERT_PULSE_INTERVAL_MS = 600
 TWITCH_GQL_URL = "https://gql.twitch.tv/gql"
@@ -336,13 +345,13 @@ def load_weather_coords():
     return settings['lat'], settings['lon']
 
 
-def _update_weather_region_cache(region, timestamp, country=None):
-    """Rewrites config.conf in place, setting country=/region=/region_updated= inside
-    the [weather] section (creating the section at the end of the file if
-    it's somehow missing) while leaving every other line -- including
-    comments and other sections -- untouched. Best-effort: any error here
-    just means the location gets re-resolved next poll instead of using the
-    weekly cache, so failures are swallowed."""
+def _edit_weather_section(transform):
+    """Rewrites config.conf in place: `transform` receives the lines of the
+    [weather] section (without the header; the section is created at the end
+    of the file if it's somehow missing) and returns the replacement lines.
+    Every other line -- including comments and other sections -- is left
+    untouched. Best-effort: failures are swallowed (callers just redo the work
+    next poll)."""
     try:
         with open(CONFIG_FILE) as f:
             lines = f.readlines()
@@ -362,14 +371,7 @@ def _update_weather_region_cache(region, timestamp, country=None):
         lines.append('[weather]\n')
         start = len(lines) - 1
     end = next((i for i in range(start + 1, len(lines)) if is_section(lines[i])), len(lines))
-
-    kept = [
-        l for l in lines[start + 1:end]
-        if not l.strip().lower().startswith(('country=', 'region=', 'region_updated='))
-    ]
-    new_section = kept + ([f'country={country}\n'] if country else []) + [
-        f'region={region}\n', f'region_updated={int(timestamp)}\n']
-    lines[start + 1:end] = new_section
+    lines[start + 1:end] = transform(lines[start + 1:end])
 
     try:
         tmp = CONFIG_FILE + '.tmp'
@@ -380,10 +382,36 @@ def _update_weather_region_cache(region, timestamp, country=None):
         pass
 
 
+_RESOLVED_LOCATION_KEYS = ('country=', 'region=', 'region_updated=')
+
+
+def _update_weather_region_cache(region, timestamp, country=None):
+    """Sets country=/region=/region_updated= in [weather] (the weekly
+    reverse-geocode cache)."""
+    def transform(section):
+        kept = [l for l in section if not l.strip().lower().startswith(_RESOLVED_LOCATION_KEYS)]
+        return kept + ([f'country={country}\n'] if country else []) + [
+            f'region={region}\n', f'region_updated={int(timestamp)}\n']
+    _edit_weather_section(transform)
+
+
+def _disable_weather_alerts():
+    """Writes alerts=false into [weather] (and drops the cached location),
+    used when the coordinates resolve to a country MeteoAlarm doesn't cover."""
+    def transform(section):
+        kept = [l for l in section
+                if not l.strip().lower().startswith(_RESOLVED_LOCATION_KEYS)
+                and not l.strip().lower().startswith('alerts=')]
+        return kept + ['alerts=false\n']
+    _edit_weather_section(transform)
+
+
 def reverse_geocode_region(lat, lon):
     """Best-effort reverse geocode via Nominatim (English names); returns
-    (country, region) -- region being the county, falling back to the state --
-    or None on any failure or if either part is missing. Rate-limited by
+    (country, region, country_code) -- region being the county, falling back
+    to the state, and None if neither exists; country_code is the lowercase
+    ISO code Nominatim reports. Returns None on any failure or if no country
+    was found. Rate-limited by
     design to once a week (see ALERTS_REGION_REFRESH_SECONDS) by the caller."""
     url = (
         f"{NOMINATIM_REVERSE_URL}?lat={lat}&lon={lon}"
@@ -395,8 +423,10 @@ def reverse_geocode_region(lat, lon):
             data = json.loads(resp.read().decode('utf-8'))
         address = data.get('address') or {}
         country = address.get('country')
+        if not country:
+            return None
         region = address.get('county') or address.get('state')
-        return (country, region) if country and region else None
+        return country, region, (address.get('country_code') or '').upper() or None
     except Exception:
         return None
 
@@ -1438,8 +1468,15 @@ class RssTray:
         if not (country and region) or (now - settings['region_updated']) >= ALERTS_REGION_REFRESH_SECONDS:
             resolved = reverse_geocode_region(settings['lat'], settings['lon'])
             if resolved:
-                country, region = resolved
-                _update_weather_region_cache(region, now, country=country)
+                new_country, new_region, code = resolved
+                if code and code not in METEOALARM_COUNTRY_CODES:
+                    _disable_weather_alerts()  # no MeteoAlarm feed for this country
+                    return []
+                if new_country and new_region:
+                    country, region = new_country, new_region
+                    _update_weather_region_cache(region, now, country=country)
+                elif not (country and region):
+                    return None  # country known but no region, nothing cached
             elif not (country and region):
                 return None  # never resolved, and this attempt also failed
             # else: geocoding failed but a stale region is cached -- keep

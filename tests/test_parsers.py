@@ -361,22 +361,84 @@ class TestReverseGeocodeRegion(unittest.TestCase):
         with mock.patch.object(rt.urllib.request, 'urlopen', return_value=self._resp(payload)):
             return rt.reverse_geocode_region(10.0, 20.0)
 
-    def test_county(self):
-        self.assertEqual(self._geocode({'address': {'country': 'Exampleland', 'county': 'Northshire'}}),
-                         ('Exampleland', 'Northshire'))
+    def test_county_and_country_code(self):
+        self.assertEqual(
+            self._geocode({'address': {'country': 'Exampleland', 'county': 'Northshire', 'country_code': 'xx'}}),
+            ('Exampleland', 'Northshire', 'XX'))
 
     def test_state_used_when_no_county(self):
         self.assertEqual(self._geocode({'address': {'country': 'Exampleland', 'state': 'Westland'}}),
-                         ('Exampleland', 'Westland'))
+                         ('Exampleland', 'Westland', None))
 
-    def test_missing_region_or_country_is_none(self):
-        self.assertIsNone(self._geocode({'address': {'country': 'Exampleland'}}))
+    def test_missing_region_still_returns_country(self):
+        self.assertEqual(self._geocode({'address': {'country': 'Exampleland', 'country_code': 'xx'}}),
+                         ('Exampleland', None, 'XX'))
+
+    def test_missing_country_is_none(self):
         self.assertIsNone(self._geocode({'address': {'county': 'Northshire'}}))
         self.assertIsNone(self._geocode({'address': {}}))
 
     def test_request_error_is_none(self):
         with mock.patch.object(rt.urllib.request, 'urlopen', side_effect=OSError):
             self.assertIsNone(rt.reverse_geocode_region(10.0, 20.0))
+
+
+class TestDisableWeatherAlerts(TmpConfigCase):
+    def test_flips_alerts_and_drops_cache_keeping_rest(self):
+        self.conf('[feeds]\nhttps://a\n\n[weather]\n10.0|20.0\nalerts=true\n# note\n'
+                  'country=X\nregion=Y\nregion_updated=5\n\n[twitch]\nsomechannel\n')
+        rt._disable_weather_alerts()
+        s = rt.load_weather_settings()
+        self.assertFalse(s['alerts_enabled'])
+        self.assertEqual((s['lat'], s['lon']), (10.0, 20.0))
+        self.assertIsNone(s['country'])
+        self.assertIsNone(s['region'])
+        self.assertEqual(rt.load_twitch_channels(), ['somechannel'])
+        with open(rt.CONFIG_FILE) as f:
+            self.assertIn('# note', f.read())
+
+    def test_adds_alerts_false_when_line_missing(self):
+        self.conf('[weather]\n10.0|20.0\n')
+        rt._disable_weather_alerts()
+        self.assertFalse(rt.load_weather_settings()['alerts_enabled'])
+        with open(rt.CONFIG_FILE) as f:
+            self.assertIn('alerts=false', f.read())
+
+
+class TestFetchAlertsBg(TmpConfigCase):
+    class Stub:
+        _fetch_alerts_bg = rt.RssTray._fetch_alerts_bg
+
+    def test_non_meteoalarm_country_disables_alerts_in_config(self):
+        self.conf('[weather]\n10.0|20.0\nalerts=true\n')
+        with mock.patch.object(rt, 'reverse_geocode_region', return_value=('Elsewhere', 'Somestate', 'ZZ')), \
+                mock.patch.object(rt, 'fetch_meteoalarm_alerts') as fetch:
+            self.assertEqual(self.Stub()._fetch_alerts_bg(), [])
+        fetch.assert_not_called()
+        self.assertFalse(rt.load_weather_settings()['alerts_enabled'])
+
+    def test_covered_country_caches_location_and_fetches(self):
+        self.conf('[weather]\n10.0|20.0\nalerts=true\n')
+        with mock.patch.object(rt, 'reverse_geocode_region', return_value=('Exampleland', 'Northshire', 'RO')), \
+                mock.patch.object(rt, 'fetch_meteoalarm_alerts', return_value=[]) as fetch:
+            self.assertEqual(self.Stub()._fetch_alerts_bg(), [])
+        fetch.assert_called_once_with('Northshire', 'Exampleland')
+        s = rt.load_weather_settings()
+        self.assertTrue(s['alerts_enabled'])
+        self.assertEqual((s['country'], s['region']), ('Exampleland', 'Northshire'))
+
+    def test_geocode_failure_with_nothing_cached_is_none(self):
+        self.conf('[weather]\n10.0|20.0\nalerts=true\n')
+        with mock.patch.object(rt, 'reverse_geocode_region', return_value=None):
+            self.assertIsNone(self.Stub()._fetch_alerts_bg())
+        self.assertTrue(rt.load_weather_settings()['alerts_enabled'])
+
+    def test_unknown_country_code_does_not_disable(self):
+        self.conf('[weather]\n10.0|20.0\nalerts=true\n')
+        with mock.patch.object(rt, 'reverse_geocode_region', return_value=('Exampleland', 'Northshire', None)), \
+                mock.patch.object(rt, 'fetch_meteoalarm_alerts', return_value=[]):
+            self.Stub()._fetch_alerts_bg()
+        self.assertTrue(rt.load_weather_settings()['alerts_enabled'])
 
 
 class TestMeteoalarmFeedUrl(unittest.TestCase):
