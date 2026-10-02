@@ -21,6 +21,7 @@ import subprocess
 import threading
 import webbrowser
 import hashlib
+import atexit
 import calendar
 import time as time_module
 import urllib.request
@@ -104,7 +105,7 @@ def ensure_config():
             "[twitch]\n"
             "# Twitch channel login names to watch for live status, one per line.\n"
             "# Uses Twitch's own internal (unofficial) API — no account/app needed.\n"
-            "# Clicking a live channel runs: streamlink --player mpv twitch.tv/<name> best\n"
+            "# Clicking a live channel plays it (streamlink + mpv, one shared maximized window).\n"
             "# examplechannel\n"
             "\n"
             "[weather]\n"
@@ -602,29 +603,227 @@ def check_twitch_live_channels(channels):
     return live
 
 
-def open_twitch_stream(channel, quality='best', site='Twitch'):
-    """Plays the stream with streamlink+mpv if both are installed; falls
-    back to opening the channel in the browser otherwise, or if launching
-    the player fails for any reason. --title is passed so mpv's window
-    title (and OSD title) shows '<site> > <channel> > <category> > <stream
-    title>'; streamlink substitutes {author}/{category}/{title} per-stream
-    and handles the mpv-specific --force-media-title translation itself.
-    site will become a real per-call argument once a non-Twitch caller
-    (e.g. YouTube Live) exists; for now every caller is Twitch."""
+# --- Live-stream playback -------------------------------------------------
+# One persistent mpv window is shared by every live channel. mpv is started
+# idle + maximized with an IPC socket; each click starts `streamlink
+# --player-external-http` (serves the stream on a local port, no player of its
+# own) and tells the running mpv to `loadfile` that URL, so a new channel
+# replaces whatever is playing in the *same* window instead of opening another.
+MPV_IPC_SOCKET = os.path.join(
+    os.environ.get('XDG_RUNTIME_DIR') or '/tmp', f'rss-tray-mpv-{os.getuid()}.sock')
+STREAMLINK_READY_TIMEOUT_SECONDS = 30
+MPV_START_TIMEOUT_SECONDS = 10
+
+_player_lock = threading.Lock()  # guards _streamlink_proc
+_mpv_lock = threading.Lock()     # serialises "is mpv up? if not, start it"
+_streamlink_proc = None
+_mpv_proc = None
+
+
+def _mpv_ipc(commands, timeout=2.0):
+    """Sends mpv JSON-IPC commands (each a list, e.g. ['loadfile', url,
+    'replace']) and waits for one reply per command. True only if mpv is
+    reachable and every command answered 'success'."""
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect(MPV_IPC_SOCKET)
+        for command in commands:
+            sock.sendall((json.dumps({'command': command}) + '\n').encode())
+        pending = len(commands)
+        ok = True
+        buf = b''
+        while pending > 0:
+            chunk = sock.recv(4096)
+            if not chunk:
+                return False
+            buf += chunk
+            *lines, buf = buf.split(b'\n')
+            for line in lines:
+                try:
+                    reply = json.loads(line)
+                except ValueError:
+                    continue
+                if 'error' in reply:  # events have no 'error' key
+                    pending -= 1
+                    if reply['error'] != 'success':
+                        ok = False
+        return ok
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def _ensure_mpv():
+    """True if an mpv with our IPC socket is running, starting one (idle,
+    maximized) if not. --idle=once: it sits empty until the first stream,
+    and quits when that playback ends, so the next click starts a fresh one."""
+    global _mpv_proc
+    with _mpv_lock:
+        if _mpv_ipc([['get_property', 'pid']]):
+            return True
+        try:
+            os.unlink(MPV_IPC_SOCKET)  # stale socket from a dead mpv
+        except OSError:
+            pass
+        try:
+            _mpv_proc = subprocess.Popen(
+                ['mpv', '--idle=once', '--force-window=yes',
+                 '--window-maximized=yes', f'--input-ipc-server={MPV_IPC_SOCKET}'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            return False
+        deadline = time_module.monotonic() + MPV_START_TIMEOUT_SECONDS
+        while time_module.monotonic() < deadline:
+            if _mpv_proc.poll() is not None:
+                return False
+            if _mpv_ipc([['get_property', 'pid']], timeout=0.5):
+                return True
+            time_module.sleep(0.2)
+        return False
+
+
+def _load_in_mpv(stream_url, title):
+    """Plays stream_url in the shared mpv window (replacing what's there)."""
+    for _attempt in range(2):  # 2nd try covers mpv quitting right after the probe
+        if not _ensure_mpv():
+            return False
+        if _mpv_ipc([['set_property', 'force-media-title', title],
+                     ['loadfile', stream_url, 'replace']]):
+            return True
+        time_module.sleep(0.5)
+    return False
+
+
+def _stop_streamlink():
+    global _streamlink_proc
+    with _player_lock:
+        proc, _streamlink_proc = _streamlink_proc, None
+    if proc is not None and proc.poll() is None:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+
+
+atexit.register(_stop_streamlink)
+
+
+def _is_current_streamlink(proc):
+    with _player_lock:
+        return _streamlink_proc is proc
+
+
+def _free_local_port():
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(('127.0.0.1', 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
+
+
+def _apply_stream_title(proc, url, site):
+    """Replaces the placeholder window title with
+    '<site> > <author> > <category> > <title>' from `streamlink --json`
+    (external-http mode has no {author}/{category} substitution of its own)."""
+    try:
+        result = subprocess.run(['streamlink', '--json', url],
+                                capture_output=True, text=True,
+                                timeout=YOUTUBE_CHECK_TIMEOUT_SECONDS)
+        meta = json.loads(result.stdout).get('metadata') or {}
+    except Exception:
+        return
+    parts = [site, meta.get('author'), meta.get('category'), meta.get('title')]
+    title = ' > '.join(p for p in parts if p)
+    if meta and _is_current_streamlink(proc):
+        _mpv_ipc([['set_property', 'force-media-title', title]])
+
+
+def _stop_streamlink_when_mpv_exits(proc):
+    """The external-http server would otherwise serve forever after the mpv
+    window is closed; stop it once mpv has been gone for two checks."""
+    misses = 0
+    while proc.poll() is None:
+        time_module.sleep(3)
+        if _mpv_ipc([['get_property', 'pid']], timeout=1):
+            misses = 0
+            continue
+        misses += 1
+        if misses >= 2:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+            return
+
+
+def _play_in_shared_mpv(url, quality, site, channel, fallback_url):
+    """Worker thread: serve the stream via streamlink, load it into the
+    shared mpv. Falls back to the browser if anything fails (unless a newer
+    click has superseded this one)."""
+    _stop_streamlink()  # a new click replaces the previous stream
+    port = _free_local_port()
+    try:
+        proc = subprocess.Popen(
+            ['streamlink', '--player-external-http',
+             '--player-external-http-interface', '127.0.0.1',
+             '--player-external-http-port', str(port), url, quality],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            text=True, errors='replace')
+    except Exception:
+        webbrowser.open(fallback_url)
+        return
+    global _streamlink_proc
+    with _player_lock:
+        _streamlink_proc = proc
+    # streamlink logs this line once its local server is listening; mpv can
+    # connect from then on (it fetches the actual stream on first request).
+    watchdog = threading.Timer(STREAMLINK_READY_TIMEOUT_SECONDS, proc.kill)
+    watchdog.start()
+    ready = False
+    try:
+        for line in proc.stderr:
+            if 'access with one of' in line:
+                ready = True
+                break
+    finally:
+        watchdog.cancel()
+    if not ready or not _load_in_mpv(f'http://127.0.0.1:{port}/', f'{site} > {channel}'):
+        superseded = not _is_current_streamlink(proc)
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+        if not superseded:
+            webbrowser.open(fallback_url)
+        return
+    threading.Thread(target=_apply_stream_title, args=(proc, url, site), daemon=True).start()
+    threading.Thread(target=_stop_streamlink_when_mpv_exits, args=(proc,), daemon=True).start()
+    for _line in proc.stderr:  # drain so streamlink never blocks on a full pipe
+        pass
+
+
+def _open_live_stream(url, quality, site, channel, fallback_url):
     if shutil.which('streamlink') and shutil.which('mpv'):
         try:
-            subprocess.Popen(
-                [
-                    'streamlink', '--player', 'mpv',
-                    '--title', f'{site} > {{author}} > {{category}} > {{title}}',
-                    f'twitch.tv/{channel}', quality,
-                ],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
+            threading.Thread(
+                target=_play_in_shared_mpv,
+                args=(url, quality, site, channel, fallback_url),
+                daemon=True).start()
             return
         except Exception:
             pass
-    webbrowser.open(f'https://twitch.tv/{channel}')
+    webbrowser.open(fallback_url)
+
+
+def open_twitch_stream(channel, quality='best', site='Twitch'):
+    """Plays the stream in the shared, maximized mpv window (see above) if
+    streamlink and mpv are installed; falls back to opening the channel in
+    the browser otherwise, or if starting playback fails."""
+    _open_live_stream(f'twitch.tv/{channel}', quality, site, channel,
+                      f'https://twitch.tv/{channel}')
 
 
 YOUTUBE_CHECK_INTERVAL_SECONDS = 1800  # how often to poll YouTube live status
@@ -671,24 +870,10 @@ def check_youtube_live_channels(channels):
 
 
 def open_youtube_stream(channel, quality='best'):
-    """Plays the stream with streamlink+mpv if both are installed; falls
-    back to opening the channel's page in the browser otherwise, or if
-    launching the player fails for any reason. See open_twitch_stream for
-    the --title scheme (same pattern, site fixed to 'YouTube')."""
-    if shutil.which('streamlink') and shutil.which('mpv'):
-        try:
-            subprocess.Popen(
-                [
-                    'streamlink', '--player', 'mpv',
-                    '--title', 'YouTube > {author} > {category} > {title}',
-                    f'https://www.youtube.com/{channel}/live', quality,
-                ],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-            return
-        except Exception:
-            pass
-    webbrowser.open(f'https://www.youtube.com/{channel}')
+    """Same as open_twitch_stream (shared mpv window); falls back to the
+    channel's page in the browser."""
+    _open_live_stream(f'https://www.youtube.com/{channel}/live', quality,
+                      'YouTube', channel, f'https://www.youtube.com/{channel}')
 
 
 def play_notification_sound():
@@ -2209,9 +2394,13 @@ class RssTray:
             self.mark_feed_read(row.header_feed_url)
             return
         if hasattr(row, 'twitch_channel'):
+            if self.popup:
+                self.popup.hide()
             open_twitch_stream(row.twitch_channel, getattr(row, 'twitch_quality', 'best'))
             return
         if hasattr(row, 'youtube_channel'):
+            if self.popup:
+                self.popup.hide()
             open_youtube_stream(row.youtube_channel, getattr(row, 'youtube_quality', 'best'))
             return
         if not hasattr(row, 'entry_id'):
