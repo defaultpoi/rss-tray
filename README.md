@@ -18,7 +18,7 @@ A minimal tray-based RSS/Atom reader for Linux, built with Python and GTK3 as a 
 - **YouTube Live:** live channels are polled every 30 minutes via `streamlink --json <channel>/live` per channel -- no API key, and the same extraction path used for actual playback, so the check can't disagree with what clicking the row does. There's no keyless batch API for YouTube, so this is one streamlink call per channel (heavier than Twitch's single batched request). Shares the same "Live now" list, quality config, and browser fallback as Twitch.
 - **Player window titles:** mpv's title is set via streamlink's `--title` to `<Site> > <channel> > <category> > <stream title>` for both platforms.
 - **Timer:** a 0-2 h slider behind the "Timer" footer button. It keeps counting with the popup closed and plays the notification sound twice at zero.
-- **Severe-weather alerts** (optional, `alerts=true` in `[weather]`): polls MeteoAlarm's Exampleland feed every 30 minutes for the county matching the configured coordinates (reverse-geocoded via OpenStreetMap, re-checked weekly). An active alert is color-coded by severity (yellow/orange/red for moderate/severe/extreme) and pulses the matching weather value and the tray badge, faster for more severe alerts.
+- **Severe-weather alerts** (optional, `alerts=true` in `[weather]`): polls the MeteoAlarm feed for your country every 30 minutes, filtered to the region matching the configured coordinates (country and region are reverse-geocoded via OpenStreetMap and re-checked weekly; Europe only, since MeteoAlarm only covers European countries). An active alert is color-coded by severity (yellow/orange/red for moderate/severe/extreme) and pulses the matching weather value and the tray badge, faster for more severe alerts.
 
 ## Requirements
 
@@ -85,9 +85,9 @@ somechannel2|720p60
 channel/UCxxxxxxxxxxxxxxxxxxxxxx|720p60
 
 [weather]
-# lat|lon for the weather bar (Open-Meteo, no key needed); optional —
-# falls back to the built-in default if omitted
-10.0|20.0
+# lat|lon for the weather bar (Open-Meteo, no key needed); the weather
+# bar stays hidden until this is set
+<latitude>|<longitude>
 alerts=true
 
 [timer]
