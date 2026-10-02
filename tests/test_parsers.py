@@ -493,43 +493,225 @@ class TestTwitchQuality(TmpConfigCase):
         self.assertEqual(rt.load_twitch_qualities(), {})
 
 
-class TestOpenTwitchStream(unittest.TestCase):
-    def test_uses_streamlink_when_both_installed(self):
-        with mock.patch.object(rt.shutil, 'which', side_effect=lambda x: '/usr/bin/' + x), \
-                mock.patch.object(rt.subprocess, 'Popen') as popen, \
+class FakeStreamlinkProc:
+    def __init__(self, stderr_lines):
+        self.stderr = iter(stderr_lines)
+        self.terminated = False
+
+    def poll(self):
+        return 0 if self.terminated else None
+
+    def terminate(self):
+        self.terminated = True
+
+    def kill(self):
+        self.terminated = True
+
+
+class TestOpenLiveStream(unittest.TestCase):
+    def _which_ok(self):
+        return mock.patch.object(rt.shutil, 'which', side_effect=lambda x: '/usr/bin/' + x)
+
+    def test_twitch_starts_worker_thread_with_url_and_quality(self):
+        with self._which_ok(), mock.patch.object(rt.threading, 'Thread') as thread, \
                 mock.patch.object(rt.webbrowser, 'open') as wb_open:
             rt.open_twitch_stream('somechan', '720p60')
-        popen.assert_called_once()
-        args = popen.call_args[0][0]
-        self.assertEqual(args, [
-            'streamlink', '--player', 'mpv', '--title',
-            'Twitch > {author} > {category} > {title}',
-            'twitch.tv/somechan', '720p60',
-        ])
+        thread.assert_called_once()
+        self.assertIs(thread.call_args.kwargs['target'], rt._play_in_shared_mpv)
+        self.assertEqual(thread.call_args.kwargs['args'], (
+            'twitch.tv/somechan', '720p60', 'Twitch', 'somechan', 'https://twitch.tv/somechan'))
+        thread.return_value.start.assert_called_once()
         wb_open.assert_not_called()
 
-    def test_defaults_to_best_quality(self):
-        with mock.patch.object(rt.shutil, 'which', side_effect=lambda x: '/usr/bin/' + x), \
-                mock.patch.object(rt.subprocess, 'Popen') as popen, \
+    def test_twitch_defaults_to_best_quality(self):
+        with self._which_ok(), mock.patch.object(rt.threading, 'Thread') as thread, \
                 mock.patch.object(rt.webbrowser, 'open'):
             rt.open_twitch_stream('somechan')
-        args = popen.call_args[0][0]
-        self.assertEqual(args[-1], 'best')
+        self.assertEqual(thread.call_args.kwargs['args'][1], 'best')
 
-    def test_falls_back_to_browser_when_streamlink_missing(self):
+    def test_twitch_falls_back_to_browser_when_streamlink_missing(self):
         with mock.patch.object(rt.shutil, 'which', return_value=None), \
-                mock.patch.object(rt.subprocess, 'Popen') as popen, \
+                mock.patch.object(rt.threading, 'Thread') as thread, \
                 mock.patch.object(rt.webbrowser, 'open') as wb_open:
             rt.open_twitch_stream('somechan')
-        popen.assert_not_called()
+        thread.assert_not_called()
         wb_open.assert_called_once_with('https://twitch.tv/somechan')
 
-    def test_falls_back_to_browser_when_launch_raises(self):
-        with mock.patch.object(rt.shutil, 'which', side_effect=lambda x: '/usr/bin/' + x), \
-                mock.patch.object(rt.subprocess, 'Popen', side_effect=OSError), \
+    def test_twitch_falls_back_to_browser_when_thread_start_raises(self):
+        with self._which_ok(), mock.patch.object(rt.threading, 'Thread', side_effect=RuntimeError), \
                 mock.patch.object(rt.webbrowser, 'open') as wb_open:
             rt.open_twitch_stream('somechan')
         wb_open.assert_called_once_with('https://twitch.tv/somechan')
+
+    def test_youtube_starts_worker_thread(self):
+        with self._which_ok(), mock.patch.object(rt.threading, 'Thread') as thread, \
+                mock.patch.object(rt.webbrowser, 'open') as wb_open:
+            rt.open_youtube_stream('@somehandle', '720p60')
+        self.assertEqual(thread.call_args.kwargs['args'], (
+            'https://www.youtube.com/@somehandle/live', '720p60', 'YouTube',
+            '@somehandle', 'https://www.youtube.com/@somehandle'))
+        wb_open.assert_not_called()
+
+    def test_youtube_falls_back_to_channel_page_when_mpv_missing(self):
+        with mock.patch.object(rt.shutil, 'which', side_effect=lambda x: None if x == 'mpv' else '/x'), \
+                mock.patch.object(rt.webbrowser, 'open') as wb_open:
+            rt.open_youtube_stream('@somehandle')
+        wb_open.assert_called_once_with('https://www.youtube.com/@somehandle')
+
+
+class TestSharedMpv(unittest.TestCase):
+    def setUp(self):
+        rt._streamlink_proc = None
+        self.addCleanup(setattr, rt, '_streamlink_proc', None)
+
+    def test_streamlink_serves_locally_then_loads_into_mpv(self):
+        proc = FakeStreamlinkProc(['[cli][info] Starting server, access with one of:\n', ' http://127.0.0.1:1/\n'])
+        with mock.patch.object(rt.subprocess, 'Popen', return_value=proc) as popen, \
+                mock.patch.object(rt, '_load_in_mpv', return_value=True) as load, \
+                mock.patch.object(rt.threading, 'Thread'), \
+                mock.patch.object(rt.threading, 'Timer'), \
+                mock.patch.object(rt.webbrowser, 'open') as wb_open:
+            rt._play_in_shared_mpv('twitch.tv/x', '720p60', 'Twitch', 'x', 'https://twitch.tv/x')
+        args = popen.call_args[0][0]
+        self.assertEqual(args[:5], ['streamlink', '--player-external-http',
+                                    '--player-external-http-interface', '127.0.0.1',
+                                    '--player-external-http-port'])
+        self.assertEqual(args[6:], ['twitch.tv/x', '720p60'])
+        load.assert_called_once_with('http://127.0.0.1:%s/' % args[5], 'Twitch > x')
+        wb_open.assert_not_called()
+        self.assertFalse(proc.terminated)
+
+    def test_browser_fallback_when_streamlink_never_ready(self):
+        proc = FakeStreamlinkProc(['error: no plugin\n'])
+        with mock.patch.object(rt.subprocess, 'Popen', return_value=proc), \
+                mock.patch.object(rt, '_load_in_mpv') as load, \
+                mock.patch.object(rt.webbrowser, 'open') as wb_open:
+            rt._play_in_shared_mpv('twitch.tv/x', 'best', 'Twitch', 'x', 'https://twitch.tv/x')
+        load.assert_not_called()
+        wb_open.assert_called_once_with('https://twitch.tv/x')
+        self.assertTrue(proc.terminated)
+
+    def test_browser_fallback_when_mpv_load_fails(self):
+        proc = FakeStreamlinkProc(['access with one of:\n'])
+        with mock.patch.object(rt.subprocess, 'Popen', return_value=proc), \
+                mock.patch.object(rt, '_load_in_mpv', return_value=False), \
+                mock.patch.object(rt.webbrowser, 'open') as wb_open:
+            rt._play_in_shared_mpv('twitch.tv/x', 'best', 'Twitch', 'x', 'https://twitch.tv/x')
+        wb_open.assert_called_once_with('https://twitch.tv/x')
+
+    def test_browser_fallback_when_streamlink_launch_raises(self):
+        with mock.patch.object(rt.subprocess, 'Popen', side_effect=OSError), \
+                mock.patch.object(rt.webbrowser, 'open') as wb_open:
+            rt._play_in_shared_mpv('twitch.tv/x', 'best', 'Twitch', 'x', 'https://twitch.tv/x')
+        wb_open.assert_called_once_with('https://twitch.tv/x')
+
+    def test_new_click_stops_previous_stream(self):
+        old = FakeStreamlinkProc([])
+        rt._streamlink_proc = old
+        new = FakeStreamlinkProc(['access with one of:\n'])
+        with mock.patch.object(rt.subprocess, 'Popen', return_value=new), \
+                mock.patch.object(rt, '_load_in_mpv', return_value=True), \
+                mock.patch.object(rt.threading, 'Thread'), \
+                mock.patch.object(rt.threading, 'Timer'):
+            rt._play_in_shared_mpv('twitch.tv/y', 'best', 'Twitch', 'y', 'https://twitch.tv/y')
+        self.assertTrue(old.terminated)
+        self.assertFalse(new.terminated)
+
+    def test_superseded_failure_does_not_open_browser(self):
+        def lines():
+            rt._streamlink_proc = FakeStreamlinkProc([])  # a newer click took over
+            yield 'no marker\n'
+        proc = FakeStreamlinkProc([])
+        proc.stderr = lines()
+        with mock.patch.object(rt.subprocess, 'Popen', return_value=proc), \
+                mock.patch.object(rt.webbrowser, 'open') as wb_open:
+            rt._play_in_shared_mpv('twitch.tv/x', 'best', 'Twitch', 'x', 'https://twitch.tv/x')
+        wb_open.assert_not_called()
+
+    def test_load_in_mpv_sends_title_then_loadfile(self):
+        with mock.patch.object(rt, '_ensure_mpv', return_value=True), \
+                mock.patch.object(rt, '_mpv_ipc', return_value=True) as ipc:
+            self.assertTrue(rt._load_in_mpv('http://127.0.0.1:9/', 'T'))
+        ipc.assert_called_once_with([['set_property', 'force-media-title', 'T'],
+                                     ['loadfile', 'http://127.0.0.1:9/', 'replace']])
+
+    def test_load_in_mpv_fails_when_mpv_cannot_start(self):
+        with mock.patch.object(rt, '_ensure_mpv', return_value=False):
+            self.assertFalse(rt._load_in_mpv('u', 'T'))
+
+    def test_load_in_mpv_retries_once(self):
+        with mock.patch.object(rt, '_ensure_mpv', return_value=True), \
+                mock.patch.object(rt, '_mpv_ipc', side_effect=[False, True]), \
+                mock.patch.object(rt.time_module, 'sleep'):
+            self.assertTrue(rt._load_in_mpv('u', 'T'))
+
+    def test_ensure_mpv_reuses_running_instance(self):
+        with mock.patch.object(rt, '_mpv_ipc', return_value=True), \
+                mock.patch.object(rt.subprocess, 'Popen') as popen:
+            self.assertTrue(rt._ensure_mpv())
+        popen.assert_not_called()
+
+    def test_ensure_mpv_launches_maximized_idle_with_ipc(self):
+        mpv = mock.Mock()
+        mpv.poll.return_value = None
+        with mock.patch.object(rt, '_mpv_ipc', side_effect=[False, True]), \
+                mock.patch.object(rt.subprocess, 'Popen', return_value=mpv) as popen, \
+                mock.patch.object(rt.time_module, 'sleep'):
+            self.assertTrue(rt._ensure_mpv())
+        args = popen.call_args[0][0]
+        self.assertEqual(args[0], 'mpv')
+        self.assertIn('--window-maximized=yes', args)
+        self.assertIn('--idle=once', args)
+        self.assertIn(f'--input-ipc-server={rt.MPV_IPC_SOCKET}', args)
+
+    def test_ensure_mpv_false_when_mpv_dies_at_startup(self):
+        mpv = mock.Mock()
+        mpv.poll.return_value = 1
+        with mock.patch.object(rt, '_mpv_ipc', return_value=False), \
+                mock.patch.object(rt.subprocess, 'Popen', return_value=mpv):
+            self.assertFalse(rt._ensure_mpv())
+
+
+class TestMpvIpc(unittest.TestCase):
+    """Runs _mpv_ipc against a real unix socket standing in for mpv."""
+
+    def _serve(self, replies):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        path = os.path.join(d, 'mpv.sock')
+        self.received = []
+        server = rt.socket.socket(rt.socket.AF_UNIX, rt.socket.SOCK_STREAM)
+        server.bind(path)
+        server.listen(1)
+        self.addCleanup(server.close)
+
+        def run():
+            conn, _ = server.accept()
+            buf = b''
+            for reply in replies:
+                while b'\n' not in buf:
+                    buf += conn.recv(4096)
+                line, buf = buf.split(b'\n', 1)
+                self.received.append(json.loads(line))
+                conn.sendall(b'{"event":"noise"}\n' + (json.dumps(reply) + '\n').encode())
+            conn.close()
+        rt.threading.Thread(target=run, daemon=True).start()
+        patcher = mock.patch.object(rt, 'MPV_IPC_SOCKET', path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_success_replies(self):
+        self._serve([{'error': 'success'}, {'error': 'success'}])
+        self.assertTrue(rt._mpv_ipc([['set_property', 'a', 'b'], ['loadfile', 'u', 'replace']]))
+        self.assertEqual(self.received[1], {'command': ['loadfile', 'u', 'replace']})
+
+    def test_error_reply_is_false(self):
+        self._serve([{'error': 'property unavailable'}])
+        self.assertFalse(rt._mpv_ipc([['get_property', 'x']]))
+
+    def test_no_socket_is_false(self):
+        with mock.patch.object(rt, 'MPV_IPC_SOCKET', '/nonexistent/none.sock'):
+            self.assertFalse(rt._mpv_ipc([['get_property', 'pid']]))
 
 
 class TestTimerSettings(TmpConfigCase):
@@ -625,40 +807,3 @@ class TestCheckYoutubeLiveChannels(unittest.TestCase):
             return result
         with mock.patch.object(rt.subprocess, 'run', side_effect=run):
             self.assertIsNone(rt.check_youtube_live_channels(['a']))
-
-
-class TestOpenYoutubeStream(unittest.TestCase):
-    def test_uses_streamlink_when_both_installed(self):
-        with mock.patch.object(rt.shutil, 'which', side_effect=lambda x: '/usr/bin/' + x), \
-                mock.patch.object(rt.subprocess, 'Popen') as popen, \
-                mock.patch.object(rt.webbrowser, 'open') as wb_open:
-            rt.open_youtube_stream('@somehandle', '720p60')
-        args = popen.call_args[0][0]
-        self.assertEqual(args, [
-            'streamlink', '--player', 'mpv', '--title',
-            'YouTube > {author} > {category} > {title}',
-            'https://www.youtube.com/@somehandle/live', '720p60',
-        ])
-        wb_open.assert_not_called()
-
-    def test_defaults_to_best_quality(self):
-        with mock.patch.object(rt.shutil, 'which', side_effect=lambda x: '/usr/bin/' + x), \
-                mock.patch.object(rt.subprocess, 'Popen') as popen, \
-                mock.patch.object(rt.webbrowser, 'open'):
-            rt.open_youtube_stream('@somehandle')
-        self.assertEqual(popen.call_args[0][0][-1], 'best')
-
-    def test_falls_back_to_browser_channel_page_when_streamlink_missing(self):
-        with mock.patch.object(rt.shutil, 'which', return_value=None), \
-                mock.patch.object(rt.subprocess, 'Popen') as popen, \
-                mock.patch.object(rt.webbrowser, 'open') as wb_open:
-            rt.open_youtube_stream('@somehandle')
-        popen.assert_not_called()
-        wb_open.assert_called_once_with('https://www.youtube.com/@somehandle')
-
-    def test_falls_back_to_browser_when_launch_raises(self):
-        with mock.patch.object(rt.shutil, 'which', side_effect=lambda x: '/usr/bin/' + x), \
-                mock.patch.object(rt.subprocess, 'Popen', side_effect=OSError), \
-                mock.patch.object(rt.webbrowser, 'open') as wb_open:
-            rt.open_youtube_stream('@somehandle')
-        wb_open.assert_called_once_with('https://www.youtube.com/@somehandle')
