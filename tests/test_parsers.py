@@ -265,39 +265,43 @@ class TestEntryIdFeedScoping(unittest.TestCase):
 
 
 class TestWeatherCoords(TmpConfigCase):
-    def test_no_section_gives_default(self):
-        self.assertEqual(rt.load_weather_coords(),
-                          (rt.DEFAULT_WEATHER_LATITUDE, rt.DEFAULT_WEATHER_LONGITUDE))
+    def test_no_section_gives_none(self):
+        self.assertEqual(rt.load_weather_coords(), (None, None))
 
     def test_valid_coords_parsed(self):
         self.conf('[weather]\n40.0|-3.7\n')
         self.assertEqual(rt.load_weather_coords(), (40.0, -3.7))
 
-    def test_garbage_falls_back_to_default(self):
+    def test_garbage_gives_none(self):
         self.conf('[weather]\nnot-a-number|also-not\n')
-        self.assertEqual(rt.load_weather_coords(),
-                          (rt.DEFAULT_WEATHER_LATITUDE, rt.DEFAULT_WEATHER_LONGITUDE))
+        self.assertEqual(rt.load_weather_coords(), (None, None))
 
-    def test_missing_second_field_falls_back(self):
+    def test_missing_second_field_gives_none(self):
         self.conf('[weather]\n40.0\n')
-        self.assertEqual(rt.load_weather_coords(),
-                          (rt.DEFAULT_WEATHER_LATITUDE, rt.DEFAULT_WEATHER_LONGITUDE))
+        self.assertEqual(rt.load_weather_coords(), (None, None))
+
+    def test_fetch_weather_skips_network_without_coords(self):
+        with mock.patch.object(rt.urllib.request, 'urlopen') as urlopen:
+            self.assertIsNone(rt.fetch_weather())
+        urlopen.assert_not_called()
 
 
 class TestWeatherSettings(TmpConfigCase):
     def test_defaults(self):
         s = rt.load_weather_settings()
-        self.assertEqual(s['lat'], rt.DEFAULT_WEATHER_LATITUDE)
-        self.assertEqual(s['lon'], rt.DEFAULT_WEATHER_LONGITUDE)
+        self.assertIsNone(s['lat'])
+        self.assertIsNone(s['lon'])
         self.assertFalse(s['alerts_enabled'])
+        self.assertIsNone(s['country'])
         self.assertIsNone(s['region'])
         self.assertEqual(s['region_updated'], 0.0)
 
     def test_full_section(self):
-        self.conf('[weather]\n40.0|-3.7\nalerts=true\nregion=Northshire\nregion_updated=123.0\n')
+        self.conf('[weather]\n40.0|-3.7\nalerts=true\ncountry=Exampleland\nregion=Northshire\nregion_updated=123.0\n')
         s = rt.load_weather_settings()
         self.assertEqual((s['lat'], s['lon']), (40.0, -3.7))
         self.assertTrue(s['alerts_enabled'])
+        self.assertEqual(s['country'], 'Exampleland')
         self.assertEqual(s['region'], 'Northshire')
         self.assertEqual(s['region_updated'], 123.0)
 
@@ -333,30 +337,55 @@ class TestUpdateWeatherRegionCache(TmpConfigCase):
         self.assertEqual(s['region'], 'New')
         self.assertEqual(s['region_updated'], 200.0)
 
+    def test_country_written_and_replaced(self):
+        self.conf('[weather]\n45.0|26.0\ncountry=Old\nregion=Old\nregion_updated=1\n')
+        rt._update_weather_region_cache('New', 200.0, country='Newland')
+        s = rt.load_weather_settings()
+        self.assertEqual((s['country'], s['region']), ('Newland', 'New'))
+        with open(rt.CONFIG_FILE) as f:
+            self.assertEqual(f.read().count('country='), 1)
+
     def test_creates_section_if_missing(self):
         self.conf('[feeds]\nhttps://a\n')
         rt._update_weather_region_cache('Northshire', 50.0)
         self.assertEqual(rt.load_weather_settings()['region'], 'Northshire')
 
 
-class TestReverseGeocodeCounty(unittest.TestCase):
+class TestReverseGeocodeRegion(unittest.TestCase):
     def _resp(self, payload):
         resp = mock.MagicMock()
         resp.__enter__.return_value.read.return_value = json.dumps(payload).encode()
         return resp
 
-    def test_success(self):
-        payload = {'address': {'county': 'Northshire'}}
+    def _geocode(self, payload):
         with mock.patch.object(rt.urllib.request, 'urlopen', return_value=self._resp(payload)):
-            self.assertEqual(rt.reverse_geocode_county(10.0, 20.0), 'Northshire')
+            return rt.reverse_geocode_region(10.0, 20.0)
 
-    def test_missing_county_is_none(self):
-        with mock.patch.object(rt.urllib.request, 'urlopen', return_value=self._resp({'address': {}})):
-            self.assertIsNone(rt.reverse_geocode_county(10.0, 20.0))
+    def test_county(self):
+        self.assertEqual(self._geocode({'address': {'country': 'Exampleland', 'county': 'Northshire'}}),
+                         ('Exampleland', 'Northshire'))
+
+    def test_state_used_when_no_county(self):
+        self.assertEqual(self._geocode({'address': {'country': 'Exampleland', 'state': 'Westland'}}),
+                         ('Exampleland', 'Westland'))
+
+    def test_missing_region_or_country_is_none(self):
+        self.assertIsNone(self._geocode({'address': {'country': 'Exampleland'}}))
+        self.assertIsNone(self._geocode({'address': {'county': 'Northshire'}}))
+        self.assertIsNone(self._geocode({'address': {}}))
 
     def test_request_error_is_none(self):
         with mock.patch.object(rt.urllib.request, 'urlopen', side_effect=OSError):
-            self.assertIsNone(rt.reverse_geocode_county(10.0, 20.0))
+            self.assertIsNone(rt.reverse_geocode_region(10.0, 20.0))
+
+
+class TestMeteoalarmFeedUrl(unittest.TestCase):
+    def test_simple_country(self):
+        self.assertEqual(rt.meteoalarm_feed_url('Exampleland'),
+                         'https://feeds.meteoalarm.org/feeds/meteoalarm-legacy-atom-exampleland')
+
+    def test_multi_word_country_is_slugged(self):
+        self.assertTrue(rt.meteoalarm_feed_url('United  Example Kingdom').endswith('-united-example-kingdom'))
 
 
 class TestMeteoalarmTitleParsing(unittest.TestCase):
@@ -397,7 +426,7 @@ class TestFetchMeteoalarmAlerts(unittest.TestCase):
             self._entry('northshire', 'Orange Rain Warning issued for Exampleland - Northshire'),
         ])
         with mock.patch.object(rt.feedparser, 'parse', return_value=parsed):
-            alerts = rt.fetch_meteoalarm_alerts('Northshire')
+            alerts = rt.fetch_meteoalarm_alerts('Northshire', 'Exampleland')
         self.assertEqual(len(alerts), 1)
         self.assertEqual(alerts[0]['hazard'], 'Rain')
         self.assertEqual(alerts[0]['segment'], 'rain')
@@ -407,16 +436,22 @@ class TestFetchMeteoalarmAlerts(unittest.TestCase):
             self._entry('Eastshire', 'Yellow Wind Warning issued for Exampleland - Eastshire'),
         ])
         with mock.patch.object(rt.feedparser, 'parse', return_value=parsed):
-            self.assertEqual(rt.fetch_meteoalarm_alerts('Northshire'), [])
+            self.assertEqual(rt.fetch_meteoalarm_alerts('Northshire', 'Exampleland'), [])
 
     def test_bozo_with_no_entries_is_failure(self):
         parsed = mock.MagicMock(bozo=True, entries=[])
         with mock.patch.object(rt.feedparser, 'parse', return_value=parsed):
-            self.assertIsNone(rt.fetch_meteoalarm_alerts('Northshire'))
+            self.assertIsNone(rt.fetch_meteoalarm_alerts('Northshire', 'Exampleland'))
+
+    def test_uses_country_feed_url(self):
+        parsed = mock.MagicMock(bozo=False, entries=[])
+        with mock.patch.object(rt.feedparser, 'parse', return_value=parsed) as parse:
+            rt.fetch_meteoalarm_alerts('Northshire', 'Exampleland')
+        parse.assert_called_once_with(rt.meteoalarm_feed_url('Exampleland'))
 
     def test_parse_exception_is_failure(self):
         with mock.patch.object(rt.feedparser, 'parse', side_effect=Exception):
-            self.assertIsNone(rt.fetch_meteoalarm_alerts('Northshire'))
+            self.assertIsNone(rt.fetch_meteoalarm_alerts('Northshire', 'Exampleland'))
 
 
 class TestAlertSeverityAndTiming(unittest.TestCase):
@@ -441,7 +476,7 @@ class TestAlertSeverityAndTiming(unittest.TestCase):
                          '2026-09-28T17:00:00+00:00'),
         ])
         with mock.patch.object(rt.feedparser, 'parse', return_value=parsed):
-            self.assertEqual(rt.fetch_meteoalarm_alerts('Northshire', now=now), [])
+            self.assertEqual(rt.fetch_meteoalarm_alerts('Northshire', 'Exampleland', now=now), [])
 
     def test_future_entry_filtered_out(self):
         now = rt.datetime(2026, 9, 29, 19, 14, 58, tzinfo=rt.timezone.utc)
@@ -450,7 +485,7 @@ class TestAlertSeverityAndTiming(unittest.TestCase):
                          '2026-09-30T20:00:00+00:00', severity='Extreme'),
         ])
         with mock.patch.object(rt.feedparser, 'parse', return_value=parsed):
-            self.assertEqual(rt.fetch_meteoalarm_alerts('Northshire', now=now), [])
+            self.assertEqual(rt.fetch_meteoalarm_alerts('Northshire', 'Exampleland', now=now), [])
 
     def test_currently_active_entry_kept_with_severity_color(self):
         now = rt.datetime(2026, 9, 29, 19, 14, 58, tzinfo=rt.timezone.utc)
@@ -460,7 +495,7 @@ class TestAlertSeverityAndTiming(unittest.TestCase):
                          title='Orange Rain Warning issued for Exampleland - Northshire'),
         ])
         with mock.patch.object(rt.feedparser, 'parse', return_value=parsed):
-            alerts = rt.fetch_meteoalarm_alerts('Northshire', now=now)
+            alerts = rt.fetch_meteoalarm_alerts('Northshire', 'Exampleland', now=now)
         self.assertEqual(len(alerts), 1)
         self.assertEqual(alerts[0]['severity_color'], 'orange')
 
