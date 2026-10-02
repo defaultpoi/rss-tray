@@ -1170,8 +1170,9 @@ WEATHER_GLYPH_COLOR = '#2b2b2b'
 
 # DejaVu Sans' cloud is small and sits low (its top is ~0.36em above the
 # baseline, vs ~0.74em for the digits and the sun/snow/bolt glyphs), so it's
-# lifted by this many em to line up with the others.
-GLYPH_RISE_EM = {'\u2601': 0.38}
+# lifted by this many em to line up with the others (value tuned against a
+# real screenshot of the bar).
+GLYPH_RISE_EM = {'\u2601': 0.52}
 
 
 def glyph_rise_units(glyph, widget=None):
@@ -1196,6 +1197,13 @@ def rise_spacer_markup(rise):
     if not rise:
         return ''
     return f'<span font_family="DejaVu Sans" rise="{rise}">\u200b</span>'
+
+
+def weather_row_pad(widget=None):
+    """Zero-width raised run appended to every value on both weather slides,
+    so all labels (and both slides) get identical line height and therefore
+    identical text position, whether or not a raised glyph is on screen."""
+    return rise_spacer_markup(glyph_rise_units('\u2601', widget))
 
 
 def mono_glyph_markup(glyph, color=WEATHER_GLYPH_COLOR, rise=0):
@@ -1587,6 +1595,7 @@ class RssTray:
         if not d:
             return []
         segments = []
+        pad = weather_row_pad(getattr(self, 'weather_box', None))
         for day in d.get('forecast_days', []):
             segment = ''
             if day.get('rain_prob') is not None and day['rain_prob'] > 0:
@@ -1596,7 +1605,7 @@ class RssTray:
                     f"{day['max_temp']:.0f}/{day['min_temp']:.0f}°C"
                 )
             if segment:
-                segments.append(f'<span size="large"><b>{segment}</b></span>')
+                segments.append(f'<span size="large"><b>{segment}{pad}</b></span>')
         return segments
 
     def build_today_weather_segments(self):
@@ -1618,8 +1627,9 @@ class RssTray:
 
         segments = []
         glyph = weather_code_glyph(d.get('weather_code'))
-        rise = glyph_rise_units(glyph, getattr(self, 'weather_box', None)) if glyph else 0
-        pad = rise_spacer_markup(rise) if d.get('temp') is not None else ''
+        widget = getattr(self, 'weather_box', None)
+        rise = glyph_rise_units(glyph, widget) if glyph else 0
+        pad = weather_row_pad(widget)
         if d.get('temp') is not None:
             temp_text = GLib.markup_escape_text(f"{d['temp']:.0f}°C")
             if glyph:
@@ -1630,7 +1640,7 @@ class RssTray:
                 else:
                     glyph_color = WEATHER_GLYPH_COLOR
                 temp_text = mono_glyph_markup(glyph, glyph_color, rise) + ' ' + temp_text
-            segments.append(f'<span size="large"><b>{temp_text}</b></span>')
+            segments.append(f'<span size="large"><b>{temp_text}{pad}</b></span>')
         if d.get('today_max_temp') is not None and d.get('today_min_temp') is not None:
             hi_lo = colorize(GLib.markup_escape_text(
                 f"{d['today_max_temp']:.0f}/{d['today_min_temp']:.0f}°C"
@@ -1644,13 +1654,15 @@ class RssTray:
         elif d.get('wind') is not None:
             wind_text = colorize(GLib.markup_escape_text(f"{d['wind']:.0f} km/h"), 'wind')
             segments.append(f'<span size="large"><b>{wind_text}{pad}</b></span>')
-        if d.get('today_rain_prob') is not None and d.get('today_precip_sum') is not None:
-            rain_text = colorize(GLib.markup_escape_text(
-                f"{d['today_rain_prob']:.0f}%/{d['today_precip_sum']:.1f}mm"
-            ), 'rain')
-            segments.append(f'<span size="large"><b>{rain_text}{pad}</b></span>')
-        elif d.get('today_rain_prob') is not None:
-            rain_text = colorize(GLib.markup_escape_text(f"{d['today_rain_prob']:.0f}%"), 'rain')
+        prob, precip = d.get('today_rain_prob'), d.get('today_precip_sum')
+        if prob is not None:
+            if round(prob) == 0 and precip is not None:
+                rain = f"{precip:.1f}mm"  # 0% chance: just the amount, no "0%/"
+            elif precip is not None:
+                rain = f"{prob:.0f}%/{precip:.1f}mm"
+            else:
+                rain = f"{prob:.0f}%"
+            rain_text = colorize(GLib.markup_escape_text(rain), 'rain')
             segments.append(f'<span size="large"><b>{rain_text}{pad}</b></span>')
         return segments
 
@@ -1695,14 +1707,15 @@ class RssTray:
             back_btn.set_valign(Gtk.Align.CENTER)
             self.weather_box.pack_start(back_btn, False, False, 0)
 
-            empty = ('<span size="large">Weather unavailable</span>' if not self.weather_data
-                     else '<span size="large">Forecast unavailable</span>')
+            pad = weather_row_pad(self.weather_box)
+            empty = (f'<span size="large">Weather unavailable{pad}</span>' if not self.weather_data
+                     else f'<span size="large">Forecast unavailable{pad}</span>')
             row = self._build_weather_row(self.build_forecast_weather_segments(), empty)
             self.weather_box.pack_start(row, True, True, 0)
         else:
             row = self._build_weather_row(
                 self.build_today_weather_segments(),
-                '<span size="large">Weather unavailable</span>')
+                f'<span size="large">Weather unavailable{weather_row_pad(self.weather_box)}</span>')
             self.weather_box.pack_start(row, True, True, 0)
 
             fwd_btn = Gtk.Button(label='›')
