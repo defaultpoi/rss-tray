@@ -1146,7 +1146,8 @@ def fetch_weather():
 
 
 def weather_code_glyph(code):
-    """Maps a WMO weather_code to a plain (non-color-emoji) Unicode glyph.
+    """Maps a WMO weather_code to a Unicode glyph (the caller picks text or
+    emoji presentation).
     Returns None for codes without a good simple symbol (e.g. fog), so the
     icon is just omitted rather than showing something misleading."""
     if code is None:
@@ -1580,11 +1581,15 @@ class RssTray:
             if glyph:
                 glyph_color_name = seg_colors.get('glyph')
                 if glyph_color_name:
+                    # an active alert recolors the glyph, which only works on
+                    # the monochrome (text-presentation) form
                     bright, dim = ALERT_TEXT_COLORS[glyph_color_name]
                     glyph_color = bright if self._pulse_on_for(glyph_color_name) else dim
+                    temp_text = f'<span foreground="{glyph_color}">{glyph}</span> ' + temp_text
                 else:
-                    glyph_color = '#2b2b2b'
-                temp_text = f'<span foreground="{glyph_color}">{glyph}</span> ' + temp_text
+                    # U+FE0F = emoji presentation, so the glyph renders as
+                    # a color emoji like the forecast's umbrella does
+                    temp_text = f'{glyph}\ufe0f ' + temp_text
             segments.append(f'<span size="large"><b>{temp_text}</b></span>')
         if d.get('today_max_temp') is not None and d.get('today_min_temp') is not None:
             hi_lo = colorize(GLib.markup_escape_text(
@@ -1615,6 +1620,7 @@ class RssTray:
         they look identical."""
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         row.set_hexpand(True)
+        row.set_valign(Gtk.Align.CENTER)
         if not segments:
             segments, separate = [empty_markup], False
         else:
@@ -1623,13 +1629,13 @@ class RssTray:
             if separate and n > 0:
                 bullet = Gtk.Label()
                 bullet.set_markup(WEATHER_BULLET_MARKUP)
-                bullet.set_valign(Gtk.Align.END)
+                bullet.set_valign(Gtk.Align.CENTER)
                 row.pack_start(bullet, False, False, 0)
             lbl = Gtk.Label()
             lbl.set_markup(seg)
             lbl.set_hexpand(True)
             lbl.set_xalign(0.5)
-            lbl.set_valign(Gtk.Align.END)
+            lbl.set_valign(Gtk.Align.CENTER)
             row.pack_start(lbl, True, True, 0)
         return row
 
