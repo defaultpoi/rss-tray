@@ -374,6 +374,35 @@ class TestGlyphRise(unittest.TestCase):
         self.assertIn('rise="', seg)
 
 
+class TestRiseSpacer(unittest.TestCase):
+    def test_spacer_markup(self):
+        self.assertEqual(rt.rise_spacer_markup(0), '')
+        m = rt.rise_spacer_markup(700)
+        self.assertIn('rise="700"', m)
+        self.assertIn('\u200b', m)
+
+    def _segments(self, code):
+        class Stub(TestTodayGlyph.Stub):
+            def __init__(self):
+                super().__init__()
+                self.weather_data = {
+                    'temp': 12.0, 'weather_code': code, 'today_max_temp': 15.0,
+                    'today_min_temp': 4.0, 'wind': 10.0, 'today_max_wind': 20.0,
+                    'today_rain_prob': 30.0, 'today_precip_sum': 1.2}
+        with mock.patch.object(rt.GLib, 'markup_escape_text', side_effect=lambda x: x):
+            return Stub().build_today_weather_segments()
+
+    def test_all_values_share_the_raise_when_cloud_is_shown(self):
+        segs = self._segments(3)
+        self.assertEqual(len(segs), 4)
+        for seg in segs:
+            self.assertIn('rise="', seg)
+
+    def test_no_spacers_when_glyph_needs_no_raise(self):
+        for seg in self._segments(71):
+            self.assertNotIn('rise=', seg)
+
+
 class TestMonoGlyph(unittest.TestCase):
     def test_markup(self):
         m = rt.mono_glyph_markup('\u2614')
