@@ -336,15 +336,33 @@ class TestTodayGlyph(unittest.TestCase):
         with mock.patch.object(rt.GLib, 'markup_escape_text', side_effect=lambda x: x):
             return stub.build_today_weather_segments()[0]
 
-    def test_glyph_uses_emoji_presentation_without_alert(self):
+    def test_glyph_is_monochrome_dark_without_alert(self):
         seg = self._first(self.Stub())
-        self.assertIn('\u2744\ufe0f ', seg)
-        self.assertNotIn('foreground', seg)
-
-    def test_alert_on_glyph_uses_colored_text_presentation(self):
-        seg = self._first(self.Stub({'glyph': 'red'}))
-        self.assertIn('foreground', seg)
+        self.assertIn('foreground="#2b2b2b"', seg)
+        self.assertIn('\u2744\ufe0e', seg)
         self.assertNotIn('\ufe0f', seg)
+
+    def test_alert_on_glyph_uses_alert_color(self):
+        seg = self._first(self.Stub({'glyph': 'red'}))
+        self.assertTrue('#cc0000' in seg or '#7a1414' in seg)
+        self.assertIn('\ufe0e', seg)
+        self.assertNotIn('\ufe0f', seg)
+
+
+class TestMonoGlyph(unittest.TestCase):
+    def test_markup(self):
+        m = rt.mono_glyph_markup('\u2614')
+        self.assertIn('\u2614\ufe0e', m)
+        self.assertIn('foreground="#2b2b2b"', m)
+        self.assertIn('font_family=', m)
+
+    def test_forecast_umbrella_is_monochrome(self):
+        class Stub:
+            build_forecast_weather_segments = rt.RssTray.build_forecast_weather_segments
+            weather_data = {'forecast_days': [{'max_temp': 5.0, 'min_temp': 1.0, 'rain_prob': 50}]}
+        with mock.patch.object(rt.GLib, 'markup_escape_text', side_effect=lambda x: x):
+            seg = Stub().build_forecast_weather_segments()[0]
+        self.assertIn('\u2614\ufe0e', seg)
 
 
 class TestWeatherSettings(TmpConfigCase):
