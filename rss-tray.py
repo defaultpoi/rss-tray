@@ -1168,11 +1168,34 @@ def weather_code_glyph(code):
 WEATHER_GLYPH_COLOR = '#2b2b2b'
 
 
-def mono_glyph_markup(glyph, color=WEATHER_GLYPH_COLOR):
+# DejaVu Sans' cloud is small and sits low (its top is ~0.36em above the
+# baseline, vs ~0.74em for the digits and the sun/snow/bolt glyphs), so it's
+# lifted by this many em to line up with the others.
+GLYPH_RISE_EM = {'\u2601': 0.38}
+
+
+def glyph_rise_units(glyph, widget=None):
+    """Pango `rise` (1/1024 pt) that top-aligns `glyph`, or 0 if it needs none.
+    The glyph's span is size="large" (1.2x), so the base font size of
+    `widget` (10pt if unknown) is scaled accordingly."""
+    em = GLYPH_RISE_EM.get(glyph)
+    if not em:
+        return 0
+    size = 10 * 1024
+    try:
+        size = widget.get_pango_context().get_font_description().get_size() or size
+    except Exception:
+        pass
+    return int(em * 1.2 * size)
+
+
+def mono_glyph_markup(glyph, color=WEATHER_GLYPH_COLOR, rise=0):
     """Weather glyph forced to the monochrome text form (U+FE0E variation
     selector + a text font), so it's drawn in `color` and stays readable on
     the light weather bar instead of becoming a pale color emoji."""
-    return f'<span foreground="{color}" font_family="DejaVu Sans">{glyph}\ufe0e</span>'
+    rise_attr = f' rise="{rise}"' if rise else ''
+    return (f'<span foreground="{color}" font_family="DejaVu Sans"{rise_attr}>'
+            f'{glyph}\ufe0e</span>')
 
 
 def format_timer_duration(total_seconds):
@@ -1595,7 +1618,8 @@ class RssTray:
                     glyph_color = bright if self._pulse_on_for(glyph_color_name) else dim
                 else:
                     glyph_color = WEATHER_GLYPH_COLOR
-                temp_text = mono_glyph_markup(glyph, glyph_color) + ' ' + temp_text
+                rise = glyph_rise_units(glyph, getattr(self, 'weather_box', None))
+                temp_text = mono_glyph_markup(glyph, glyph_color, rise) + ' ' + temp_text
             segments.append(f'<span size="large"><b>{temp_text}</b></span>')
         if d.get('today_max_temp') is not None and d.get('today_min_temp') is not None:
             hi_lo = colorize(GLib.markup_escape_text(
