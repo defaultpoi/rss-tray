@@ -51,9 +51,6 @@ NOTIFICATION_SOUND_CANDIDATES = [
     os.path.join(CONFIG_DIR, 'notification.wav'),  # QuiteRSS's notification sound, if present
     '/usr/share/sounds/alsa/Front_Center.wav',      # fallback if the above is missing
 ]
-DEFAULT_WEATHER_LATITUDE = 10.0
-DEFAULT_WEATHER_LONGITUDE = 20.0
-
 
 def build_weather_api_url(lat, lon):
     return (
@@ -65,8 +62,8 @@ def build_weather_api_url(lat, lon):
         "&forecast_days=6&timezone=auto"
     )
 WEATHER_REFRESH_SECONDS = 1800  # 30 minutes
-ALERTS_REGION_REFRESH_SECONDS = 7 * 24 * 3600  # re-resolve county from lat/lon weekly
-METEOALARM_Exampleland_ATOM_URL = "https://feeds.meteoalarm.org/feeds/meteoalarm-legacy-atom-Exampleland"
+ALERTS_REGION_REFRESH_SECONDS = 7 * 24 * 3600  # re-resolve country/region from lat/lon weekly
+METEOALARM_FEED_URL_TEMPLATE = "https://feeds.meteoalarm.org/feeds/meteoalarm-legacy-atom-{country}"
 NOMINATIM_REVERSE_URL = "https://nominatim.openstreetmap.org/reverse"
 ALERT_PULSE_INTERVAL_MS = 600
 TWITCH_GQL_URL = "https://gql.twitch.tv/gql"
@@ -110,16 +107,17 @@ def ensure_config():
             "\n"
             "[weather]\n"
             "# Coordinates for the weather bar: lat|lon (one line, decimal degrees).\n"
-            "# Uses Open-Meteo, no account/key needed. Falls back to the built-in\n"
-            "# default below if this section or line is missing/unparsable.\n"
-            f"# {DEFAULT_WEATHER_LATITUDE}|{DEFAULT_WEATHER_LONGITUDE}\n"
+            "# Uses Open-Meteo, no account/key needed. The weather bar stays hidden\n"
+            "# until this line is set, e.g.:\n"
+            "# <latitude>|<longitude>\n"
             "#\n"
-            "# alerts=true enables MeteoAlarm severe-weather alerts for the county\n"
-            "# matching the coordinates above (reverse-geocoded automatically via\n"
-            "# OpenStreetMap, re-checked weekly). When an alert is active, the\n"
-            "# matching weather value pulses red and the tray badge pulses red.\n"
-            "# Exampleland only. The app writes region=/region_updated= back into this\n"
-            "# section itself once resolved -- leave those two alone.\n"
+            "# alerts=true enables MeteoAlarm severe-weather alerts (European\n"
+            "# countries covered by MeteoAlarm) for the country/region matching the\n"
+            "# coordinates above (reverse-geocoded automatically via OpenStreetMap,\n"
+            "# re-checked weekly). When an alert is active, the matching weather\n"
+            "# value and the tray badge pulse in the alert's color.\n"
+            "# The app writes country=/region=/region_updated= back into this\n"
+            "# section itself once resolved -- leave those alone.\n"
             "alerts=false\n"
         )
 
@@ -289,15 +287,17 @@ def load_youtube_qualities():
 
 
 def load_weather_settings():
-    """Returns {'lat', 'lon', 'alerts_enabled', 'region', 'region_updated'}
-    from config.conf's [weather] section. The coordinates line has no '='
-    ('lat|lon'); everything else is a 'key=value' line. 'region' and
-    'region_updated' are written back automatically by the app itself
+    """Returns {'lat', 'lon', 'alerts_enabled', 'country', 'region',
+    'region_updated'} from config.conf's [weather] section. lat/lon are None
+    until a coordinates line is configured. The coordinates line has no '='
+    ('lat|lon'); everything else is a 'key=value' line. 'country', 'region'
+    and 'region_updated' are written back automatically by the app itself
     (see _update_weather_region_cache) once alerts are enabled and the
-    county has been resolved from the coordinates -- not meant to be
+    location has been resolved from the coordinates -- not meant to be
     hand-edited, though nothing breaks if they're missing or wrong."""
-    lat, lon = DEFAULT_WEATHER_LATITUDE, DEFAULT_WEATHER_LONGITUDE
+    lat = lon = None
     alerts_enabled = False
+    country = None
     region = None
     region_updated = 0.0
     for line in _read_config_sections()['weather']:
@@ -307,6 +307,8 @@ def load_weather_settings():
             val = val.strip()
             if key == 'alerts':
                 alerts_enabled = val.lower() in ('1', 'true', 'yes', 'on')
+            elif key == 'country':
+                country = val or None
             elif key == 'region':
                 region = val or None
             elif key == 'region_updated':
@@ -323,22 +325,23 @@ def load_weather_settings():
                     pass
     return {
         'lat': lat, 'lon': lon, 'alerts_enabled': alerts_enabled,
-        'region': region, 'region_updated': region_updated,
+        'country': country, 'region': region, 'region_updated': region_updated,
     }
 
 
 def load_weather_coords():
-    """Back-compat wrapper: just the (lat, lon) from load_weather_settings()."""
+    """Back-compat wrapper: just the (lat, lon) from load_weather_settings();
+    (None, None) if no coordinates are configured."""
     settings = load_weather_settings()
     return settings['lat'], settings['lon']
 
 
-def _update_weather_region_cache(region, timestamp):
-    """Rewrites config.conf in place, setting region=/region_updated= inside
+def _update_weather_region_cache(region, timestamp, country=None):
+    """Rewrites config.conf in place, setting country=/region=/region_updated= inside
     the [weather] section (creating the section at the end of the file if
     it's somehow missing) while leaving every other line -- including
     comments and other sections -- untouched. Best-effort: any error here
-    just means the county gets re-resolved next poll instead of using the
+    just means the location gets re-resolved next poll instead of using the
     weekly cache, so failures are swallowed."""
     try:
         with open(CONFIG_FILE) as f:
@@ -362,10 +365,10 @@ def _update_weather_region_cache(region, timestamp):
 
     kept = [
         l for l in lines[start + 1:end]
-        if not l.strip().lower().startswith('region=')
-        and not l.strip().lower().startswith('region_updated=')
+        if not l.strip().lower().startswith(('country=', 'region=', 'region_updated='))
     ]
-    new_section = kept + [f'region={region}\n', f'region_updated={int(timestamp)}\n']
+    new_section = kept + ([f'country={country}\n'] if country else []) + [
+        f'region={region}\n', f'region_updated={int(timestamp)}\n']
     lines[start + 1:end] = new_section
 
     try:
@@ -377,10 +380,11 @@ def _update_weather_region_cache(region, timestamp):
         pass
 
 
-def reverse_geocode_county(lat, lon):
-    """Best-effort reverse geocode via Nominatim; returns the local county
-    name (e.g. 'Northshire') or None on any failure. Rate-limited by design to
-    once a week (see ALERTS_REGION_REFRESH_SECONDS) by the caller."""
+def reverse_geocode_region(lat, lon):
+    """Best-effort reverse geocode via Nominatim (English names); returns
+    (country, region) -- region being the county, falling back to the state --
+    or None on any failure or if either part is missing. Rate-limited by
+    design to once a week (see ALERTS_REGION_REFRESH_SECONDS) by the caller."""
     url = (
         f"{NOMINATIM_REVERSE_URL}?lat={lat}&lon={lon}"
         "&format=jsonv2&zoom=8&accept-language=en"
@@ -389,9 +393,19 @@ def reverse_geocode_county(lat, lon):
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode('utf-8'))
-        return (data.get('address') or {}).get('county') or None
+        address = data.get('address') or {}
+        country = address.get('country')
+        region = address.get('county') or address.get('state')
+        return (country, region) if country and region else None
     except Exception:
         return None
+
+
+def meteoalarm_feed_url(country):
+    """MeteoAlarm's per-country legacy Atom feed, e.g. 'United Kingdom' ->
+    .../meteoalarm-legacy-atom-united-kingdom."""
+    slug = re.sub(r'[^a-z0-9]+', '-', (country or '').lower()).strip('-')
+    return METEOALARM_FEED_URL_TEMPLATE.format(country=slug)
 
 
 def is_muted(title, mute_phrases):
@@ -947,13 +961,13 @@ def _hazard_to_segment(hazard_text):
 
 
 _METEOALARM_TITLE_RE = re.compile(
-    r'^\s*\S+\s+(.+?)\s+Warning\s+issued\s+for\s+\S+\s*-\s*(.+?)\s*$', re.IGNORECASE
+    r'^\s*\S+\s+(.+?)\s+Warning\s+issued\s+for\s+.+?\s+-\s+(.+?)\s*$', re.IGNORECASE
 )
 
 
 def parse_meteoalarm_title(title):
     """Splits a MeteoAlarm entry title like 'Yellow Wind Warning issued for
-    Exampleland - Eastshire' into (hazard, region). Returns (None, None) if the
+    <country> - <region>' into (hazard, region). Returns (None, None) if the
     title doesn't match the expected shape."""
     m = _METEOALARM_TITLE_RE.match(title or '')
     if not m:
@@ -1001,8 +1015,8 @@ def _parse_meteoalarm_time(value):
         return None
 
 
-def fetch_meteoalarm_alerts(region, now=None):
-    """Fetches Exampleland's MeteoAlarm feed and returns the entries whose area
+def fetch_meteoalarm_alerts(region, country, now=None):
+    """Fetches `country`'s MeteoAlarm feed and returns the entries whose area
     matches `region` (case-insensitive) AND whose time window currently
     covers `now` (defaults to the real current time), as a list of
     {'hazard', 'segment', 'title', 'expires', 'severity_color'} dicts.
@@ -1014,7 +1028,7 @@ def fetch_meteoalarm_alerts(region, now=None):
     presence in the feed alone. Missing or unparsable timestamps err on the
     side of showing the alert rather than hiding a possibly-real one."""
     try:
-        parsed = feedparser.parse(METEOALARM_Exampleland_ATOM_URL)
+        parsed = feedparser.parse(meteoalarm_feed_url(country))
     except Exception:
         return None
     if getattr(parsed, 'bozo', False) and not parsed.entries:
@@ -1051,6 +1065,8 @@ def fetch_meteoalarm_alerts(region, now=None):
 def fetch_weather():
     """Best-effort fetch from Open-Meteo. Returns a dict or None on any failure."""
     lat, lon = load_weather_coords()
+    if lat is None or lon is None:
+        return None  # no coordinates configured: weather bar stays hidden
     url = build_weather_api_url(lat, lon)
     try:
         with urllib.request.urlopen(url, timeout=10) as resp:
@@ -1410,26 +1426,26 @@ class RssTray:
         GLib.idle_add(self._on_weather_fetched, data, alerts)
 
     def _fetch_alerts_bg(self):
-        """Resolves the alert region (from lat/lon, cached weekly in
+        """Resolves the alert country/region (from lat/lon, cached weekly in
         config.conf) and fetches active MeteoAlarm alerts for it. Returns
         None on failure (caller keeps the previous alerts), [] if alerts
         are disabled or the region genuinely has nothing active."""
         settings = load_weather_settings()
-        if not settings['alerts_enabled']:
+        if not settings['alerts_enabled'] or settings['lat'] is None or settings['lon'] is None:
             return []
-        region = settings['region']
+        country, region = settings['country'], settings['region']
         now = time_module.time()
-        if not region or (now - settings['region_updated']) >= ALERTS_REGION_REFRESH_SECONDS:
-            resolved = reverse_geocode_county(settings['lat'], settings['lon'])
+        if not (country and region) or (now - settings['region_updated']) >= ALERTS_REGION_REFRESH_SECONDS:
+            resolved = reverse_geocode_region(settings['lat'], settings['lon'])
             if resolved:
-                region = resolved
-                _update_weather_region_cache(region, now)
-            elif not region:
+                country, region = resolved
+                _update_weather_region_cache(region, now, country=country)
+            elif not (country and region):
                 return None  # never resolved, and this attempt also failed
             # else: geocoding failed but a stale region is cached -- keep
             # using it; region_updated is left untouched so it retries
             # next poll instead of waiting a full week
-        return fetch_meteoalarm_alerts(region)
+        return fetch_meteoalarm_alerts(region, country)
 
     def _on_weather_fetched(self, data, alerts=None):
         if data is not None:
