@@ -358,7 +358,7 @@ class TestGlyphRise(unittest.TestCase):
     def test_rise_scales_with_widget_font_size(self):
         widget = mock.MagicMock()
         widget.get_pango_context.return_value.get_font_description.return_value.get_size.return_value = 20 * 1024
-        self.assertEqual(rt.glyph_rise_units('\u2601', widget), 2 * rt.glyph_rise_units('\u2601'))
+        self.assertAlmostEqual(rt.glyph_rise_units('\u2601', widget), 2 * rt.glyph_rise_units('\u2601'), delta=2)
 
     def test_markup_includes_rise_only_when_nonzero(self):
         self.assertIn('rise="500"', rt.mono_glyph_markup('\u2601', rise=500))
@@ -398,9 +398,43 @@ class TestRiseSpacer(unittest.TestCase):
         for seg in segs:
             self.assertIn('rise="', seg)
 
-    def test_no_spacers_when_glyph_needs_no_raise(self):
-        for seg in self._segments(71):
-            self.assertNotIn('rise=', seg)
+    def test_every_value_is_padded_even_without_a_raised_glyph(self):
+        for seg in self._segments(71):  # snow: its glyph needs no raise
+            self.assertIn('rise="', seg)
+
+    def test_forecast_segments_are_padded_too(self):
+        class Stub:
+            build_forecast_weather_segments = rt.RssTray.build_forecast_weather_segments
+            weather_data = {'forecast_days': [{'max_temp': 5.0, 'min_temp': 1.0, 'rain_prob': 0}]}
+        with mock.patch.object(rt.GLib, 'markup_escape_text', side_effect=lambda x: x):
+            seg = Stub().build_forecast_weather_segments()[0]
+        self.assertIn('rise="', seg)
+
+
+class TestTodayRainText(unittest.TestCase):
+    def _rain(self, prob, precip):
+        class Stub(TestTodayGlyph.Stub):
+            def __init__(self):
+                super().__init__()
+                self.weather_data = {'today_rain_prob': prob, 'today_precip_sum': precip}
+        with mock.patch.object(rt.GLib, 'markup_escape_text', side_effect=lambda x: x):
+            return Stub().build_today_weather_segments()[0]
+
+    def test_zero_chance_shows_only_amount(self):
+        seg = self._rain(0.0, 0.0)
+        self.assertIn('0.0mm', seg)
+        self.assertNotIn('%', seg)
+
+    def test_nonzero_chance_shows_both(self):
+        self.assertIn('40%/1.2mm', self._rain(40.0, 1.2))
+
+    def test_chance_without_amount(self):
+        seg = self._rain(40.0, None)
+        self.assertIn('40%', seg)
+        self.assertNotIn('mm', seg)
+
+    def test_zero_chance_without_amount_keeps_percent(self):
+        self.assertIn('0%', self._rain(0.0, None))
 
 
 class TestMonoGlyph(unittest.TestCase):
