@@ -1553,7 +1553,7 @@ class RssTray:
                     f"{day['max_temp']:.0f}/{day['min_temp']:.0f}°C"
                 )
             if segment:
-                segments.append(f'<span size="medium"><b>{segment}</b></span>')
+                segments.append(f'<span size="large"><b>{segment}</b></span>')
         return segments
 
     def build_today_weather_segments(self):
@@ -1645,8 +1645,8 @@ class RssTray:
             back_btn.connect('clicked', self.on_weather_arrow_clicked, 'today')
             self.weather_box.pack_start(back_btn, False, False, 0)
 
-            empty = ('<span size="medium">Weather unavailable</span>' if not self.weather_data
-                     else '<span size="medium">Forecast unavailable</span>')
+            empty = ('<span size="large">Weather unavailable</span>' if not self.weather_data
+                     else '<span size="large">Forecast unavailable</span>')
             row = self._build_weather_row(self.build_forecast_weather_segments(), empty)
             self.weather_box.pack_start(row, True, True, 0)
         else:
