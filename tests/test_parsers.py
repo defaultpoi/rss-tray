@@ -286,6 +286,39 @@ class TestWeatherCoords(TmpConfigCase):
         urlopen.assert_not_called()
 
 
+class TestForecastSegments(unittest.TestCase):
+    class Stub:
+        build_forecast_weather_segments = rt.RssTray.build_forecast_weather_segments
+
+    def _segments(self, weather_data):
+        s = self.Stub()
+        s.weather_data = weather_data
+        with mock.patch.object(rt.GLib, 'markup_escape_text', side_effect=lambda x: x):
+            return s.build_forecast_weather_segments()
+
+    def test_no_data_or_no_days_is_empty(self):
+        self.assertEqual(self._segments(None), [])
+        self.assertEqual(self._segments({'forecast_days': []}), [])
+
+    def test_one_segment_per_day_with_rain_glyph_only_when_rain_likely(self):
+        segs = self._segments({'forecast_days': [
+            {'max_temp': 21.4, 'min_temp': 9.6, 'rain_prob': 40},
+            {'max_temp': 18.0, 'min_temp': 7.0, 'rain_prob': 0},
+        ]})
+        self.assertEqual(len(segs), 2)
+        self.assertIn('☔', segs[0])
+        self.assertIn('21/10°C', segs[0])
+        self.assertNotIn('☔', segs[1])
+        self.assertIn('18/7°C', segs[1])
+
+    def test_day_without_any_values_is_skipped(self):
+        segs = self._segments({'forecast_days': [
+            {'max_temp': None, 'min_temp': None, 'rain_prob': None},
+            {'max_temp': 5.0, 'min_temp': 1.0, 'rain_prob': None},
+        ]})
+        self.assertEqual(len(segs), 1)
+
+
 class TestWeatherSettings(TmpConfigCase):
     def test_defaults(self):
         s = rt.load_weather_settings()
