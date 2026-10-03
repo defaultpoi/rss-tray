@@ -12,6 +12,7 @@ except Exception:
 import cairo
 import feedparser
 import json
+import math
 import os
 import re
 import shutil
@@ -1289,9 +1290,9 @@ def mono_glyph_markup(glyph, color=WEATHER_GLYPH_COLOR, rise=0):
 
 # The tray icon draws the degree sign as a small stroked ring (a text glyph
 # would be too tiny/blurry at 24px and would eat into the digits' width).
-TEMP_RING_RADIUS = 1.4
-TEMP_RING_LINE_WIDTH = 1.2
-TEMP_RING_GAP = 0.5
+TEMP_RING_RADIUS = 1.0
+TEMP_RING_LINE_WIDTH = 1.0
+TEMP_RING_GAP = 0.4
 TEMP_RING_RESERVE = TEMP_RING_GAP + 2 * TEMP_RING_RADIUS + TEMP_RING_LINE_WIDTH
 
 
@@ -1974,7 +1975,10 @@ class RssTray:
             ctx.show_text(temp_text)
             ctx.set_line_width(TEMP_RING_LINE_WIDTH)
             ctx.new_sub_path()
-            ctx.arc(ring_cx, ring_cy, TEMP_RING_RADIUS, 0, 2 * 3.14159265)
+            # snap the centre to a pixel centre so the tiny ring is drawn
+            # crisp (full-intensity pixels) instead of a blurry grey dot
+            ctx.arc(math.floor(ring_cx) + 0.5, math.floor(ring_cy) + 0.5,
+                    TEMP_RING_RADIUS, 0, 2 * 3.14159265)
             ctx.stroke()
         else:
             worst_alert_color = self._worst_alert_color()
