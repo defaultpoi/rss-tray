@@ -880,17 +880,34 @@ class TestSharedMpv(unittest.TestCase):
             rt._play_in_shared_mpv('twitch.tv/x', 'best', 'Twitch', 'x', 'https://twitch.tv/x')
         wb_open.assert_called_once_with('https://twitch.tv/x')
 
-    def test_new_click_stops_previous_stream(self):
+    def test_new_click_stops_previous_stream_only_after_mpv_took_the_new_one(self):
         old = FakeStreamlinkProc([])
         rt._streamlink_proc = old
         new = FakeStreamlinkProc(['access with one of:\n'])
+        seen = {}
+
+        def load(url, title):
+            seen['old_alive_during_load'] = not old.terminated
+            return True
         with mock.patch.object(rt.subprocess, 'Popen', return_value=new), \
-                mock.patch.object(rt, '_load_in_mpv', return_value=True), \
+                mock.patch.object(rt, '_load_in_mpv', side_effect=load), \
                 mock.patch.object(rt.threading, 'Thread'), \
                 mock.patch.object(rt.threading, 'Timer'):
             rt._play_in_shared_mpv('twitch.tv/y', 'best', 'Twitch', 'y', 'https://twitch.tv/y')
+        self.assertTrue(seen['old_alive_during_load'])  # else mpv would quit at EOF
         self.assertTrue(old.terminated)
         self.assertFalse(new.terminated)
+
+    def test_failed_new_click_leaves_previous_stream_playing(self):
+        old = FakeStreamlinkProc([])
+        rt._streamlink_proc = old
+        new = FakeStreamlinkProc(['no marker\n'])
+        with mock.patch.object(rt.subprocess, 'Popen', return_value=new), \
+                mock.patch.object(rt.webbrowser, 'open'), mock.patch.object(rt, '_log'):
+            rt._play_in_shared_mpv('twitch.tv/y', 'best', 'Twitch', 'y', 'https://twitch.tv/y')
+        self.assertFalse(old.terminated)
+        self.assertTrue(new.terminated)
+        self.assertIs(rt._streamlink_proc, old)
 
     def test_superseded_failure_does_not_open_browser(self):
         def lines():
@@ -1074,6 +1091,31 @@ class TestCheckYoutubeLiveChannels(unittest.TestCase):
         with mock.patch.object(rt.subprocess, 'run', side_effect=run):
             result = rt.check_youtube_live_channels(['bad', 'good'])
         self.assertEqual(result, {})  # good determined not-live; bad simply absent, not a crash
+
+    def test_live_when_streams_present_even_without_title(self):
+        def run(cmd, capture_output, text, timeout):
+            result = mock.MagicMock()
+            result.stdout = json.dumps({'metadata': {'title': None}, 'streams': {'best': {}}})
+            return result
+        with mock.patch.object(rt.subprocess, 'run', side_effect=run), mock.patch.object(rt, '_log'):
+            self.assertEqual(rt.check_youtube_live_channels(['@chan']), {'@chan': '@chan'})
+
+    def test_log_lines_before_json_are_tolerated(self):
+        def run(cmd, capture_output, text, timeout):
+            result = mock.MagicMock()
+            result.stdout = '[cli][info] hello\n' + json.dumps({'metadata': {'title': 'T'}, 'streams': {'best': {}}})
+            return result
+        with mock.patch.object(rt.subprocess, 'run', side_effect=run):
+            self.assertEqual(rt.check_youtube_live_channels(['@chan']), {'@chan': 'T'})
+
+    def test_errors_are_logged(self):
+        def run(cmd, capture_output, text, timeout):
+            result = mock.MagicMock()
+            result.stdout = json.dumps({'error': 'Unable to open URL: 403 Forbidden'})
+            return result
+        with mock.patch.object(rt.subprocess, 'run', side_effect=run), mock.patch.object(rt, '_log') as log:
+            self.assertEqual(rt.check_youtube_live_channels(['@chan']), {})
+        self.assertIn('403 Forbidden', log.call_args[0][0])
 
     def test_unparseable_json_treated_as_this_channel_failed(self):
         def run(cmd, capture_output, text, timeout):
