@@ -13,12 +13,12 @@ A minimal tray-based RSS/Atom reader for Linux, built with Python and GTK3 as a 
 - **Popup list** grouped by feed. Left-click a row to open it and mark it read, right-click a row to mark it read only, click a feed header to mark the whole feed read. The popup auto-opens on new items and closes on focus-out.
 - **Feeds:** per-feed check intervals, custom display names, mute phrases. Items older than 24 h are silently marked seen the first time they are seen.
 - **Weather** (Open-Meteo): today's temperature, high/low, wind and rain, with a 5-day forecast behind the `›` button.
-- **Void package updates:** a system-wide `xbps-install -Mn -u` dry run every hour. Click the "Updates available" header to install everything, one package at a time, with live status.
-- **Twitch:** live channels are polled (every 30 minutes by default, `interval=` in `[twitch]`) through Twitch's unofficial GQL API (no app registration). Rows read `<user> - <category>` (the stream title is the tooltip), and the bullet turns into a play triangle on the channel that's playing. Click a row to play it with `streamlink` and `mpv` at the configured quality (default `best`); the popup closes, and a second click on another channel reuses the same maximized mpv window. If either binary isn't installed, or launching fails, it opens the channel in your browser instead.
-- **YouTube Live:** live channels are polled (every 30 minutes by default, `interval=` in `[youtube]`) via `streamlink --json <channel>/live` per channel -- no API key, and the same extraction path used for actual playback, so the check can't disagree with what clicking the row does. There's no keyless batch API for YouTube, so this is one streamlink call per channel (heavier than Twitch's single batched request). Shares the same "Live now" list, quality config, and browser fallback as Twitch.
+- **Void package updates:** a system-wide `xbps-install -Mn -u` dry run twice a day by default (`interval=<hours>` in `[updates]`). Click the "Updates available" header to install everything, one package at a time, with live status.
+- **Twitch:** live channels are polled (every 15 minutes by default, `interval=` in `[twitch]`; optionally only during per-channel schedules, see below) through Twitch's unofficial GQL API (no app registration). Rows read `<user> - <category>` (the stream title is the tooltip), and the bullet turns into a play triangle on the channel that's playing. Click a row to play it with `streamlink` and `mpv` at the configured quality (default `best`); the popup closes, and a second click on another channel reuses the same maximized mpv window. If either binary isn't installed, or launching fails, it opens the channel in your browser instead.
+- **YouTube Live:** live channels are polled (every 15 minutes by default, `interval=` in `[youtube]`; same per-channel schedules) via `streamlink --json <channel>/live` per channel -- no API key, and the same extraction path used for actual playback, so the check can't disagree with what clicking the row does. There's no keyless batch API for YouTube, so this is one streamlink call per channel (heavier than Twitch's single batched request). Shares the same "Live now" list, quality config, and browser fallback as Twitch.
 - **Player window titles:** mpv's title is `<Site> · <user> · <stream title>` for both platforms.
 - **Timer:** a 0-2 h slider behind the "Timer" footer button. It keeps counting with the popup closed and plays the notification sound twice at zero.
-- **Severe-weather alerts** (optional, `alerts=true` in `[weather]`): polls the MeteoAlarm feed for your country every 30 minutes, filtered to the region matching the configured coordinates (country and region are reverse-geocoded via OpenStreetMap and re-checked weekly; Europe only, since MeteoAlarm only covers European countries; if your coordinates resolve to a country it doesn't cover, the app writes `alerts=false` into `config.conf` itself). An active alert is color-coded by severity (yellow/orange/red for moderate/severe/extreme) and pulses the matching weather value and the tray badge, faster for more severe alerts.
+- **Severe-weather alerts** (optional, `alerts=true` in `[weather]`): polls the MeteoAlarm feed for your country every 30 minutes, filtered to the region matching the configured coordinates (country and region are reverse-geocoded via OpenStreetMap once and then stored in `config.conf`; delete the `country=`/`region=` lines to resolve them again; Europe only, since MeteoAlarm only covers European countries; if your coordinates resolve to a country it doesn't cover, the app writes `alerts=false` into `config.conf` itself). An active alert is color-coded by severity (yellow/orange/red for moderate/severe/extreme) and pulses the matching weather value and the tray badge, faster for more severe alerts.
 
 ## Requirements
 
@@ -72,21 +72,23 @@ https://example.com/feed.xml|My Blog|5
 sponsored
 
 [twitch]
-# one channel name per line; optionally |quality (streamlink format, e.g.
-# 720p60, 1080p60) -- defaults to "best" if omitted.
-# interval=<minutes> sets how often to check for live channels (default 30,
+# one channel name per line: channel|quality|schedule  (quality and schedule
+# optional; quality is a streamlink format such as 720p60, default "best")
+# interval=<minutes> sets how often to check for live channels (default 15,
 # minimum 1).
-interval=30
+interval=15
 somechannel
 somechannel2|720p60
+weeklychannel||wed 18:00-23:00
+dailychannel|720p60|tue-sun 13:00-; sat 10:00-12:00
 
 [youtube]
 # one channel identifier per line -- whatever goes after youtube.com/, so
 # either @handle or channel/UCxxxxxxxxxxxxxxxxxxxxxx (case-sensitive,
-# unlike Twitch names). Optionally |quality, same as [twitch].
-# interval=<minutes> between live checks (default 30, minimum 5 -- each
+# unlike Twitch names). Optionally |quality|schedule, same as [twitch].
+# interval=<minutes> between live checks (default 15, minimum 5 -- each
 # channel costs a full streamlink run).
-interval=30
+interval=15
 @somehandle
 channel/UCxxxxxxxxxxxxxxxxxxxxxx|720p60
 
@@ -96,12 +98,26 @@ channel/UCxxxxxxxxxxxxxxxxxxxxxx|720p60
 <latitude>|<longitude>
 alerts=true
 
+[updates]
+# interval=<hours> between package update scans (default 12, minimum 1)
+interval=12
+
 [timer]
 # max=<minutes> caps the slider (default 120); step=<seconds> sets the
 # arrow-key/scroll increment (default 60). Both optional.
 max=120
 step=60
 ```
+
+### Channel schedules
+
+A schedule limits live checks to the times a channel is expected to stream, so you aren't polling it around the clock. It is the third `|` field of a channel line (leave the quality empty to skip it: `channel||wed 18:00-23:00`).
+
+- A schedule is one or more windows separated by `;`, each `[days] HH:MM[-HH:MM]` (`:` or `.` between hours and minutes).
+- Days: `mon`...`sun` (or full names), ranges such as `tue-sun` (they may wrap, `fri-mon`), lists such as `mon,wed,fri`, `daily`, `weekdays`, `weekends`. Leave the days out for every day; leave the time out for the whole day.
+- No end time means until midnight. An end earlier than the start runs past midnight into the next day (`fri 22:00-02:00`).
+- Times are the system's local time (DST included). The app reads the clock itself, so no NTP service or other dependency is needed, though keeping the clock correct (chrony or similar) obviously helps.
+- Inside a window the channel is checked at the normal `interval=`, and once right when the window opens. A channel that is live when its window ends keeps being checked until it goes offline. An unreadable schedule is ignored (the channel is then checked all the time).
 
 ## Passwordless updates (optional)
 
@@ -124,7 +140,7 @@ The `zz-` prefix matters: sudoers uses the last matching rule, so this file must
 - The popup is a borderless `Gtk.Window` that is destroyed and rebuilt on every open. This avoids stuck-size bugs; do not make it persistent or call `resize()` on it.
 - Package updates are system-wide rather than feed-based, because GitHub's atom feed is a sliding window and version bumps get missed.
 - Threading: `lock` guards state, `_check_lock` RSS cycles, `_xbps_lock` xbps scans and installs, `_twitch_lock`/`_youtube_lock` their respective live-channel checks. All GTK mutations from threads go through `GLib.idle_add`.
-- A failed xbps scan or Twitch request keeps the previous state; failed scans back off exponentially up to the normal hourly interval.
+- A failed xbps scan or Twitch request keeps the previous state; failed scans back off exponentially up to the normal update interval.
 - The install timeout kills the whole process group (`sudo` and the `xbps-install` it forked).
 
 ## Known limitations
