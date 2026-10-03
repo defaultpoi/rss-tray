@@ -574,6 +574,29 @@ class TestDebugLogging(unittest.TestCase):
         self.assertIn('hello', p.call_args[0][0])
 
 
+class TestPopupCss(unittest.TestCase):
+    def _rules(self):
+        rules = {}
+        for block in rt.POPUP_CSS.split('}'):
+            if '{' in block:
+                selectors, body = block.split('{', 1)
+                for sel in selectors.split(','):
+                    rules.setdefault(sel.strip(), []).append(body.strip())
+        return rules
+
+    def test_list_area_background_uses_the_shorthand_that_resets_theme_images(self):
+        rules = self._rules()
+        for selector in ('list', 'viewport', 'scrolledwindow', 'overlay', '.weather-bar', '.timer-bar'):
+            self.assertTrue(any('background:' in body for body in rules[selector]), selector)
+
+    def test_no_plain_background_color_left_on_those_widgets(self):
+        self.assertNotIn('background-color', rt.POPUP_CSS)
+
+    def test_list_text_is_forced_dark(self):
+        rules = self._rules()
+        self.assertTrue(any('color: #000000' in b for b in rules['list label']))
+
+
 class TestMonoGlyph(unittest.TestCase):
     def test_markup(self):
         m = rt.mono_glyph_markup('\u2614')
