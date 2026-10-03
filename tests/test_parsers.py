@@ -225,12 +225,25 @@ class TestTwitchLive(unittest.TestCase):
 
     def test_live_offline_and_missing_user(self):
         payload = [
-            {'data': {'user': {'stream': {'type': 'live', 'title': 'hi'}}}},
+            {'data': {'user': {'stream': {'type': 'live', 'title': 'hi', 'game': {'name': 'Chess'}}}}},
             {'data': {'user': {'stream': None}}},
             {'data': {'user': None}},
         ]
         with mock.patch.object(rt.urllib.request, 'urlopen', return_value=self._resp(payload)):
-            self.assertEqual(rt.check_twitch_live_channels(['a', 'b', 'c']), {'a': 'hi'})
+            self.assertEqual(rt.check_twitch_live_channels(['a', 'b', 'c']),
+                             {'a': {'title': 'hi', 'category': 'Chess'}})
+
+    def test_live_without_game_has_empty_category(self):
+        payload = [{'data': {'user': {'stream': {'type': 'live', 'title': 'hi', 'game': None}}}}]
+        with mock.patch.object(rt.urllib.request, 'urlopen', return_value=self._resp(payload)):
+            self.assertEqual(rt.check_twitch_live_channels(['a']),
+                             {'a': {'title': 'hi', 'category': ''}})
+
+    def test_query_requests_the_game_name(self):
+        with mock.patch.object(rt.urllib.request, 'urlopen',
+                               return_value=self._resp([{'data': {'user': None}}])) as urlopen:
+            rt.check_twitch_live_channels(['a'])
+        self.assertIn('game { name }', urlopen.call_args[0][0].data.decode())
 
     def test_nobody_live_is_empty_dict_not_none(self):
         payload = [{'data': {'user': {'stream': None}}}]
@@ -435,6 +448,48 @@ class TestTodayRainText(unittest.TestCase):
 
     def test_zero_chance_without_amount_keeps_percent(self):
         self.assertIn('0%', self._rain(0.0, None))
+
+
+class TestLiveRowHelpers(unittest.TestCase):
+    def setUp(self):
+        self.addCleanup(setattr, rt, '_playing', rt._playing)
+
+    def test_window_title_is_bullet_separated_and_skips_empties(self):
+        self.assertEqual(rt.stream_window_title('Twitch', 'user', 'My title'), 'Twitch \u00b7 user \u00b7 My title')
+        self.assertEqual(rt.stream_window_title('YouTube', 'user', None), 'YouTube \u00b7 user')
+        self.assertEqual(rt.stream_window_title('YouTube', 'user', ''), 'YouTube \u00b7 user')
+
+    def test_marker_is_dot_or_text_form_triangle(self):
+        self.assertIn('\u25cf', rt.live_marker_markup('#123456', False))
+        playing = rt.live_marker_markup('#123456', True)
+        self.assertIn('\u25b6\ufe0e', playing)
+        self.assertNotIn('\u25cf', playing)
+        self.assertIn('#123456', playing)
+
+    def test_is_stream_playing_tracks_site_channel_and_process(self):
+        proc = FakeStreamlinkProc([])
+        rt._playing = (proc, 'Twitch', 'chan')
+        self.assertTrue(rt.is_stream_playing('Twitch', 'chan'))
+        self.assertFalse(rt.is_stream_playing('YouTube', 'chan'))
+        self.assertFalse(rt.is_stream_playing('Twitch', 'other'))
+        proc.terminated = True  # streamlink exited -> no longer playing
+        self.assertFalse(rt.is_stream_playing('Twitch', 'chan'))
+
+    def test_nothing_playing(self):
+        rt._playing = None
+        self.assertFalse(rt.is_stream_playing('Twitch', 'chan'))
+
+    def test_playing_is_recorded_after_successful_load_with_bullet_title(self):
+        rt._streamlink_proc = None
+        proc = FakeStreamlinkProc(['access with one of:\n'])
+        titles = []
+        with mock.patch.object(rt.subprocess, 'Popen', return_value=proc), \
+                mock.patch.object(rt, '_load_in_mpv', side_effect=lambda u, t: titles.append(t) or True), \
+                mock.patch.object(rt.threading, 'Thread'), mock.patch.object(rt.threading, 'Timer'):
+            rt._play_in_shared_mpv('twitch.tv/x', 'best', 'Twitch', 'x', 'https://twitch.tv/x', 'Stream title')
+        self.assertEqual(titles, ['Twitch \u00b7 x \u00b7 Stream title'])
+        self.assertTrue(rt.is_stream_playing('Twitch', 'x'))
+        rt._streamlink_proc = None
 
 
 class TestMonoGlyph(unittest.TestCase):
@@ -783,7 +838,7 @@ class TestOpenLiveStream(unittest.TestCase):
         thread.assert_called_once()
         self.assertIs(thread.call_args.kwargs['target'], rt._play_in_shared_mpv)
         self.assertEqual(thread.call_args.kwargs['args'], (
-            'twitch.tv/somechan', '720p60', 'Twitch', 'somechan', 'https://twitch.tv/somechan'))
+            'twitch.tv/somechan', '720p60', 'Twitch', 'somechan', 'https://twitch.tv/somechan', None))
         thread.return_value.start.assert_called_once()
         wb_open.assert_not_called()
 
@@ -813,7 +868,7 @@ class TestOpenLiveStream(unittest.TestCase):
             rt.open_youtube_stream('@somehandle', '720p60')
         self.assertEqual(thread.call_args.kwargs['args'], (
             'https://www.youtube.com/@somehandle/live', '720p60', 'YouTube',
-            '@somehandle', 'https://www.youtube.com/@somehandle'))
+            '@somehandle', 'https://www.youtube.com/@somehandle', None))
         wb_open.assert_not_called()
 
     def test_youtube_falls_back_to_channel_page_when_mpv_missing(self):
@@ -844,7 +899,7 @@ class TestSharedMpv(unittest.TestCase):
         # streamlink's log goes to stdout or stderr depending on version: merge them
         self.assertIs(popen.call_args.kwargs['stderr'], rt.subprocess.STDOUT)
         self.assertIs(popen.call_args.kwargs['stdout'], rt.subprocess.PIPE)
-        load.assert_called_once_with('http://127.0.0.1:%s/' % args[5], 'Twitch > x')
+        load.assert_called_once_with('http://127.0.0.1:%s/' % args[5], 'Twitch \u00b7 x')
         wb_open.assert_not_called()
         self.assertFalse(proc.terminated)
 
@@ -1059,7 +1114,8 @@ class TestCheckYoutubeLiveChannels(unittest.TestCase):
             result = mock.MagicMock()
             if live_substring in url:
                 result.stdout = json.dumps({'metadata': {'id': 'x', 'author': 'A',
-                                                           'category': 'Gaming', 'title': 'Live now!'}})
+                                                           'category': 'Gaming', 'title': 'Live now!'},
+                                            'streams': {'best': {}}})
             elif offline_substring in url:
                 result.stdout = json.dumps({'error': 'No playable streams found'})
             else:
@@ -1075,7 +1131,7 @@ class TestCheckYoutubeLiveChannels(unittest.TestCase):
     def test_live_and_offline_distinguished(self):
         with mock.patch.object(rt.subprocess, 'run', side_effect=self._fake_run()):
             live = rt.check_youtube_live_channels(['live_channel', 'offline_channel'])
-        self.assertEqual(live, {'live_channel': 'Live now!'})
+        self.assertEqual(live, {'live_channel': {'title': 'Live now!', 'category': 'Gaming'}})
 
     def test_total_failure_returns_none(self):
         with mock.patch.object(rt.subprocess, 'run', side_effect=OSError('no streamlink')):
@@ -1098,7 +1154,8 @@ class TestCheckYoutubeLiveChannels(unittest.TestCase):
             result.stdout = json.dumps({'metadata': {'title': None}, 'streams': {'best': {}}})
             return result
         with mock.patch.object(rt.subprocess, 'run', side_effect=run), mock.patch.object(rt, '_log'):
-            self.assertEqual(rt.check_youtube_live_channels(['@chan']), {'@chan': '@chan'})
+            self.assertEqual(rt.check_youtube_live_channels(['@chan']),
+                             {'@chan': {'title': '', 'category': ''}})
 
     def test_log_lines_before_json_are_tolerated(self):
         def run(cmd, capture_output, text, timeout):
@@ -1106,7 +1163,8 @@ class TestCheckYoutubeLiveChannels(unittest.TestCase):
             result.stdout = '[cli][info] hello\n' + json.dumps({'metadata': {'title': 'T'}, 'streams': {'best': {}}})
             return result
         with mock.patch.object(rt.subprocess, 'run', side_effect=run):
-            self.assertEqual(rt.check_youtube_live_channels(['@chan']), {'@chan': 'T'})
+            self.assertEqual(rt.check_youtube_live_channels(['@chan']),
+                             {'@chan': {'title': 'T', 'category': ''}})
 
     def test_errors_are_logged(self):
         def run(cmd, capture_output, text, timeout):
