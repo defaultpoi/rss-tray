@@ -14,8 +14,8 @@ A minimal tray-based RSS/Atom reader for Linux, built with Python and GTK3 as a 
 - **Feeds:** per-feed check intervals, custom display names, mute phrases. Items older than 24 h are silently marked seen the first time they are seen.
 - **Weather** (Open-Meteo): today's temperature, high/low, wind and rain, with a 5-day forecast behind the `›` button.
 - **Void package updates:** a system-wide `xbps-install -Mn -u` dry run every hour. Click the "Updates available" header to install everything, one package at a time, with live status.
-- **Twitch:** live channels are polled every 30 minutes through Twitch's unofficial GQL API (no app registration). Rows read `<user> - <category>` (the stream title is the tooltip), and the bullet turns into a play triangle on the channel that's playing. Click a row to play it with `streamlink` and `mpv` at the configured quality (default `best`); the popup closes, and a second click on another channel reuses the same maximized mpv window. If either binary isn't installed, or launching fails, it opens the channel in your browser instead.
-- **YouTube Live:** live channels are polled every 30 minutes via `streamlink --json <channel>/live` per channel -- no API key, and the same extraction path used for actual playback, so the check can't disagree with what clicking the row does. There's no keyless batch API for YouTube, so this is one streamlink call per channel (heavier than Twitch's single batched request). Shares the same "Live now" list, quality config, and browser fallback as Twitch.
+- **Twitch:** live channels are polled (every 30 minutes by default, `interval=` in `[twitch]`) through Twitch's unofficial GQL API (no app registration). Rows read `<user> - <category>` (the stream title is the tooltip), and the bullet turns into a play triangle on the channel that's playing. Click a row to play it with `streamlink` and `mpv` at the configured quality (default `best`); the popup closes, and a second click on another channel reuses the same maximized mpv window. If either binary isn't installed, or launching fails, it opens the channel in your browser instead.
+- **YouTube Live:** live channels are polled (every 30 minutes by default, `interval=` in `[youtube]`) via `streamlink --json <channel>/live` per channel -- no API key, and the same extraction path used for actual playback, so the check can't disagree with what clicking the row does. There's no keyless batch API for YouTube, so this is one streamlink call per channel (heavier than Twitch's single batched request). Shares the same "Live now" list, quality config, and browser fallback as Twitch.
 - **Player window titles:** mpv's title is `<Site> · <user> · <stream title>` for both platforms.
 - **Timer:** a 0-2 h slider behind the "Timer" footer button. It keeps counting with the popup closed and plays the notification sound twice at zero.
 - **Severe-weather alerts** (optional, `alerts=true` in `[weather]`): polls the MeteoAlarm feed for your country every 30 minutes, filtered to the region matching the configured coordinates (country and region are reverse-geocoded via OpenStreetMap and re-checked weekly; Europe only, since MeteoAlarm only covers European countries; if your coordinates resolve to a country it doesn't cover, the app writes `alerts=false` into `config.conf` itself). An active alert is color-coded by severity (yellow/orange/red for moderate/severe/extreme) and pulses the matching weather value and the tray badge, faster for more severe alerts.
@@ -73,7 +73,10 @@ sponsored
 
 [twitch]
 # one channel name per line; optionally |quality (streamlink format, e.g.
-# 720p60, 1080p60) -- defaults to "best" if omitted
+# 720p60, 1080p60) -- defaults to "best" if omitted.
+# interval=<minutes> sets how often to check for live channels (default 30,
+# minimum 1).
+interval=30
 somechannel
 somechannel2|720p60
 
@@ -81,6 +84,9 @@ somechannel2|720p60
 # one channel identifier per line -- whatever goes after youtube.com/, so
 # either @handle or channel/UCxxxxxxxxxxxxxxxxxxxxxx (case-sensitive,
 # unlike Twitch names). Optionally |quality, same as [twitch].
+# interval=<minutes> between live checks (default 30, minimum 5 -- each
+# channel costs a full streamlink run).
+interval=30
 @somehandle
 channel/UCxxxxxxxxxxxxxxxxxxxxxx|720p60
 
