@@ -3,7 +3,7 @@
 and Twitch live-channel notifications."""
 import gi
 gi.require_version('Gtk', '3.0')
-from gi.repository import Gtk, GLib, Gdk, Pango
+from gi.repository import Gtk, GLib, Gdk, Gio, Pango
 try:
     gi.require_version('Wnck', '3.0')
     from gi.repository import Wnck
@@ -1141,11 +1141,21 @@ def is_fullscreen_active():
 
 
 def edit_file_externally(path):
+    """Opens `path` in the user's default application for its type -- the one
+    set in the desktop's settings (e.g. XFCE's Default Applications). Tried in
+    order: GIO (in-process, needs nothing beyond GTK itself), xdg-open, and
+    finally $EDITOR in a terminal."""
     try:
-        subprocess.Popen(['xdg-open', path])
-        return
-    except Exception:
-        pass
+        if Gio.AppInfo.launch_default_for_uri(Gio.File.new_for_path(path).get_uri(), None):
+            return
+    except GLib.Error as e:
+        _log(f'GIO could not open {path}: {e.message}')
+    if shutil.which('xdg-open'):
+        try:
+            subprocess.Popen(['xdg-open', path])
+            return
+        except OSError as e:
+            _log(f'xdg-open failed: {e}')
     editor = os.environ.get('EDITOR', 'vi')
     if shutil.which('xfce4-terminal'):
         subprocess.Popen(['xfce4-terminal', '-e', f'{editor} "{path}"'])
