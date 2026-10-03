@@ -114,6 +114,7 @@ def ensure_config():
             "# Twitch channel login names to watch for live status, one per line.\n"
             "# Uses Twitch's own internal (unofficial) API — no account/app needed.\n"
             "# Clicking a live channel plays it (streamlink + mpv, one shared maximized window).\n"
+            "# interval=<minutes> sets how often to check (default 30, minimum 1).\n"
             "# examplechannel\n"
             "\n"
             "[weather]\n"
@@ -213,11 +214,39 @@ def load_twitch_channels():
     seen = set()
     channels = []
     for line in _read_config_sections()['twitch']:
+        if '=' in line:
+            continue  # a setting (e.g. interval=10), not a channel
         ch = line.split('|', 1)[0].strip().lower()
         if ch and ch not in seen:
             seen.add(ch)
             channels.append(ch)
     return channels
+
+
+MIN_TWITCH_CHECK_MINUTES = 1
+MIN_YOUTUBE_CHECK_MINUTES = 5  # each channel costs a full streamlink run
+
+
+def _load_live_check_interval(section, default_seconds, minimum_minutes):
+    """Seconds between live checks from an 'interval=<minutes>' line in the
+    given section ([twitch] / [youtube]). Missing or unparsable -> default;
+    values below the minimum are raised to it (each check hits the network)."""
+    for line in _read_config_sections()[section]:
+        key, sep, val = line.partition('=')
+        if sep and key.strip().lower() == 'interval':
+            try:
+                return max(minimum_minutes, int(val.split('#', 1)[0].strip())) * 60
+            except ValueError:
+                return default_seconds
+    return default_seconds
+
+
+def load_twitch_check_interval():
+    return _load_live_check_interval('twitch', TWITCH_CHECK_INTERVAL_SECONDS, MIN_TWITCH_CHECK_MINUTES)
+
+
+def load_youtube_check_interval():
+    return _load_live_check_interval('youtube', YOUTUBE_CHECK_INTERVAL_SECONDS, MIN_YOUTUBE_CHECK_MINUTES)
 
 
 DEFAULT_TIMER_MAX_MINUTES = 120
@@ -261,6 +290,8 @@ def load_twitch_qualities():
     absent here; callers should default missing entries to 'best'."""
     qualities = {}
     for line in _read_config_sections()['twitch']:
+        if '=' in line:
+            continue
         parts = [p.strip() for p in line.split('|', 1)]
         if len(parts) == 2 and parts[0] and parts[1]:
             qualities[parts[0].lower()] = parts[1]
@@ -276,6 +307,8 @@ def load_youtube_channels():
     seen = set()
     channels = []
     for line in _read_config_sections()['youtube']:
+        if '=' in line:
+            continue  # a setting (e.g. interval=30), not a channel
         ch = line.split('|', 1)[0].strip()
         key = ch.lower()
         if ch and key not in seen:
@@ -291,6 +324,8 @@ def load_youtube_qualities():
     absent here; callers should default missing entries to 'best'."""
     qualities = {}
     for line in _read_config_sections()['youtube']:
+        if '=' in line:
+            continue
         parts = [p.strip() for p in line.split('|', 1)]
         if len(parts) == 2 and parts[0] and parts[1]:
             qualities[parts[0]] = parts[1]
@@ -1337,9 +1372,9 @@ class RssTray:
         GLib.timeout_add_seconds(WEATHER_REFRESH_SECONDS, self.periodic_weather_check)
         GLib.timeout_add(ALERT_PULSE_INTERVAL_MS, self._alert_pulse_tick)
         GLib.timeout_add_seconds(3, self.initial_twitch_check)
-        GLib.timeout_add_seconds(TWITCH_CHECK_INTERVAL_SECONDS, self.periodic_twitch_check)
+        GLib.timeout_add_seconds(load_twitch_check_interval(), self.periodic_twitch_check)
         GLib.timeout_add_seconds(4, self.initial_youtube_check)
-        GLib.timeout_add_seconds(YOUTUBE_CHECK_INTERVAL_SECONDS, self.periodic_youtube_check)
+        GLib.timeout_add_seconds(load_youtube_check_interval(), self.periodic_youtube_check)
         GLib.timeout_add_seconds(1, self._timer_tick)
 
     def maybe_auto_show_startup(self):
@@ -1488,7 +1523,10 @@ class RssTray:
 
     def periodic_twitch_check(self):
         self.start_twitch_check()
-        return True
+        # re-arm with the interval currently in config.conf, so edits apply
+        # after the next check without restarting the app
+        GLib.timeout_add_seconds(load_twitch_check_interval(), self.periodic_twitch_check)
+        return False
 
     def start_twitch_check(self):
         if not self._twitch_lock.acquire(blocking=False):
@@ -1530,7 +1568,8 @@ class RssTray:
 
     def periodic_youtube_check(self):
         self.start_youtube_check()
-        return True
+        GLib.timeout_add_seconds(load_youtube_check_interval(), self.periodic_youtube_check)
+        return False
 
     def start_youtube_check(self):
         if not self._youtube_lock.acquire(blocking=False):
