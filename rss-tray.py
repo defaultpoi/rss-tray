@@ -2461,9 +2461,19 @@ class RssTray:
 
     def _run_update_all(self, pkgnames):
         with self._xbps_lock:
+            versions_at_start = {pkg: get_installed_version(pkg) for pkg in pkgnames}
             for pkgname in pkgnames:
-                self._set_status(pkgname, 'Installing…')
                 before = get_installed_version(pkgname)
+                if before != versions_at_start[pkgname]:
+                    # `xbps-install -u <pkg>` also updates <pkg>'s outdated
+                    # dependencies in the same transaction, so a package listed
+                    # later may already have been updated as someone's
+                    # dependency; running xbps again would change nothing and
+                    # wrongly look like a failure.
+                    self._set_status(pkgname, 'Done')
+                    GLib.timeout_add(1200, self._finalize_package_removal, pkgname)
+                    continue
+                self._set_status(pkgname, 'Installing…')
                 cmd = PRIVILEGE_CMD + ['xbps-install', '-Su', '-y', pkgname]
                 returncode = -1
                 watchdog = None
