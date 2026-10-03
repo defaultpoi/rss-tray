@@ -1424,6 +1424,23 @@ def temp_icon_layout(size, text_width, text_height):
     return digits_left, ring_cx, ring_cy
 
 
+# `background:` (the shorthand), not `background-color:`, on everything that
+# makes up the list area: many themes paint a background-image (gradient or
+# solid) on lists/viewports, and that image is drawn over a plain
+# background-color -- the whole news area then turns black/dark with the rows
+# sitting on top of it. The shorthand also resets the image. Text colour is
+# forced too, since a dark theme's light foreground would be invisible on white.
+POPUP_CSS = """
+list row { padding: 1px 3px; min-height: 0px; }
+button { padding: 1px; }
+list, viewport, scrolledwindow, overlay { background: #ffffff; }
+list, list label { color: #000000; }
+.weather-bar { background: #e8eef5; }
+.weather-bar label, .timer-bar label { color: #000000; }
+.timer-bar { background: #ffffff; }
+"""
+
+
 def format_timer_duration(total_seconds):
     h = total_seconds // 3600
     m = (total_seconds % 3600) // 60
@@ -2144,19 +2161,8 @@ class RssTray:
         return Gdk.pixbuf_get_from_surface(surface, 0, 0, size, size)
 
     def _apply_compact_css(self):
-        css = b"""
-        list row { padding: 1px 3px; min-height: 0px; }
-        button { padding: 1px; }
-        list { background-color: #ffffff; }
-        viewport { background-color: #ffffff; }  /* ScrolledWindow auto-wraps
-                                                      the listbox in a GtkViewport,
-                                                      which paints its own
-                                                      background over the list's */
-        .weather-bar { background-color: #e8eef5; }
-        .timer-bar { background-color: #ffffff; }
-        """
         provider = Gtk.CssProvider()
-        provider.load_from_data(css)
+        provider.load_from_data(POPUP_CSS.encode())
         Gtk.StyleContext.add_provider_for_screen(
             Gdk.Screen.get_default(),
             provider,
