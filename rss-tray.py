@@ -608,15 +608,16 @@ def check_twitch_live_channels(channels):
     needed. Undocumented; could break if Twitch changes their internal schema.
     Batches every channel into a single POST request (Twitch's GQL endpoint
     accepts a JSON array of operations) instead of one request per channel.
-    Returns {channel: title} for whichever channels are currently live;
-    a failed/offline channel is simply absent from the result, not marked False."""
+    Returns {channel: {'title', 'category'}} for whichever channels are
+    currently live; a failed/offline channel is simply absent from the
+    result, not marked False."""
     if not channels:
         return {}
     payload = json.dumps([
         {
             "operationName": "StreamMetadata",
             "query": "query StreamMetadata($channelLogin: String!) { "
-                     "user(login: $channelLogin) { stream { type title } } }",
+                     "user(login: $channelLogin) { stream { type title game { name } } } }",
             "variables": {"channelLogin": channel},
         }
         for channel in channels
@@ -645,7 +646,10 @@ def check_twitch_live_channels(channels):
             continue
         stream = user.get('stream')
         if stream and stream.get('type') == 'live':
-            live[channel] = stream.get('title') or ''
+            live[channel] = {
+                'title': stream.get('title') or '',
+                'category': (stream.get('game') or {}).get('name') or '',
+            }
     return live
 
 
@@ -664,6 +668,27 @@ _player_lock = threading.Lock()  # guards _streamlink_proc
 _mpv_lock = threading.Lock()     # serialises "is mpv up? if not, start it"
 _streamlink_proc = None
 _mpv_proc = None
+_playing = None  # (streamlink_proc, site, channel) of the stream mpv is showing
+
+
+def is_stream_playing(site, channel):
+    """True while `channel` on `site` ('Twitch'/'YouTube') is what the shared
+    mpv is playing (its streamlink is still running)."""
+    with _player_lock:
+        playing = _playing
+    return bool(playing and playing[1:] == (site, channel) and playing[0].poll() is None)
+
+
+def live_marker_markup(color, playing):
+    """The colored bullet in front of a live row; a play triangle (forced to
+    its text form, not the emoji one) while that stream is playing."""
+    symbol = '\u25b6\ufe0e' if playing else '\u25cf'
+    return f'<span foreground="{color}"><b>{symbol}</b></span>'
+
+
+def stream_window_title(site, channel, title=None):
+    """mpv window title: site, user and stream title separated by bullets."""
+    return ' \u00b7 '.join(p for p in (site, channel, title) if p)
 
 
 def _log(message):
@@ -774,10 +799,10 @@ def _free_local_port():
         s.close()
 
 
-def _apply_stream_title(proc, url, site):
-    """Replaces the placeholder window title with
-    '<site> > <author> > <category> > <title>' from `streamlink --json`
-    (external-http mode has no {author}/{category} substitution of its own)."""
+def _apply_stream_title(proc, url, site, channel):
+    """Refines the window title with the author's display name and stream title
+    from `streamlink --json` (external-http mode has no {author}/{title}
+    substitution of its own): '<site> \u00b7 <author> \u00b7 <title>'."""
     try:
         result = subprocess.run(['streamlink', '--json', url],
                                 capture_output=True, text=True,
@@ -785,8 +810,7 @@ def _apply_stream_title(proc, url, site):
         meta = json.loads(result.stdout).get('metadata') or {}
     except Exception:
         return
-    parts = [site, meta.get('author'), meta.get('category'), meta.get('title')]
-    title = ' > '.join(p for p in parts if p)
+    title = stream_window_title(site, meta.get('author') or channel, meta.get('title'))
     if meta and _is_current_streamlink(proc):
         _mpv_ipc([['set_property', 'force-media-title', title]])
 
@@ -809,7 +833,7 @@ def _stop_streamlink_when_mpv_exits(proc):
             return
 
 
-def _play_in_shared_mpv(url, quality, site, channel, fallback_url):
+def _play_in_shared_mpv(url, quality, site, channel, fallback_url, title=None):
     """Worker thread: serve the stream via streamlink, load it into the
     shared mpv. Falls back to the browser if anything fails (unless a newer
     click has superseded this one).
@@ -849,7 +873,8 @@ def _play_in_shared_mpv(url, quality, site, channel, fallback_url):
                 break
     finally:
         watchdog.cancel()
-    loaded = ready and _load_in_mpv(f'http://127.0.0.1:{port}/', f'{site} > {channel}')
+    loaded = ready and _load_in_mpv(f'http://127.0.0.1:{port}/',
+                                    stream_window_title(site, channel, title))
     if not loaded:
         superseded = not _is_current_streamlink(proc)
         if not superseded:
@@ -866,23 +891,26 @@ def _play_in_shared_mpv(url, quality, site, channel, fallback_url):
         if not superseded:
             webbrowser.open(fallback_url)
         return
+    global _playing
+    with _player_lock:
+        _playing = (proc, site, channel)
     if previous is not None and previous.poll() is None:
         try:
             previous.terminate()  # mpv has already switched over to the new stream
         except OSError:
             pass
-    threading.Thread(target=_apply_stream_title, args=(proc, url, site), daemon=True).start()
+    threading.Thread(target=_apply_stream_title, args=(proc, url, site, channel), daemon=True).start()
     threading.Thread(target=_stop_streamlink_when_mpv_exits, args=(proc,), daemon=True).start()
     for _line in proc.stdout:  # drain so streamlink never blocks on a full pipe
         pass
 
 
-def _open_live_stream(url, quality, site, channel, fallback_url):
+def _open_live_stream(url, quality, site, channel, fallback_url, title=None):
     if shutil.which('streamlink') and shutil.which('mpv'):
         try:
             threading.Thread(
                 target=_play_in_shared_mpv,
-                args=(url, quality, site, channel, fallback_url),
+                args=(url, quality, site, channel, fallback_url, title),
                 daemon=True).start()
             return
         except Exception:
@@ -890,12 +918,12 @@ def _open_live_stream(url, quality, site, channel, fallback_url):
     webbrowser.open(fallback_url)
 
 
-def open_twitch_stream(channel, quality='best', site='Twitch'):
+def open_twitch_stream(channel, quality='best', site='Twitch', title=None):
     """Plays the stream in the shared, maximized mpv window (see above) if
     streamlink and mpv are installed; falls back to opening the channel in
     the browser otherwise, or if starting playback fails."""
     _open_live_stream(f'twitch.tv/{channel}', quality, site, channel,
-                      f'https://twitch.tv/{channel}')
+                      f'https://twitch.tv/{channel}', title)
 
 
 YOUTUBE_CHECK_INTERVAL_SECONDS = 1800  # how often to poll YouTube live status
@@ -921,10 +949,11 @@ def check_youtube_live_channels(channels):
     check disagreeing with what clicking the row would actually do. No
     keyless YouTube API exists for batch-checking many channels in one
     request, so this is sequential, one streamlink invocation per channel.
-    A channel is live if streamlink found playable streams for it (its title
-    is optional; the channel name is used if streamlink has none).
-    Returns {channel: title} for whichever channels are currently live (a
-    not-live channel is simply absent, same convention as Twitch's check);
+    A channel is live if streamlink found playable streams for it (title and
+    category are optional and may be empty).
+    Returns {channel: {'title', 'category'}} for whichever channels are
+    currently live (a not-live channel is simply absent, same convention as
+    Twitch's check);
     returns None only if every single channel's check failed (e.g.
     streamlink isn't installed) -- an individual channel's request failing
     is treated the same as that channel not being live, and is simply
@@ -949,17 +978,20 @@ def check_youtube_live_channels(channels):
         if parsed.get('error'):
             _log(f"YouTube {channel}: not live ({str(parsed['error'])[:160]})")
         elif parsed.get('streams') or metadata.get('title'):
-            live[channel] = metadata.get('title') or channel
+            live[channel] = {
+                'title': metadata.get('title') or '',
+                'category': metadata.get('category') or '',
+            }
     if not any_success:
         return None  # every channel's check failed (e.g. streamlink missing)
     return live
 
 
-def open_youtube_stream(channel, quality='best'):
+def open_youtube_stream(channel, quality='best', title=None):
     """Same as open_twitch_stream (shared mpv window); falls back to the
     channel's page in the browser."""
     _open_live_stream(f'https://www.youtube.com/{channel}/live', quality,
-                      'YouTube', channel, f'https://www.youtube.com/{channel}')
+                      'YouTube', channel, f'https://www.youtube.com/{channel}', title)
 
 
 def play_notification_sound():
@@ -1477,7 +1509,7 @@ class RssTray:
         with self.lock:
             was_live = {e['channel'] for e in self.state.get('live_channels', [])}
             self.state['live_channels'] = [
-                {'channel': ch, 'title': live_now[ch]} for ch in sorted(live_now)
+                {'channel': ch, **live_now[ch]} for ch in sorted(live_now)
             ]
             save_state(self.state)
         newly_live = set(live_now) - was_live
@@ -1519,7 +1551,7 @@ class RssTray:
         with self.lock:
             was_live = {e['channel'] for e in self.state.get('live_youtube_channels', [])}
             self.state['live_youtube_channels'] = [
-                {'channel': ch, 'title': live_now[ch]} for ch in sorted(live_now)
+                {'channel': ch, **live_now[ch]} for ch in sorted(live_now)
             ]
             save_state(self.state)
         newly_live = set(live_now) - was_live
@@ -2266,15 +2298,18 @@ class RssTray:
         row.add(box)
         return row
 
-    def build_twitch_row(self, entry):
+    def _build_live_row(self, entry, site, color):
+        """Shared by the Twitch and YouTube rows: '<user> - <category>' with
+        the stream title as a tooltip; the leading bullet becomes a play
+        triangle while this channel is what mpv is playing."""
         channel = entry['channel']
         title = entry.get('title') or ''
+        category = entry.get('category') or ''
 
         row = Gtk.ListBoxRow()
         row.set_selectable(False)
         row.set_activatable(True)
-        row.twitch_channel = channel
-        row.twitch_quality = load_twitch_qualities().get(channel, 'best')
+        row.live_title = title
 
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         box.set_margin_start(3)
@@ -2282,88 +2317,37 @@ class RssTray:
         box.set_margin_top(0)
         box.set_margin_bottom(0)
 
-        dot = Gtk.Label()
-        dot.set_markup('<span foreground="#9146FF"><b>●</b></span>')
-        box.pack_start(dot, False, False, 0)
+        marker = Gtk.Label()
+        marker.set_markup(live_marker_markup(color, is_stream_playing(site, channel)))
+        box.pack_start(marker, False, False, 0)
 
-        channel_esc = GLib.markup_escape_text(channel)
-        trimmed = False
-        if title:
-            prefix_len = len(channel) + 3  # " - "
-            available = max(0, MAX_TITLE_LEN - prefix_len)
-            if len(title) > available:
-                cut_len = max(available - 1, 0)
-                shown_title = (title[:cut_len] + '…') if cut_len > 0 else '…'
-                trimmed = True
-            else:
-                shown_title = title
-            title_esc = GLib.markup_escape_text(shown_title)
-            markup = f'<span foreground="#000000"><b>{channel_esc}</b> - {title_esc}</span>'
-        else:
-            markup = f'<span foreground="#000000"><b>{channel_esc}</b></span>'
-
+        markup = f'<b>{GLib.markup_escape_text(channel)}</b>'
+        if category:
+            markup += f' - {GLib.markup_escape_text(category)}'
         label = Gtk.Label()
-        label.set_markup(markup)
+        label.set_markup(f'<span foreground="#000000">{markup}</span>')
         label.set_xalign(0)
         label.set_ellipsize(Pango.EllipsizeMode.END)
         label.set_hexpand(True)
         box.pack_start(label, True, True, 0)
 
-        if trimmed:
+        if title:
             row.set_tooltip_text(title)
             label.set_tooltip_text(title)
 
         row.add(box)
         return row
 
+    def build_twitch_row(self, entry):
+        row = self._build_live_row(entry, 'Twitch', '#9146FF')
+        row.twitch_channel = entry['channel']
+        row.twitch_quality = load_twitch_qualities().get(entry['channel'], 'best')
+        return row
+
     def build_youtube_row(self, entry):
-        channel = entry['channel']
-        title = entry.get('title') or ''
-
-        row = Gtk.ListBoxRow()
-        row.set_selectable(False)
-        row.set_activatable(True)
-        row.youtube_channel = channel
-        row.youtube_quality = load_youtube_qualities().get(channel, 'best')
-
-        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
-        box.set_margin_start(3)
-        box.set_margin_end(3)
-        box.set_margin_top(0)
-        box.set_margin_bottom(0)
-
-        dot = Gtk.Label()
-        dot.set_markup('<span foreground="#FF0000"><b>\u25cf</b></span>')
-        box.pack_start(dot, False, False, 0)
-
-        channel_esc = GLib.markup_escape_text(channel)
-        trimmed = False
-        if title:
-            prefix_len = len(channel) + 3  # " - "
-            available = max(0, MAX_TITLE_LEN - prefix_len)
-            if len(title) > available:
-                cut_len = max(available - 1, 0)
-                shown_title = (title[:cut_len] + '\u2026') if cut_len > 0 else '\u2026'
-                trimmed = True
-            else:
-                shown_title = title
-            title_esc = GLib.markup_escape_text(shown_title)
-            markup = f'<span foreground="#000000"><b>{channel_esc}</b> - {title_esc}</span>'
-        else:
-            markup = f'<span foreground="#000000"><b>{channel_esc}</b></span>'
-
-        label = Gtk.Label()
-        label.set_markup(markup)
-        label.set_xalign(0)
-        label.set_ellipsize(Pango.EllipsizeMode.END)
-        label.set_hexpand(True)
-        box.pack_start(label, True, True, 0)
-
-        if trimmed:
-            row.set_tooltip_text(title)
-            label.set_tooltip_text(title)
-
-        row.add(box)
+        row = self._build_live_row(entry, 'YouTube', '#FF0000')
+        row.youtube_channel = entry['channel']
+        row.youtube_quality = load_youtube_qualities().get(entry['channel'], 'best')
         return row
 
     def build_info_row(self, entry):
@@ -2554,12 +2538,14 @@ class RssTray:
         if hasattr(row, 'twitch_channel'):
             if self.popup:
                 self.popup.hide()
-            open_twitch_stream(row.twitch_channel, getattr(row, 'twitch_quality', 'best'))
+            open_twitch_stream(row.twitch_channel, getattr(row, 'twitch_quality', 'best'),
+                               title=getattr(row, 'live_title', None))
             return
         if hasattr(row, 'youtube_channel'):
             if self.popup:
                 self.popup.hide()
-            open_youtube_stream(row.youtube_channel, getattr(row, 'youtube_quality', 'best'))
+            open_youtube_stream(row.youtube_channel, getattr(row, 'youtube_quality', 'best'),
+                                title=getattr(row, 'live_title', None))
             return
         if not hasattr(row, 'entry_id'):
             return
