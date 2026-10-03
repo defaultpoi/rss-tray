@@ -491,6 +491,58 @@ class TestLiveRowHelpers(unittest.TestCase):
         rt._streamlink_proc = None
 
 
+class TestRunUpdateAll(unittest.TestCase):
+    class Stub:
+        _run_update_all = rt.RssTray._run_update_all
+
+        def __init__(self):
+            self._xbps_lock = rt.threading.Lock()
+            self.statuses = []
+
+        def _set_status(self, pkg, status):
+            self.statuses.append((pkg, status))
+
+        def _finalize_package_removal(self, pkg):
+            pass
+
+        def _end_install(self):
+            pass
+
+    def _run(self, pkgnames, versions, returncode=0):
+        """versions: successive get_installed_version() results, in call order."""
+        stub = self.Stub()
+        proc = mock.MagicMock()
+        proc.stdout = iter([])
+        proc.returncode = returncode
+        with mock.patch.object(rt, 'get_installed_version', side_effect=versions), \
+                mock.patch.object(rt.subprocess, 'Popen', return_value=proc) as popen, \
+                mock.patch.object(rt.threading, 'Timer'), \
+                mock.patch.object(rt, 'PRIVILEGE_CMD', []):
+            stub._run_update_all(pkgnames)
+        return stub, popen
+
+    def test_dependency_updated_by_an_earlier_package_is_done_not_failed(self):
+        # start: mesa v1, libfoo v1 | mesa: before v1, after v2 | libfoo: before v2 (changed by mesa)
+        stub, popen = self._run(['mesa', 'libfoo'], ['v1', 'v1', 'v1', 'v2', 'v2'])
+        self.assertEqual(popen.call_count, 1)  # xbps never ran for libfoo
+        self.assertIn(('mesa', 'Done'), stub.statuses)
+        self.assertIn(('libfoo', 'Done'), stub.statuses)
+        self.assertNotIn(('libfoo', 'Failed'), stub.statuses)
+
+    def test_package_that_really_did_not_update_is_still_failed(self):
+        # held/blocked package: xbps exits 0 but the version never changes
+        stub, popen = self._run(['held'], ['v1', 'v1', 'v1'])
+        self.assertIn(('held', 'Failed'), stub.statuses)
+
+    def test_nonzero_exit_is_failed(self):
+        stub, _ = self._run(['pkg'], ['v1', 'v1', 'v2'], returncode=1)
+        self.assertIn(('pkg', 'Failed'), stub.statuses)
+
+    def test_normal_update_is_done(self):
+        stub, _ = self._run(['pkg'], ['v1', 'v1', 'v2'])
+        self.assertIn(('pkg', 'Done'), stub.statuses)
+
+
 class TestMonoGlyph(unittest.TestCase):
     def test_markup(self):
         m = rt.mono_glyph_markup('\u2614')
