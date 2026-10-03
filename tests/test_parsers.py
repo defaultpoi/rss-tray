@@ -597,6 +597,33 @@ class TestPopupCss(unittest.TestCase):
         self.assertTrue(any('color: #000000' in b for b in rules['list label']))
 
 
+class TestEditFileExternally(unittest.TestCase):
+    def test_default_application_via_gio_is_used_first(self):
+        with mock.patch.object(rt.Gio.AppInfo, 'launch_default_for_uri', return_value=True) as launch, \
+                mock.patch.object(rt.subprocess, 'Popen') as popen:
+            rt.edit_file_externally('/tmp/x.conf')
+        launch.assert_called_once()
+        popen.assert_not_called()
+
+    def test_falls_back_to_xdg_open_when_gio_has_no_handler(self):
+        class FakeGlibError(Exception):
+            message = 'no handler'
+        with mock.patch.object(rt.GLib, 'Error', FakeGlibError), \
+                mock.patch.object(rt.Gio.AppInfo, 'launch_default_for_uri', side_effect=FakeGlibError()), \
+                mock.patch.object(rt.shutil, 'which', side_effect=lambda n: '/usr/bin/xdg-open' if n == 'xdg-open' else None), \
+                mock.patch.object(rt.subprocess, 'Popen') as popen:
+            rt.edit_file_externally('/tmp/x.conf')
+        popen.assert_called_once_with(['xdg-open', '/tmp/x.conf'])
+
+    def test_terminal_editor_is_the_last_resort(self):
+        with mock.patch.object(rt.Gio.AppInfo, 'launch_default_for_uri', return_value=False), \
+                mock.patch.object(rt.shutil, 'which', side_effect=lambda n: '/usr/bin/xfce4-terminal' if n == 'xfce4-terminal' else None), \
+                mock.patch.dict(rt.os.environ, {'EDITOR': 'nvim'}), \
+                mock.patch.object(rt.subprocess, 'Popen') as popen:
+            rt.edit_file_externally('/tmp/x.conf')
+        popen.assert_called_once_with(['xfce4-terminal', '-e', 'nvim "/tmp/x.conf"'])
+
+
 class TestMonoGlyph(unittest.TestCase):
     def test_markup(self):
         m = rt.mono_glyph_markup('\u2614')
