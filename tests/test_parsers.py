@@ -133,14 +133,14 @@ class TestState(TmpConfigCase):
 
 class TestEntryHelpers(unittest.TestCase):
     def test_id_preferred_over_link(self):
-        self.assertEqual(rt.entry_id({'id': 'x', 'link': 'y'}), rt.entry_id({'id': 'x', 'link': 'z'}))
+        self.assertEqual(rt.entry_id({'id': 'x', 'link': 'y'}, 'u'), rt.entry_id({'id': 'x', 'link': 'z'}, 'u'))
 
     def test_link_fallback(self):
-        self.assertEqual(rt.entry_id({'link': 'y'}), rt.entry_id({'link': 'y', 'title': 't'}))
+        self.assertEqual(rt.entry_id({'link': 'y'}, 'u'), rt.entry_id({'link': 'y', 'title': 't'}, 'u'))
 
     def test_title_and_published_fallback(self):
-        a = rt.entry_id({'title': 't', 'published': '1'})
-        b = rt.entry_id({'title': 't', 'published': '2'})
+        a = rt.entry_id({'title': 't', 'published': '1'}, 'u')
+        b = rt.entry_id({'title': 't', 'published': '2'}, 'u')
         self.assertNotEqual(a, b)
         self.assertEqual(len(a), 40)
 
@@ -259,39 +259,38 @@ class TestTwitchLive(unittest.TestCase):
             self.assertIsNone(rt.check_twitch_live_channels(['a']))
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 class TestEntryIdFeedScoping(unittest.TestCase):
     def test_fallback_scoped_by_feed_url(self):
         entry = {'title': 't', 'published': 'd'}
-        a = rt.entry_id(entry, feed_url='https://a')
-        b = rt.entry_id(entry, feed_url='https://b')
-        legacy = rt.entry_id(entry)
+        a = rt.entry_id(entry, 'https://a')
+        b = rt.entry_id(entry, 'https://b')
         self.assertNotEqual(a, b)
-        self.assertNotEqual(a, legacy)
 
     def test_id_or_link_present_ignores_feed_url(self):
         entry = {'id': 'x'}
-        self.assertEqual(rt.entry_id(entry, feed_url='https://a'), rt.entry_id(entry))
+        self.assertEqual(rt.entry_id(entry, 'https://a'), rt.entry_id(entry, 'https://b'))
 
 
 class TestWeatherCoords(TmpConfigCase):
+    @staticmethod
+    def coords():
+        s = rt.load_weather_settings()
+        return s['lat'], s['lon']
+
     def test_no_section_gives_none(self):
-        self.assertEqual(rt.load_weather_coords(), (None, None))
+        self.assertEqual(self.coords(), (None, None))
 
     def test_valid_coords_parsed(self):
         self.conf('[weather]\n40.0|-3.7\n')
-        self.assertEqual(rt.load_weather_coords(), (40.0, -3.7))
+        self.assertEqual(self.coords(), (40.0, -3.7))
 
     def test_garbage_gives_none(self):
         self.conf('[weather]\nnot-a-number|also-not\n')
-        self.assertEqual(rt.load_weather_coords(), (None, None))
+        self.assertEqual(self.coords(), (None, None))
 
     def test_missing_second_field_gives_none(self):
         self.conf('[weather]\n40.0\n')
-        self.assertEqual(rt.load_weather_coords(), (None, None))
+        self.assertEqual(self.coords(), (None, None))
 
     def test_fetch_weather_skips_network_without_coords(self):
         with mock.patch.object(rt.urllib.request, 'urlopen') as urlopen:
@@ -1218,3 +1217,7 @@ class TestCheckYoutubeLiveChannels(unittest.TestCase):
             return result
         with mock.patch.object(rt.subprocess, 'run', side_effect=run):
             self.assertIsNone(rt.check_youtube_live_channels(['a']))
+
+
+if __name__ == '__main__':
+    unittest.main()
