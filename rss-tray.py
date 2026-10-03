@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import socket
+import sys
 import signal
 import subprocess
 import threading
@@ -665,6 +666,10 @@ _streamlink_proc = None
 _mpv_proc = None
 
 
+def _log(message):
+    print(f'rss-tray: {message}', file=sys.stderr, flush=True)
+
+
 def _mpv_ipc(commands, timeout=2.0):
     """Sends mpv JSON-IPC commands (each a list, e.g. ['loadfile', url,
     'replace']) and waits for one reply per command. True only if mpv is
@@ -815,9 +820,12 @@ def _play_in_shared_mpv(url, quality, site, channel, fallback_url):
             ['streamlink', '--player-external-http',
              '--player-external-http-interface', '127.0.0.1',
              '--player-external-http-port', str(port), url, quality],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            # streamlink logs to stdout in some versions and stderr in others;
+            # read both through one pipe
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, errors='replace')
-    except Exception:
+    except Exception as e:
+        _log(f'could not start streamlink: {e}')
         webbrowser.open(fallback_url)
         return
     global _streamlink_proc
@@ -828,15 +836,23 @@ def _play_in_shared_mpv(url, quality, site, channel, fallback_url):
     watchdog = threading.Timer(STREAMLINK_READY_TIMEOUT_SECONDS, proc.kill)
     watchdog.start()
     ready = False
+    recent = []  # last few log lines, for the failure message
     try:
-        for line in proc.stderr:
+        for line in proc.stdout:
+            recent = (recent + [line.strip()])[-4:]
             if 'access with one of' in line:
                 ready = True
                 break
     finally:
         watchdog.cancel()
-    if not ready or not _load_in_mpv(f'http://127.0.0.1:{port}/', f'{site} > {channel}'):
+    loaded = ready and _load_in_mpv(f'http://127.0.0.1:{port}/', f'{site} > {channel}')
+    if not loaded:
         superseded = not _is_current_streamlink(proc)
+        if not superseded:
+            if not ready:
+                _log('streamlink never reported its local server; last output: ' + ' | '.join(recent))
+            else:
+                _log('streamlink is serving, but mpv could not be started or controlled')
         try:
             proc.terminate()
         except OSError:
@@ -846,7 +862,7 @@ def _play_in_shared_mpv(url, quality, site, channel, fallback_url):
         return
     threading.Thread(target=_apply_stream_title, args=(proc, url, site), daemon=True).start()
     threading.Thread(target=_stop_streamlink_when_mpv_exits, args=(proc,), daemon=True).start()
-    for _line in proc.stderr:  # drain so streamlink never blocks on a full pipe
+    for _line in proc.stdout:  # drain so streamlink never blocks on a full pipe
         pass
 
 
