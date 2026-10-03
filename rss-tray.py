@@ -687,7 +687,10 @@ def stream_window_title(site, channel, title=None):
 
 
 def _log(message):
-    print(f'rss-tray: {message}', file=sys.stderr, flush=True)
+    """Diagnostics to stderr, silent unless RSS_TRAY_DEBUG is set (e.g.
+    `RSS_TRAY_DEBUG=1 python3 ~/.local/bin/rss-tray.py`)."""
+    if os.environ.get('RSS_TRAY_DEBUG'):
+        print(f'rss-tray: {message}', file=sys.stderr, flush=True)
 
 
 def _mpv_ipc(commands, timeout=2.0):
@@ -1282,6 +1285,26 @@ def mono_glyph_markup(glyph, color=WEATHER_GLYPH_COLOR, rise=0):
     rise_attr = f' rise="{rise}"' if rise else ''
     return (f'<span foreground="{color}" font_family="DejaVu Sans"{rise_attr}>'
             f'{glyph}\ufe0e</span>')
+
+
+# The tray icon draws the degree sign as a small stroked ring (a text glyph
+# would be too tiny/blurry at 24px and would eat into the digits' width).
+TEMP_RING_RADIUS = 1.4
+TEMP_RING_LINE_WIDTH = 1.2
+TEMP_RING_GAP = 0.5
+TEMP_RING_RESERVE = TEMP_RING_GAP + 2 * TEMP_RING_RADIUS + TEMP_RING_LINE_WIDTH
+
+
+def temp_icon_layout(size, text_width, text_height):
+    """Horizontal start of the digits and centre of the degree ring so that
+    digits + ring are centred together in a `size`-px icon, ring top level
+    with the digits' top. Returns (digits_left, ring_cx, ring_cy)."""
+    total = text_width + TEMP_RING_RESERVE
+    digits_left = (size - total) / 2
+    ring_outer = 2 * TEMP_RING_RADIUS + TEMP_RING_LINE_WIDTH
+    ring_cx = digits_left + text_width + TEMP_RING_GAP + ring_outer / 2
+    ring_cy = max(size / 2 - text_height / 2 + ring_outer / 2, ring_outer / 2)
+    return digits_left, ring_cx, ring_cy
 
 
 def format_timer_duration(total_seconds):
@@ -1933,8 +1956,8 @@ class RssTray:
             # in the popup's weather bar, where space isn't constrained.
             ctx.set_source_rgba(1, 1, 1, 1)
             temp_text = f"{self.weather_data['temp']:.0f}"
-            padding = 2
-            max_width = size - 2 * padding
+            padding = 1
+            max_width = size - 2 * padding - TEMP_RING_RESERVE  # room for the ring
 
             ctx.select_font_face('Sans', cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
             temp_size = 20
@@ -1945,9 +1968,14 @@ class RssTray:
                     break
                 temp_size -= 1
 
-            xb, yb, tw, th, dx, dy = ctx.text_extents(temp_text)
-            ctx.move_to((size - tw) / 2 - xb, size / 2 - th / 2 - yb)
+            xb, yb, tw, th, _dx, _dy = ctx.text_extents(temp_text)
+            digits_left, ring_cx, ring_cy = temp_icon_layout(size, tw, th)
+            ctx.move_to(digits_left - xb, size / 2 - th / 2 - yb)
             ctx.show_text(temp_text)
+            ctx.set_line_width(TEMP_RING_LINE_WIDTH)
+            ctx.new_sub_path()
+            ctx.arc(ring_cx, ring_cy, TEMP_RING_RADIUS, 0, 2 * 3.14159265)
+            ctx.stroke()
         else:
             worst_alert_color = self._worst_alert_color()
             if worst_alert_color:
