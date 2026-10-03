@@ -36,8 +36,8 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, 'config.conf')
 STATE_FILE = os.path.join(CONFIG_DIR, 'state.json')
 CHECK_INTERVAL = 600  # default per-feed interval (seconds) when none is set in config.conf
 SCHEDULER_TICK_SECONDS = 60  # how often we check whether any feed is due
-PENDING_CHECK_INTERVAL_SECONDS = 3600  # how often to check for system-wide package updates
-TWITCH_CHECK_INTERVAL_SECONDS = 1800  # how often to poll Twitch live status
+PENDING_CHECK_INTERVAL_SECONDS = 12 * 3600  # default: twice a day, for system-wide package updates
+TWITCH_CHECK_INTERVAL_SECONDS = 900  # how often to poll Twitch live status
 NETWORK_RETRY_SECONDS = 10  # how often to recheck connectivity if offline at startup
 MAX_LIST_ITEMS = 40
 MAX_TITLE_LEN = 60
@@ -64,7 +64,6 @@ def build_weather_api_url(lat, lon):
         "&forecast_days=6&timezone=auto"
     )
 WEATHER_REFRESH_SECONDS = 1800  # 30 minutes
-ALERTS_REGION_REFRESH_SECONDS = 7 * 24 * 3600  # re-resolve country/region from lat/lon weekly
 METEOALARM_FEED_URL_TEMPLATE = "https://feeds.meteoalarm.org/feeds/meteoalarm-legacy-atom-{country}"
 # ISO 3166-1 alpha-2 codes of the countries MeteoAlarm publishes feeds for.
 # Anywhere else (reverse-geocoded country_code not in here) alerts are
@@ -107,11 +106,25 @@ def ensure_config():
             "# (P)|Fashion week|Another item\n"
             "\n"
             "[twitch]\n"
-            "# Twitch channel login names to watch for live status, one per line.\n"
+            "# Twitch channel login names to watch for live status, one per line:\n"
+            "#   channel|quality (optional)|schedule (optional)\n"
             "# Uses Twitch's own internal (unofficial) API — no account/app needed.\n"
             "# Clicking a live channel plays it (streamlink + mpv, one shared maximized window).\n"
-            "# interval=<minutes> sets how often to check (default 30, minimum 1).\n"
+            "# interval=<minutes> sets how often to check (default 15, minimum 1).\n"
+            "# A schedule limits checking to when the channel is expected to stream\n"
+            "# (system local time): [days] HH:MM[-HH:MM], several separated by ;\n"
+            "# Days: mon..sun, ranges (tue-sun), lists (mon,wed), daily, weekdays,\n"
+            "# weekends; no end time means until midnight. Examples:\n"
             "# examplechannel\n"
+            "# weeklychannel||wed 18:00-23:00\n"
+            "# dailychannel|720p60|tue-sun 13:00-; sat 10:00-12:00\n"
+            "\n"
+            "[youtube]\n"
+            "# Same format as [twitch]; identifiers are @handle or channel/UC... and\n"
+            "# case-sensitive. interval=<minutes>: default 15, minimum 5.\n"
+            "\n"
+            "[updates]\n"
+            "# interval=<hours> between package update scans (default 12, minimum 1).\n"
             "\n"
             "[weather]\n"
             "# Coordinates for the weather bar: lat|lon (one line, decimal degrees).\n"
@@ -121,11 +134,12 @@ def ensure_config():
             "#\n"
             "# alerts=true enables MeteoAlarm severe-weather alerts (European\n"
             "# countries covered by MeteoAlarm) for the country/region matching the\n"
-            "# coordinates above (reverse-geocoded automatically via OpenStreetMap,\n"
-            "# re-checked weekly). When an alert is active, the matching weather\n"
-            "# value and the tray badge pulse in the alert's color.\n"
-            "# The app writes country=/region=/region_updated= back into this\n"
-            "# section itself once resolved -- leave those alone.\n"
+            "# coordinates above (reverse-geocoded automatically via OpenStreetMap).\n"
+            "# When an alert is active, the matching weather value and the tray badge\n"
+            "# pulse in the alert's color.\n"
+            "# The app writes country=/region= back into this section once resolved\n"
+            "# and never looks them up again; delete both lines to resolve afresh\n"
+            "# (e.g. after changing the coordinates).\n"
             "alerts=false\n"
         )
 
@@ -133,7 +147,8 @@ def ensure_config():
 def _read_config_sections():
     """Parses config.conf into {section: [lines]} for the known sections,
     each a list of raw non-comment, non-empty lines under that [section]."""
-    sections = {'feeds': [], 'mute': [], 'twitch': [], 'weather': [], 'timer': [], 'youtube': []}
+    sections = {'feeds': [], 'mute': [], 'twitch': [], 'weather': [], 'timer': [], 'youtube': [],
+                'updates': []}
     current = None
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE) as f:
@@ -177,47 +192,205 @@ def load_mute_filters():
     return phrases
 
 
-def load_twitch_channels():
-    """Returns a list of lowercase Twitch channel login names to watch,
-    de-duplicated while preserving the order they appear in the config.
-    A line may optionally have |quality after the name (see
-    load_twitch_qualities); only the name is used here."""
-    seen = set()
-    channels = []
-    for line in _read_config_sections()['twitch']:
+def _load_live_entries(section, fold_case):
+    """Parses the channel lines of [twitch] / [youtube]:
+    'channel|quality|schedule', the last two optional. Returns
+    [(channel, quality_or_None, schedule_text_or_None)], de-duplicated
+    case-insensitively (first line wins) in config order. Twitch logins are
+    lowercased (fold_case); YouTube identifiers keep the casing as typed."""
+    entries, seen = [], set()
+    for line in _read_config_sections()[section]:
         if '=' in line:
             continue  # a setting (e.g. interval=10), not a channel
-        ch = line.split('|', 1)[0].strip().lower()
-        if ch and ch not in seen:
-            seen.add(ch)
-            channels.append(ch)
-    return channels
+        parts = [p.strip() for p in line.split('|', 2)]
+        channel = parts[0].lower() if fold_case else parts[0]
+        if not channel or channel.lower() in seen:
+            continue
+        seen.add(channel.lower())
+        quality = parts[1] if len(parts) > 1 and parts[1] else None
+        schedule = parts[2] if len(parts) > 2 and parts[2] else None
+        entries.append((channel, quality, schedule))
+    return entries
+
+
+def _entry_schedules(entries):
+    """{channel: windows} for the entries that have a valid schedule; an
+    invalid one is reported (RSS_TRAY_DEBUG) and ignored, i.e. that channel is
+    then checked all the time rather than never."""
+    schedules = {}
+    for channel, _quality, text in entries:
+        if not text:
+            continue
+        try:
+            schedules[channel] = parse_schedule(text)
+        except ValueError as e:
+            _log(f'ignoring schedule for {channel!r}: {e}')
+    return schedules
+
+
+def load_twitch_channels():
+    """Lowercase Twitch login names to watch, in config order."""
+    return [e[0] for e in _load_live_entries('twitch', True)]
+
+
+def load_twitch_qualities():
+    """{channel: quality} for lines with a quality; callers default the rest
+    to 'best'."""
+    return {c: q for c, q, _s in _load_live_entries('twitch', True) if q}
+
+
+def load_twitch_schedules():
+    return _entry_schedules(_load_live_entries('twitch', True))
+
+
+def load_youtube_channels():
+    """YouTube channel identifiers to watch, as typed (case-sensitive), e.g.
+    '@somehandle' or 'channel/UCxxxxxxxxxxxxxxxxxxxxxx'."""
+    return [e[0] for e in _load_live_entries('youtube', False)]
+
+
+def load_youtube_qualities():
+    return {c: q for c, q, _s in _load_live_entries('youtube', False) if q}
+
+
+def load_youtube_schedules():
+    return _entry_schedules(_load_live_entries('youtube', False))
+
+
+# ---- per-channel check schedules -------------------------------------------
+# 'wed 18:00-23:00', 'tue-sun 13:00-', 'mon,wed,fri 20:00-02:00; sat 10:00-12:00'
+_DAY_NAMES = ('monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday')
+_ALL_DAYS = frozenset(range(7))
+_CLOCK_RE = re.compile(r'^(\d{1,2})[:.](\d{2})$')
+
+
+def _day_index(token):
+    """Index (Monday=0) for 'mon'..'sun' or a longer prefix of the full name."""
+    if len(token) >= 3:
+        for index, name in enumerate(_DAY_NAMES):
+            if name.startswith(token):
+                return index
+    raise ValueError(f'unknown day {token!r}')
+
+
+def _parse_days(spec):
+    spec = spec.lower().replace(' ', '')
+    if spec in ('', 'daily', 'everyday', 'every', '*'):
+        return _ALL_DAYS
+    if spec == 'weekdays':
+        return frozenset(range(5))
+    if spec in ('weekend', 'weekends'):
+        return frozenset((5, 6))
+    days = set()
+    for part in spec.split(','):
+        if not part:
+            raise ValueError(f'bad day list {spec!r}')
+        first, dash, last = part.partition('-')
+        start = _day_index(first)
+        end = _day_index(last) if dash else start
+        day = start
+        while True:  # ranges may wrap, e.g. fri-mon
+            days.add(day)
+            if day == end:
+                break
+            day = (day + 1) % 7
+    return frozenset(days)
+
+
+def _parse_clock(text, allow_24=False):
+    m = _CLOCK_RE.match(text.strip())
+    if not m:
+        raise ValueError(f'bad time {text!r}')
+    hours, minutes = int(m.group(1)), int(m.group(2))
+    if minutes > 59 or hours > 24 or (hours == 24 and (minutes or not allow_24)):
+        raise ValueError(f'bad time {text!r}')
+    return hours * 60 + minutes
+
+
+def _parse_window(text):
+    tokens = text.split()
+    if not tokens:
+        raise ValueError('empty window')
+    last = tokens[-1]
+    if re.match(r'^\d', last):
+        days_spec = ''.join(tokens[:-1])
+        start_text, dash, end_text = last.partition('-')
+        start = _parse_clock(start_text)
+        end = _parse_clock(end_text, allow_24=True) if end_text.strip() else 24 * 60
+    else:  # days only: the whole day
+        days_spec, start, end = ''.join(tokens), 0, 24 * 60
+    return _parse_days(days_spec), start, end
+
+
+def parse_schedule(text):
+    """Parses 'WINDOW; WINDOW; ...' into [(days, start_minute, end_minute)];
+    each WINDOW is '[days] HH:MM[-HH:MM]' (':' or '.' as the separator). Days:
+    mon..sun (or full names), ranges like tue-sun, lists like mon,wed, daily,
+    weekdays, weekends -- omitted means every day. No end time = until the end
+    of that day; an end earlier than the start runs past midnight into the
+    next day. Raises ValueError on anything it can't read."""
+    windows = [_parse_window(part) for part in text.split(';') if part.strip()]
+    if not windows:
+        raise ValueError('empty schedule')
+    return windows
+
+
+def schedule_active(windows, now):
+    """True if the datetime `now` (local time) falls inside any window."""
+    minute = now.hour * 60 + now.minute
+    weekday = now.weekday()
+    for days, start, end in windows:
+        if end > start:
+            if weekday in days and start <= minute < end:
+                return True
+        elif (weekday in days and minute >= start) or ((weekday - 1) % 7 in days and minute < end):
+            return True  # window runs past midnight
+    return False
+
+
+def channels_due(channels, schedules, live_channels, now):
+    """The channels worth checking right now: those without a schedule, those
+    inside one of their windows, and any that are currently live (so the end
+    of a stream that outlasts its window is still noticed)."""
+    return [c for c in channels
+            if c not in schedules or c in live_channels or schedule_active(schedules[c], now)]
+
+
+def scheduled_active_channels(schedules, now):
+    """The channels that have a schedule and are inside a window at `now`."""
+    return {c for c, windows in schedules.items() if schedule_active(windows, now)}
 
 
 MIN_TWITCH_CHECK_MINUTES = 1
 MIN_YOUTUBE_CHECK_MINUTES = 5  # each channel costs a full streamlink run
+MIN_UPDATES_CHECK_HOURS = 1
 
 
-def _load_live_check_interval(section, default_seconds, minimum_minutes):
-    """Seconds between live checks from an 'interval=<minutes>' line in the
-    given section ([twitch] / [youtube]). Missing or unparsable -> default;
-    values below the minimum are raised to it (each check hits the network)."""
+def _load_interval(section, default_seconds, minimum, unit_seconds):
+    """Seconds from an 'interval=<n>' line in the given section, n counted in
+    units of `unit_seconds`. Missing or unparsable -> default; values below
+    `minimum` are raised to it (each check hits the network)."""
     for line in _read_config_sections()[section]:
         key, sep, val = line.partition('=')
         if sep and key.strip().lower() == 'interval':
             try:
-                return max(minimum_minutes, int(val.split('#', 1)[0].strip())) * 60
+                return max(minimum, int(val.split('#', 1)[0].strip())) * unit_seconds
             except ValueError:
                 return default_seconds
     return default_seconds
 
 
 def load_twitch_check_interval():
-    return _load_live_check_interval('twitch', TWITCH_CHECK_INTERVAL_SECONDS, MIN_TWITCH_CHECK_MINUTES)
+    return _load_interval('twitch', TWITCH_CHECK_INTERVAL_SECONDS, MIN_TWITCH_CHECK_MINUTES, 60)
 
 
 def load_youtube_check_interval():
-    return _load_live_check_interval('youtube', YOUTUBE_CHECK_INTERVAL_SECONDS, MIN_YOUTUBE_CHECK_MINUTES)
+    return _load_interval('youtube', YOUTUBE_CHECK_INTERVAL_SECONDS, MIN_YOUTUBE_CHECK_MINUTES, 60)
+
+
+def load_updates_check_interval():
+    """Seconds between package update scans: 'interval=<hours>' in [updates]."""
+    return _load_interval('updates', PENDING_CHECK_INTERVAL_SECONDS, MIN_UPDATES_CHECK_HOURS, 3600)
 
 
 DEFAULT_TIMER_MAX_MINUTES = 120
@@ -254,68 +427,18 @@ def load_timer_settings():
     return {'max_seconds': max_minutes * 60, 'step_seconds': step_seconds}
 
 
-def load_twitch_qualities():
-    """Returns {channel: quality} for config lines shaped 'channel|quality'
-    (e.g. 'channel1|720p60'). A channel with no '|quality' part is simply
-    absent here; callers should default missing entries to 'best'."""
-    qualities = {}
-    for line in _read_config_sections()['twitch']:
-        if '=' in line:
-            continue
-        parts = [p.strip() for p in line.split('|', 1)]
-        if len(parts) == 2 and parts[0] and parts[1]:
-            qualities[parts[0].lower()] = parts[1]
-    return qualities
-
-
-def load_youtube_channels():
-    """Returns a list of YouTube channel identifiers to watch (as typed --
-    e.g. '@somehandle' or 'channel/UCxxxxxxxxxxxxxxxxxxxxxx' -- YouTube
-    identifiers are case-sensitive, unlike Twitch logins), de-duplicated
-    case-insensitively while preserving the first-seen casing and the
-    order they appear in the config."""
-    seen = set()
-    channels = []
-    for line in _read_config_sections()['youtube']:
-        if '=' in line:
-            continue  # a setting (e.g. interval=30), not a channel
-        ch = line.split('|', 1)[0].strip()
-        key = ch.lower()
-        if ch and key not in seen:
-            seen.add(key)
-            channels.append(ch)
-    return channels
-
-
-def load_youtube_qualities():
-    """Returns {channel: quality} for config lines shaped 'channel|quality'
-    (e.g. '@somehandle|720p60'). Keyed by the channel identifier exactly as
-    typed (case-sensitive). A channel with no '|quality' part is simply
-    absent here; callers should default missing entries to 'best'."""
-    qualities = {}
-    for line in _read_config_sections()['youtube']:
-        if '=' in line:
-            continue
-        parts = [p.strip() for p in line.split('|', 1)]
-        if len(parts) == 2 and parts[0] and parts[1]:
-            qualities[parts[0]] = parts[1]
-    return qualities
-
-
 def load_weather_settings():
-    """Returns {'lat', 'lon', 'alerts_enabled', 'country', 'region',
-    'region_updated'} from config.conf's [weather] section. lat/lon are None
-    until a coordinates line is configured. The coordinates line has no '='
-    ('lat|lon'); everything else is a 'key=value' line. 'country', 'region'
-    and 'region_updated' are written back automatically by the app itself
-    (see _update_weather_region_cache) once alerts are enabled and the
-    location has been resolved from the coordinates -- not meant to be
-    hand-edited, though nothing breaks if they're missing or wrong."""
+    """Returns {'lat', 'lon', 'alerts_enabled', 'country', 'region'} from
+    config.conf's [weather] section. lat/lon are None until a coordinates line
+    is configured. The coordinates line has no '=' ('lat|lon'); everything else
+    is a 'key=value' line. 'country' and 'region' are written back by the app
+    itself (see _update_weather_region_cache) the first time alerts are
+    enabled and the location has been resolved from the coordinates; they are
+    never looked up again until the user deletes them."""
     lat = lon = None
     alerts_enabled = False
     country = None
     region = None
-    region_updated = 0.0
     for line in _read_config_sections()['weather']:
         if '=' in line:
             key, _, val = line.partition('=')
@@ -327,11 +450,6 @@ def load_weather_settings():
                 country = val or None
             elif key == 'region':
                 region = val or None
-            elif key == 'region_updated':
-                try:
-                    region_updated = float(val)
-                except ValueError:
-                    pass
         else:
             parts = [p.strip() for p in line.split('|')]
             if len(parts) >= 2:
@@ -341,7 +459,7 @@ def load_weather_settings():
                     pass
     return {
         'lat': lat, 'lon': lon, 'alerts_enabled': alerts_enabled,
-        'country': country, 'region': region, 'region_updated': region_updated,
+        'country': country, 'region': region,
     }
 
 
@@ -382,16 +500,15 @@ def _edit_weather_section(transform):
         pass
 
 
-_RESOLVED_LOCATION_KEYS = ('country=', 'region=', 'region_updated=')
+_RESOLVED_LOCATION_KEYS = ('country=', 'region=')
 
 
-def _update_weather_region_cache(region, timestamp, country=None):
-    """Sets country=/region=/region_updated= in [weather] (the weekly
-    reverse-geocode cache)."""
+def _update_weather_region_cache(region, country):
+    """Stores the reverse-geocoded country=/region= in [weather]; they are
+    only ever looked up again after the user deletes them."""
     def transform(section):
         kept = [l for l in section if not l.strip().lower().startswith(_RESOLVED_LOCATION_KEYS)]
-        return kept + ([f'country={country}\n'] if country else []) + [
-            f'region={region}\n', f'region_updated={int(timestamp)}\n']
+        return kept + [f'country={country}\n', f'region={region}\n']
     _edit_weather_section(transform)
 
 
@@ -411,8 +528,7 @@ def reverse_geocode_region(lat, lon):
     (country, region, country_code) -- region being the county, falling back
     to the state, and None if neither exists; country_code is the lowercase
     ISO code Nominatim reports. Returns None on any failure or if no country
-    was found. Rate-limited by
-    design to once a week (see ALERTS_REGION_REFRESH_SECONDS) by the caller."""
+    was found. The caller only asks when country/region aren't in the config."""
     url = (
         f"{NOMINATIM_REVERSE_URL}?lat={lat}&lon={lon}"
         "&format=jsonv2&zoom=8&accept-language=en"
@@ -925,7 +1041,7 @@ def open_twitch_stream(channel, quality='best', site='Twitch', title=None):
                       f'https://twitch.tv/{channel}', title)
 
 
-YOUTUBE_CHECK_INTERVAL_SECONDS = 1800  # how often to poll YouTube live status
+YOUTUBE_CHECK_INTERVAL_SECONDS = 900  # how often to poll YouTube live status
 YOUTUBE_CHECK_TIMEOUT_SECONDS = 20  # per-channel; this check shells out to
                                      # streamlink itself (no lightweight
                                      # keyless batch API exists for YouTube),
@@ -1361,6 +1477,29 @@ class RssTray:
         GLib.timeout_add_seconds(4, self.initial_youtube_check)
         GLib.timeout_add_seconds(load_youtube_check_interval(), self.periodic_youtube_check)
         GLib.timeout_add_seconds(1, self._timer_tick)
+        self._scheduled_active = self._current_scheduled_active()
+        GLib.timeout_add_seconds(60, self._live_schedule_tick)
+
+    @staticmethod
+    def _current_scheduled_active(now=None):
+        now = now or datetime.now()
+        return {
+            'twitch': scheduled_active_channels(load_twitch_schedules(), now),
+            'youtube': scheduled_active_channels(load_youtube_schedules(), now),
+        }
+
+    def _live_schedule_tick(self):
+        """Once a minute (no network): when a scheduled channel's window has
+        just opened, check right away instead of waiting for the next
+        interval, so a stream starting on time shows up on time."""
+        current = self._current_scheduled_active()
+        opened = {platform: current[platform] - self._scheduled_active[platform] for platform in current}
+        self._scheduled_active = current
+        if opened['twitch']:
+            self.start_twitch_check()
+        if opened['youtube']:
+            self.start_youtube_check()
+        return True
 
     def maybe_auto_show_startup(self):
         if self.has_anything_to_show():
@@ -1458,10 +1597,10 @@ class RssTray:
             last_attempt = self.state.get('updates_last_attempt', 0)
             fails = self.state.get('updates_fail_count', 0)
         if not force:
-            if (now - last) < PENDING_CHECK_INTERVAL_SECONDS:
+            interval = load_updates_check_interval()
+            if (now - last) < interval:
                 return
-            if fails and (now - last_attempt) < min(300 * 2 ** (fails - 1),
-                                                     PENDING_CHECK_INTERVAL_SECONDS):
+            if fails and (now - last_attempt) < min(300 * 2 ** (fails - 1), interval):
                 return  # backing off after failed scans
         pkgnames = list_all_updates()
         if pkgnames is None:
@@ -1519,7 +1658,10 @@ class RssTray:
         try:
             channels = load_twitch_channels()
             if channels:
-                live_now = check_twitch_live_channels(channels)
+                with self.lock:
+                    live = {e['channel'] for e in self.state.get('live_channels', [])}
+                due = channels_due(channels, load_twitch_schedules(), live, datetime.now())
+                live_now = check_twitch_live_channels(due)
                 if live_now is not None:  # failed check: keep last known live state
                     GLib.idle_add(self._on_twitch_checked, live_now)
         finally:
@@ -1562,7 +1704,10 @@ class RssTray:
         try:
             channels = load_youtube_channels()
             if channels:
-                live_now = check_youtube_live_channels(channels)
+                with self.lock:
+                    live = {e['channel'] for e in self.state.get('live_youtube_channels', [])}
+                due = channels_due(channels, load_youtube_schedules(), live, datetime.now())
+                live_now = check_youtube_live_channels(due)
                 if live_now is not None:  # failed check: keep last known live state
                     GLib.idle_add(self._on_youtube_checked, live_now)
         finally:
@@ -1601,32 +1746,25 @@ class RssTray:
         GLib.idle_add(self._on_weather_fetched, data, alerts)
 
     def _fetch_alerts_bg(self):
-        """Resolves the alert country/region (from lat/lon, cached weekly in
-        config.conf) and fetches active MeteoAlarm alerts for it. Returns
-        None on failure (caller keeps the previous alerts), [] if alerts
-        are disabled or the region genuinely has nothing active."""
+        """Fetches active MeteoAlarm alerts for the country/region in
+        config.conf, resolving them from the coordinates (once) if they are
+        missing. Returns None on failure (caller keeps the previous alerts),
+        [] if alerts are disabled or the region genuinely has nothing active."""
         settings = load_weather_settings()
         if not settings['alerts_enabled'] or settings['lat'] is None or settings['lon'] is None:
             return []
         country, region = settings['country'], settings['region']
-        now = time_module.time()
-        if not (country and region) or (now - settings['region_updated']) >= ALERTS_REGION_REFRESH_SECONDS:
+        if not (country and region):
             resolved = reverse_geocode_region(settings['lat'], settings['lon'])
-            if resolved:
-                new_country, new_region, code = resolved
-                if code and code not in METEOALARM_COUNTRY_CODES:
-                    _disable_weather_alerts()  # no MeteoAlarm feed for this country
-                    return []
-                if new_country and new_region:
-                    country, region = new_country, new_region
-                    _update_weather_region_cache(region, now, country=country)
-                elif not (country and region):
-                    return None  # country known but no region, nothing cached
-            elif not (country and region):
-                return None  # never resolved, and this attempt also failed
-            # else: geocoding failed but a stale region is cached -- keep
-            # using it; region_updated is left untouched so it retries
-            # next poll instead of waiting a full week
+            if not resolved:
+                return None  # lookup failed; retried on the next poll
+            country, region, code = resolved
+            if code and code not in METEOALARM_COUNTRY_CODES:
+                _disable_weather_alerts()  # no MeteoAlarm feed for this country
+                return []
+            if not (country and region):
+                return None
+            _update_weather_region_cache(region, country)
         return fetch_meteoalarm_alerts(region, country)
 
     def _on_weather_fetched(self, data, alerts=None):
