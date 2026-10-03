@@ -812,8 +812,12 @@ def _stop_streamlink_when_mpv_exits(proc):
 def _play_in_shared_mpv(url, quality, site, channel, fallback_url):
     """Worker thread: serve the stream via streamlink, load it into the
     shared mpv. Falls back to the browser if anything fails (unless a newer
-    click has superseded this one)."""
-    _stop_streamlink()  # a new click replaces the previous stream
+    click has superseded this one).
+
+    The previous stream's streamlink is deliberately left running until mpv
+    has been told to load the new one: killing it first would end the file
+    mpv is playing, and with --idle=once mpv quits when playback ends -- the
+    window would close and reopen instead of being reused."""
     port = _free_local_port()
     try:
         proc = subprocess.Popen(
@@ -830,7 +834,7 @@ def _play_in_shared_mpv(url, quality, site, channel, fallback_url):
         return
     global _streamlink_proc
     with _player_lock:
-        _streamlink_proc = proc
+        previous, _streamlink_proc = _streamlink_proc, proc
     # streamlink logs this line once its local server is listening; mpv can
     # connect from then on (it fetches the actual stream on first request).
     watchdog = threading.Timer(STREAMLINK_READY_TIMEOUT_SECONDS, proc.kill)
@@ -849,6 +853,8 @@ def _play_in_shared_mpv(url, quality, site, channel, fallback_url):
     if not loaded:
         superseded = not _is_current_streamlink(proc)
         if not superseded:
+            with _player_lock:  # the previous stream (if still alive) stays current
+                _streamlink_proc = previous if previous is not None and previous.poll() is None else None
             if not ready:
                 _log('streamlink never reported its local server; last output: ' + ' | '.join(recent))
             else:
@@ -860,6 +866,11 @@ def _play_in_shared_mpv(url, quality, site, channel, fallback_url):
         if not superseded:
             webbrowser.open(fallback_url)
         return
+    if previous is not None and previous.poll() is None:
+        try:
+            previous.terminate()  # mpv has already switched over to the new stream
+        except OSError:
+            pass
     threading.Thread(target=_apply_stream_title, args=(proc, url, site), daemon=True).start()
     threading.Thread(target=_stop_streamlink_when_mpv_exits, args=(proc,), daemon=True).start()
     for _line in proc.stdout:  # drain so streamlink never blocks on a full pipe
@@ -895,18 +906,29 @@ YOUTUBE_CHECK_TIMEOUT_SECONDS = 20  # per-channel; this check shells out to
                                      # subprocess per channel
 
 
+def _parse_streamlink_json(output):
+    """json.loads() on `streamlink --json` output, tolerating log lines before
+    the object (some streamlink versions print their log to stdout)."""
+    start = output.find('{')
+    if start < 0:
+        raise ValueError('no JSON object in output')
+    return json.loads(output[start:])
+
+
 def check_youtube_live_channels(channels):
     """Uses `streamlink --json <channel>/live` per channel -- the same
     extraction path used for actual playback, so there's no risk of this
     check disagreeing with what clicking the row would actually do. No
     keyless YouTube API exists for batch-checking many channels in one
     request, so this is sequential, one streamlink invocation per channel.
+    A channel is live if streamlink found playable streams for it (its title
+    is optional; the channel name is used if streamlink has none).
     Returns {channel: title} for whichever channels are currently live (a
     not-live channel is simply absent, same convention as Twitch's check);
     returns None only if every single channel's check failed (e.g.
     streamlink isn't installed) -- an individual channel's request failing
     is treated the same as that channel not being live, and is simply
-    retried next poll."""
+    retried next poll. Failures are logged to stderr for diagnosis."""
     if not channels:
         return {}
     live = {}
@@ -918,13 +940,16 @@ def check_youtube_live_channels(channels):
                 ['streamlink', '--json', url],
                 capture_output=True, text=True, timeout=YOUTUBE_CHECK_TIMEOUT_SECONDS
             )
-            parsed = json.loads(result.stdout)
-        except Exception:
+            parsed = _parse_streamlink_json(result.stdout)
+        except Exception as e:
+            _log(f'YouTube check for {channel} failed: {type(e).__name__}: {e}')
             continue  # this channel's check failed; left absent, retried next poll
         any_success = True
-        metadata = parsed.get('metadata')
-        if metadata and metadata.get('title'):
-            live[channel] = metadata['title']
+        metadata = parsed.get('metadata') or {}
+        if parsed.get('error'):
+            _log(f"YouTube {channel}: not live ({str(parsed['error'])[:160]})")
+        elif parsed.get('streams') or metadata.get('title'):
+            live[channel] = metadata.get('title') or channel
     if not any_success:
         return None  # every channel's check failed (e.g. streamlink missing)
     return live
