@@ -88,11 +88,6 @@ def ensure_config():
     os.makedirs(CONFIG_DIR, exist_ok=True)
     if os.path.exists(CONFIG_FILE):
         return
-    legacy_feeds = os.path.join(CONFIG_DIR, 'feeds.conf')
-    legacy_mute = os.path.join(CONFIG_DIR, 'mute.conf')
-    if os.path.exists(legacy_feeds) or os.path.exists(legacy_mute):
-        _migrate_legacy_config(legacy_feeds, legacy_mute)
-        return
     with open(CONFIG_FILE, 'w') as f:
         f.write(
             "[feeds]\n"
@@ -134,33 +129,8 @@ def ensure_config():
         )
 
 
-def _migrate_legacy_config(legacy_feeds, legacy_mute):
-    """One-time merge of the old separate feeds.conf/mute.conf into the new
-    consolidated config.conf. The legacy files are left in place, untouched."""
-    lines = ['[feeds]']
-    if os.path.exists(legacy_feeds):
-        with open(legacy_feeds) as f:
-            for line in f:
-                line = line.rstrip('\n')
-                if line.strip() and not line.strip().startswith('#'):
-                    lines.append(line)
-    lines.append('')
-    lines.append('[mute]')
-    if os.path.exists(legacy_mute):
-        with open(legacy_mute) as f:
-            for line in f:
-                line = line.rstrip('\n')
-                if line.strip() and not line.strip().startswith('#'):
-                    lines.append(line)
-    lines.append('')
-    lines.append('[twitch]')
-    lines.append('# Twitch channel login names to watch for live status, one per line.')
-    with open(CONFIG_FILE, 'w') as f:
-        f.write('\n'.join(lines) + '\n')
-
-
 def _read_config_sections():
-    """Parses config.conf into {'feeds': [...], 'mute': [...], 'twitch': [...]},
+    """Parses config.conf into {section: [lines]} for the known sections,
     each a list of raw non-comment, non-empty lines under that [section]."""
     sections = {'feeds': [], 'mute': [], 'twitch': [], 'weather': [], 'timer': [], 'youtube': []}
     current = None
@@ -257,8 +227,7 @@ def load_timer_settings():
     """Returns {'max_seconds', 'step_seconds'} from config.conf's [timer]
     section: 'max=<minutes>' and 'step=<seconds>' key=value lines, in any
     order/combination. Missing or unparsable values fall back to the
-    built-in defaults (120 minutes, 60 second steps -- the app's previous
-    fixed behavior)."""
+    built-in defaults (120 minutes, 60 second steps)."""
     max_minutes = DEFAULT_TIMER_MAX_MINUTES
     step_seconds = DEFAULT_TIMER_STEP_SECONDS
     for line in _read_config_sections()['timer']:
@@ -373,13 +342,6 @@ def load_weather_settings():
         'lat': lat, 'lon': lon, 'alerts_enabled': alerts_enabled,
         'country': country, 'region': region, 'region_updated': region_updated,
     }
-
-
-def load_weather_coords():
-    """Back-compat wrapper: just the (lat, lon) from load_weather_settings();
-    (None, None) if no coordinates are configured."""
-    settings = load_weather_settings()
-    return settings['lat'], settings['lon']
 
 
 def _edit_weather_section(transform):
@@ -540,16 +502,14 @@ def save_state(state):
     os.replace(tmp, STATE_FILE)
 
 
-def entry_id(entry, feed_url=None):
+def entry_id(entry, feed_url):
     """A stable id for entries with a real id/link. Entries lacking both
-    (the fallback: title+published) are hashed together with feed_url when
-    given, so the same title+date on two different feeds doesn't collide."""
+    (the fallback: title+published) are hashed together with feed_url, so the
+    same title+date on two different feeds doesn't collide."""
     raw = entry.get('id') or entry.get('link')
     if raw:
         return hashlib.sha1(raw.encode('utf-8', 'ignore')).hexdigest()
-    fallback = entry.get('title', '') + entry.get('published', '')
-    if feed_url:
-        fallback = feed_url + '\x00' + fallback
+    fallback = feed_url + '\x00' + entry.get('title', '') + entry.get('published', '')
     return hashlib.sha1(fallback.encode('utf-8', 'ignore')).hexdigest()
 
 
@@ -1203,7 +1163,8 @@ def fetch_meteoalarm_alerts(region, country, now=None):
 
 def fetch_weather():
     """Best-effort fetch from Open-Meteo. Returns a dict or None on any failure."""
-    lat, lon = load_weather_coords()
+    settings = load_weather_settings()
+    lat, lon = settings['lat'], settings['lon']
     if lat is None or lon is None:
         return None  # no coordinates configured: weather bar stays hidden
     url = build_weather_api_url(lat, lon)
@@ -1427,10 +1388,7 @@ class RssTray:
             last_checked[url] = now
             for entry in parsed.entries:
                 eid = entry_id(entry, url)
-                # legacy (pre-collision-fix) hash for the same fallback entry —
-                # checked too so items already recorded as seen don't resurface
-                legacy_eid = entry_id(entry)
-                if eid in seen_ids or legacy_eid in seen_ids:
+                if eid in seen_ids:
                     continue
                 seen_ids.add(eid)
                 newly_seen_ids.add(eid)
@@ -2015,16 +1973,6 @@ class RssTray:
         surface.flush()
         return Gdk.pixbuf_get_from_surface(surface, 0, 0, size, size)
 
-    def feed_name_for(self, url, feeds_map=None):
-        if feeds_map is not None:
-            return feeds_map.get(url, url)
-        for feed_url, custom_name, _interval in load_feeds():
-            if feed_url == url:
-                return custom_name or feed_url
-        return url
-
-    # --- popup window ---
-
     def _apply_compact_css(self):
         css = b"""
         list row { padding: 1px 3px; min-height: 0px; }
@@ -2479,13 +2427,6 @@ class RssTray:
     def _remove_unread(self, item_id):
         with self.lock:
             self.state['unread'] = [e for e in self.state.get('unread', []) if e['id'] != item_id]
-            save_state(self.state)
-
-    def _remove_available_update(self, item_id):
-        with self.lock:
-            self.state['available_updates'] = [
-                e for e in self.state.get('available_updates', []) if e['id'] != item_id
-            ]
             save_state(self.state)
 
     def install_all_updates(self):
