@@ -758,8 +758,8 @@ class TestTwitchQuality(TmpConfigCase):
 
 
 class FakeStreamlinkProc:
-    def __init__(self, stderr_lines):
-        self.stderr = iter(stderr_lines)
+    def __init__(self, output_lines):
+        self.stdout = iter(output_lines)
         self.terminated = False
 
     def poll(self):
@@ -841,9 +841,20 @@ class TestSharedMpv(unittest.TestCase):
                                     '--player-external-http-interface', '127.0.0.1',
                                     '--player-external-http-port'])
         self.assertEqual(args[6:], ['twitch.tv/x', '720p60'])
+        # streamlink's log goes to stdout or stderr depending on version: merge them
+        self.assertIs(popen.call_args.kwargs['stderr'], rt.subprocess.STDOUT)
+        self.assertIs(popen.call_args.kwargs['stdout'], rt.subprocess.PIPE)
         load.assert_called_once_with('http://127.0.0.1:%s/' % args[5], 'Twitch > x')
         wb_open.assert_not_called()
         self.assertFalse(proc.terminated)
+
+    def test_never_ready_failure_is_logged_with_last_output(self):
+        proc = FakeStreamlinkProc(['error: boom\n'])
+        with mock.patch.object(rt.subprocess, 'Popen', return_value=proc), \
+                mock.patch.object(rt.webbrowser, 'open'), \
+                mock.patch.object(rt, '_log') as log:
+            rt._play_in_shared_mpv('twitch.tv/x', 'best', 'Twitch', 'x', 'https://twitch.tv/x')
+        self.assertIn('error: boom', log.call_args[0][0])
 
     def test_browser_fallback_when_streamlink_never_ready(self):
         proc = FakeStreamlinkProc(['error: no plugin\n'])
@@ -886,7 +897,7 @@ class TestSharedMpv(unittest.TestCase):
             rt._streamlink_proc = FakeStreamlinkProc([])  # a newer click took over
             yield 'no marker\n'
         proc = FakeStreamlinkProc([])
-        proc.stderr = lines()
+        proc.stdout = lines()
         with mock.patch.object(rt.subprocess, 'Popen', return_value=proc), \
                 mock.patch.object(rt.webbrowser, 'open') as wb_open:
             rt._play_in_shared_mpv('twitch.tv/x', 'best', 'Twitch', 'x', 'https://twitch.tv/x')
