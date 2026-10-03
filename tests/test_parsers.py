@@ -590,6 +590,51 @@ class TestMonoGlyph(unittest.TestCase):
         self.assertIn('\u2614\ufe0e', seg)
 
 
+class TestIntervalDefaults(TmpConfigCase):
+    def test_documented_defaults(self):
+        self.assertEqual(rt.load_twitch_check_interval(), 15 * 60)
+        self.assertEqual(rt.load_youtube_check_interval(), 15 * 60)
+        self.assertEqual(rt.load_updates_check_interval(), 12 * 3600)  # twice a day
+
+    def test_updates_interval_is_in_hours_with_a_one_hour_floor(self):
+        self.conf('[updates]\ninterval=6\n')
+        self.assertEqual(rt.load_updates_check_interval(), 6 * 3600)
+        self.conf('[updates]\ninterval=0\n')
+        self.assertEqual(rt.load_updates_check_interval(), 3600)
+        self.conf('[updates]\ninterval=soon\n')
+        self.assertEqual(rt.load_updates_check_interval(), 12 * 3600)
+
+
+class TestUpdatesDue(TmpConfigCase):
+    class Stub:
+        check_updates_if_due = rt.RssTray.check_updates_if_due
+
+        def __init__(self, last_checked):
+            self.lock = rt.threading.Lock()
+            self.state = {'updates_last_checked': last_checked}
+
+    def _scans(self, last_checked_ago_hours, force=False):
+        now = 1_000_000_000.0
+        stub = self.Stub(now - last_checked_ago_hours * 3600)
+        with mock.patch.object(rt.time_module, 'time', return_value=now), \
+                mock.patch.object(rt, 'list_all_updates', return_value=None) as scan, \
+                mock.patch.object(rt, 'save_state'):
+            stub.check_updates_if_due(force=force)
+        return scan.call_count
+
+    def test_default_is_twice_a_day(self):
+        self.assertEqual(self._scans(11.9), 0)
+        self.assertEqual(self._scans(12.1), 1)
+
+    def test_configured_interval_is_used(self):
+        self.conf('[updates]\ninterval=24\n')
+        self.assertEqual(self._scans(13), 0)
+        self.assertEqual(self._scans(24.1), 1)
+
+    def test_force_ignores_the_interval(self):
+        self.assertEqual(self._scans(0.1, force=True), 1)
+
+
 class TestLiveCheckIntervals(TmpConfigCase):
     def test_defaults_without_setting(self):
         self.conf('[twitch]\nchan\n[youtube]\n@h\n')
@@ -626,6 +671,160 @@ class TestLiveCheckIntervals(TmpConfigCase):
         self.assertEqual(rt.load_youtube_qualities(), {'@h': '480p'})
 
 
+def dt(weekday, hour, minute=0):
+    """A datetime on the given weekday (0=Mon) of a fixed reference week."""
+    return rt.datetime(2026, 10, 5 + weekday, hour, minute)  # 2026-10-05 is a Monday
+
+
+class TestParseSchedule(unittest.TestCase):
+    def test_single_day_with_range(self):
+        (days, start, end), = rt.parse_schedule('wed 18:00-23:30')
+        self.assertEqual((set(days), start, end), ({2}, 18 * 60, 23 * 60 + 30))
+
+    def test_dot_separator_and_full_day_names(self):
+        (days, start, end), = rt.parse_schedule('Wednesday 18.00-20.15')
+        self.assertEqual((set(days), start, end), ({2}, 18 * 60, 20 * 60 + 15))
+
+    def test_open_end_means_until_midnight(self):
+        for text in ('tue-sun 13:00-', 'tue-sun 13:00'):
+            (days, start, end), = rt.parse_schedule(text)
+            self.assertEqual((set(days), start, end), ({1, 2, 3, 4, 5, 6}, 13 * 60, 24 * 60))
+
+    def test_day_lists_ranges_and_keywords(self):
+        self.assertEqual(set(rt.parse_schedule('mon,wed,fri 10:00')[0][0]), {0, 2, 4})
+        self.assertEqual(set(rt.parse_schedule('fri-mon 10:00')[0][0]), {4, 5, 6, 0})  # wraps
+        self.assertEqual(set(rt.parse_schedule('weekdays 10:00')[0][0]), {0, 1, 2, 3, 4})
+        self.assertEqual(set(rt.parse_schedule('weekends 10:00')[0][0]), {5, 6})
+        self.assertEqual(set(rt.parse_schedule('daily 10:00')[0][0]), set(range(7)))
+        self.assertEqual(set(rt.parse_schedule('10:00-12:00')[0][0]), set(range(7)))  # no days
+
+    def test_spaces_inside_a_day_list(self):
+        self.assertEqual(set(rt.parse_schedule('mon, wed 10:00')[0][0]), {0, 2})
+
+    def test_days_only_means_the_whole_day(self):
+        (days, start, end), = rt.parse_schedule('tue-sun')
+        self.assertEqual((set(days), start, end), ({1, 2, 3, 4, 5, 6}, 0, 24 * 60))
+
+    def test_several_windows(self):
+        windows = rt.parse_schedule('wed 18:00-20:00; sat 10:00-12:00')
+        self.assertEqual([set(w[0]) for w in windows], [{2}, {5}])
+
+    def test_invalid_input_raises(self):
+        for bad in ('', ';', 'funday 10:00', 'wed 25:00', 'wed 10:75', 'wed 10:00-99:00',
+                    'wed,,thu 10:00', 'wed 10', 'mo 10:00'):
+            with self.assertRaises(ValueError, msg=bad):
+                rt.parse_schedule(bad)
+
+
+class TestScheduleActive(unittest.TestCase):
+    def test_wednesday_evening_only(self):
+        w = rt.parse_schedule('wed 18:00-23:00')
+        self.assertTrue(rt.schedule_active(w, dt(2, 18, 0)))
+        self.assertTrue(rt.schedule_active(w, dt(2, 22, 59)))
+        self.assertFalse(rt.schedule_active(w, dt(2, 17, 59)))
+        self.assertFalse(rt.schedule_active(w, dt(2, 23, 0)))   # end is exclusive
+        self.assertFalse(rt.schedule_active(w, dt(3, 18, 30)))  # Thursday
+
+    def test_every_day_except_monday_from_13(self):
+        w = rt.parse_schedule('tue-sun 13:00-')
+        self.assertFalse(rt.schedule_active(w, dt(0, 15)))      # Monday
+        self.assertFalse(rt.schedule_active(w, dt(1, 12, 59)))
+        for day in range(1, 7):
+            self.assertTrue(rt.schedule_active(w, dt(day, 13)))
+            self.assertTrue(rt.schedule_active(w, dt(day, 23, 59)))
+
+    def test_window_past_midnight_spills_into_the_next_day(self):
+        w = rt.parse_schedule('fri 22:00-02:00')
+        self.assertTrue(rt.schedule_active(w, dt(4, 23)))
+        self.assertTrue(rt.schedule_active(w, dt(5, 1, 59)))    # Saturday early morning
+        self.assertFalse(rt.schedule_active(w, dt(5, 2, 0)))
+        self.assertFalse(rt.schedule_active(w, dt(4, 21)))
+        self.assertFalse(rt.schedule_active(w, dt(6, 1)))       # Sunday early: no Saturday window
+
+    def test_sunday_window_past_midnight_wraps_to_monday(self):
+        w = rt.parse_schedule('sun 23:00-01:00')
+        self.assertTrue(rt.schedule_active(w, dt(0, 0, 30)))
+
+    def test_any_of_several_windows(self):
+        w = rt.parse_schedule('wed 18:00-19:00; sat 10:00-11:00')
+        self.assertTrue(rt.schedule_active(w, dt(5, 10, 30)))
+        self.assertFalse(rt.schedule_active(w, dt(5, 18, 30)))
+
+
+class TestChannelsDue(unittest.TestCase):
+    def test_unscheduled_always_scheduled_only_in_window_live_always(self):
+        schedules = {'weekly': rt.parse_schedule('wed 18:00-23:00'),
+                     'daily': rt.parse_schedule('tue-sun 13:00-')}
+        channels = ['plain', 'weekly', 'daily']
+        self.assertEqual(rt.channels_due(channels, schedules, set(), dt(2, 19)), ['plain', 'weekly', 'daily'])
+        self.assertEqual(rt.channels_due(channels, schedules, set(), dt(0, 19)), ['plain'])
+        self.assertEqual(rt.channels_due(channels, schedules, {'weekly'}, dt(0, 19)), ['plain', 'weekly'])
+
+    def test_scheduled_active_channels(self):
+        schedules = {'weekly': rt.parse_schedule('wed 18:00-23:00')}
+        self.assertEqual(rt.scheduled_active_channels(schedules, dt(2, 18)), {'weekly'})
+        self.assertEqual(rt.scheduled_active_channels(schedules, dt(2, 12)), set())
+
+
+class TestScheduleConfig(TmpConfigCase):
+    def test_schedule_is_the_third_field_and_quality_may_be_empty(self):
+        self.conf('[twitch]\nplain\nweekly||wed 18:00-23:00\nboth|720p60|tue-sun 13:00-; sat 10:00-12:00\n'
+                  '[youtube]\n@Handle|480p|mon 20:00-\n')
+        self.assertEqual(rt.load_twitch_channels(), ['plain', 'weekly', 'both'])
+        self.assertEqual(rt.load_twitch_qualities(), {'both': '720p60'})
+        schedules = rt.load_twitch_schedules()
+        self.assertEqual(set(schedules), {'weekly', 'both'})
+        self.assertEqual(len(schedules['both']), 2)
+        self.assertEqual(rt.load_youtube_channels(), ['@Handle'])
+        self.assertEqual(rt.load_youtube_qualities(), {'@Handle': '480p'})
+        self.assertEqual(set(rt.load_youtube_schedules()), {'@Handle'})
+
+    def test_invalid_schedule_means_always_checked(self):
+        self.conf('[twitch]\nbroken||someday 99:99\nfine||wed 18:00\n')
+        self.assertEqual(set(rt.load_twitch_schedules()), {'fine'})
+        self.assertEqual(rt.channels_due(rt.load_twitch_channels(), rt.load_twitch_schedules(), set(), dt(0, 3)),
+                         ['broken'])
+
+    def test_first_line_wins_for_duplicates(self):
+        self.conf('[twitch]\nChan|720p60\nchan|480p||wed 18:00\n')
+        self.assertEqual(rt.load_twitch_channels(), ['chan'])
+        self.assertEqual(rt.load_twitch_qualities(), {'chan': '720p60'})
+        self.assertEqual(rt.load_twitch_schedules(), {})
+
+
+class TestLiveScheduleTick(unittest.TestCase):
+    class Stub:
+        _live_schedule_tick = rt.RssTray._live_schedule_tick
+        _current_scheduled_active = staticmethod(rt.RssTray._current_scheduled_active)
+
+        def __init__(self, before):
+            self._scheduled_active = before
+            self.twitch_checks = 0
+            self.youtube_checks = 0
+
+        def start_twitch_check(self):
+            self.twitch_checks += 1
+
+        def start_youtube_check(self):
+            self.youtube_checks += 1
+
+    def _tick(self, before, now_active):
+        stub = self.Stub(before)
+        with mock.patch.object(rt.RssTray, '_current_scheduled_active', staticmethod(lambda now=None: now_active)):
+            stub._current_scheduled_active = rt.RssTray._current_scheduled_active
+            self.assertTrue(stub._live_schedule_tick())
+        return stub
+
+    def test_window_opening_triggers_one_immediate_check_for_that_platform(self):
+        stub = self._tick({'twitch': set(), 'youtube': set()}, {'twitch': {'weekly'}, 'youtube': set()})
+        self.assertEqual((stub.twitch_checks, stub.youtube_checks), (1, 0))
+        self.assertEqual(stub._scheduled_active['twitch'], {'weekly'})
+
+    def test_staying_inside_or_leaving_a_window_does_not_trigger(self):
+        stub = self._tick({'twitch': {'weekly'}, 'youtube': {'yt'}}, {'twitch': {'weekly'}, 'youtube': set()})
+        self.assertEqual((stub.twitch_checks, stub.youtube_checks), (0, 0))
+
+
 class TestWeatherSettings(TmpConfigCase):
     def test_defaults(self):
         s = rt.load_weather_settings()
@@ -634,16 +833,14 @@ class TestWeatherSettings(TmpConfigCase):
         self.assertFalse(s['alerts_enabled'])
         self.assertIsNone(s['country'])
         self.assertIsNone(s['region'])
-        self.assertEqual(s['region_updated'], 0.0)
 
     def test_full_section(self):
-        self.conf('[weather]\n40.0|-3.7\nalerts=true\ncountry=Exampleland\nregion=Northshire\nregion_updated=123.0\n')
+        self.conf('[weather]\n40.0|-3.7\nalerts=true\ncountry=Exampleland\nregion=Northshire\n')
         s = rt.load_weather_settings()
         self.assertEqual((s['lat'], s['lon']), (40.0, -3.7))
         self.assertTrue(s['alerts_enabled'])
         self.assertEqual(s['country'], 'Exampleland')
         self.assertEqual(s['region'], 'Northshire')
-        self.assertEqual(s['region_updated'], 123.0)
 
     def test_alerts_case_insensitive_and_variants(self):
         for val in ('True', 'YES', '1', 'on'):
@@ -661,25 +858,23 @@ class TestUpdateWeatherRegionCache(TmpConfigCase):
             '\n[weather]\n45.0|26.0\nalerts=true\n# a comment\n'
             '\n[twitch]\nsomechannel\n'
         )
-        rt._update_weather_region_cache('Northshire', 100.0)
+        rt._update_weather_region_cache('Northshire', 'Exampleland')
         s = rt.load_weather_settings()
-        self.assertEqual(s['region'], 'Northshire')
-        self.assertEqual(s['region_updated'], 100.0)
+        self.assertEqual((s['country'], s['region']), ('Exampleland', 'Northshire'))
         self.assertEqual((s['lat'], s['lon']), (45.0, 26.0))
         self.assertTrue(s['alerts_enabled'])
         self.assertEqual(rt.load_twitch_channels(), ['somechannel'])
         self.assertEqual([f[0] for f in rt.load_feeds()], ['https://a'])
 
     def test_overwrites_previous_region_values(self):
-        self.conf('[weather]\n45.0|26.0\nregion=Old\nregion_updated=1\n')
-        rt._update_weather_region_cache('New', 200.0)
+        self.conf('[weather]\n45.0|26.0\nregion=Old\n')
+        rt._update_weather_region_cache('New', 'Newland')
         s = rt.load_weather_settings()
-        self.assertEqual(s['region'], 'New')
-        self.assertEqual(s['region_updated'], 200.0)
+        self.assertEqual((s['country'], s['region']), ('Newland', 'New'))
 
     def test_country_written_and_replaced(self):
-        self.conf('[weather]\n45.0|26.0\ncountry=Old\nregion=Old\nregion_updated=1\n')
-        rt._update_weather_region_cache('New', 200.0, country='Newland')
+        self.conf('[weather]\n45.0|26.0\ncountry=Old\nregion=Old\n')
+        rt._update_weather_region_cache('New', 'Newland')
         s = rt.load_weather_settings()
         self.assertEqual((s['country'], s['region']), ('Newland', 'New'))
         with open(rt.CONFIG_FILE) as f:
@@ -687,7 +882,7 @@ class TestUpdateWeatherRegionCache(TmpConfigCase):
 
     def test_creates_section_if_missing(self):
         self.conf('[feeds]\nhttps://a\n')
-        rt._update_weather_region_cache('Northshire', 50.0)
+        rt._update_weather_region_cache('Northshire', 'Exampleland')
         self.assertEqual(rt.load_weather_settings()['region'], 'Northshire')
 
 
@@ -726,7 +921,7 @@ class TestReverseGeocodeRegion(unittest.TestCase):
 class TestDisableWeatherAlerts(TmpConfigCase):
     def test_flips_alerts_and_drops_cache_keeping_rest(self):
         self.conf('[feeds]\nhttps://a\n\n[weather]\n10.0|20.0\nalerts=true\n# note\n'
-                  'country=X\nregion=Y\nregion_updated=5\n\n[twitch]\nsomechannel\n')
+                  'country=X\nregion=Y\n\n[twitch]\nsomechannel\n')
         rt._disable_weather_alerts()
         s = rt.load_weather_settings()
         self.assertFalse(s['alerts_enabled'])
@@ -772,6 +967,22 @@ class TestFetchAlertsBg(TmpConfigCase):
         with mock.patch.object(rt, 'reverse_geocode_region', return_value=None):
             self.assertIsNone(self.Stub()._fetch_alerts_bg())
         self.assertTrue(rt.load_weather_settings()['alerts_enabled'])
+
+    def test_cached_location_is_never_looked_up_again(self):
+        self.conf('[weather]\n10.0|20.0\nalerts=true\ncountry=Exampleland\nregion=Northshire\n')
+        with mock.patch.object(rt, 'reverse_geocode_region') as geocode, \
+                mock.patch.object(rt, 'fetch_meteoalarm_alerts', return_value=[]) as fetch:
+            self.Stub()._fetch_alerts_bg()
+        geocode.assert_not_called()
+        fetch.assert_called_once_with('Northshire', 'Exampleland')
+
+    def test_lookup_runs_again_once_the_values_are_deleted(self):
+        self.conf('[weather]\n10.0|20.0\nalerts=true\ncountry=Exampleland\n')  # region missing
+        with mock.patch.object(rt, 'reverse_geocode_region', return_value=('Exampleland', 'Eastshire', 'RO')) as geocode, \
+                mock.patch.object(rt, 'fetch_meteoalarm_alerts', return_value=[]):
+            self.Stub()._fetch_alerts_bg()
+        geocode.assert_called_once()
+        self.assertEqual(rt.load_weather_settings()['region'], 'Eastshire')
 
     def test_unknown_country_code_does_not_disable(self):
         self.conf('[weather]\n10.0|20.0\nalerts=true\n')
