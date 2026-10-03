@@ -508,6 +508,42 @@ class TestMonoGlyph(unittest.TestCase):
         self.assertIn('\u2614\ufe0e', seg)
 
 
+class TestLiveCheckIntervals(TmpConfigCase):
+    def test_defaults_without_setting(self):
+        self.conf('[twitch]\nchan\n[youtube]\n@h\n')
+        self.assertEqual(rt.load_twitch_check_interval(), rt.TWITCH_CHECK_INTERVAL_SECONDS)
+        self.assertEqual(rt.load_youtube_check_interval(), rt.YOUTUBE_CHECK_INTERVAL_SECONDS)
+
+    def test_defaults_without_config_file(self):
+        self.assertEqual(rt.load_twitch_check_interval(), rt.TWITCH_CHECK_INTERVAL_SECONDS)
+
+    def test_minutes_are_converted_to_seconds(self):
+        self.conf('[twitch]\ninterval=10\nchan\n[youtube]\ninterval = 15 # note\n@h\n')
+        self.assertEqual(rt.load_twitch_check_interval(), 600)
+        self.assertEqual(rt.load_youtube_check_interval(), 900)
+
+    def test_low_values_are_raised_to_the_minimum(self):
+        self.conf('[twitch]\ninterval=0\n[youtube]\ninterval=1\n')
+        self.assertEqual(rt.load_twitch_check_interval(), rt.MIN_TWITCH_CHECK_MINUTES * 60)
+        self.assertEqual(rt.load_youtube_check_interval(), rt.MIN_YOUTUBE_CHECK_MINUTES * 60)
+
+    def test_garbage_falls_back_to_default(self):
+        self.conf('[twitch]\ninterval=often\n')
+        self.assertEqual(rt.load_twitch_check_interval(), rt.TWITCH_CHECK_INTERVAL_SECONDS)
+
+    def test_setting_is_per_section(self):
+        self.conf('[twitch]\ninterval=7\n')
+        self.assertEqual(rt.load_twitch_check_interval(), 420)
+        self.assertEqual(rt.load_youtube_check_interval(), rt.YOUTUBE_CHECK_INTERVAL_SECONDS)
+
+    def test_interval_lines_are_not_channels(self):
+        self.conf('[twitch]\ninterval=10\nchan|720p60\n[youtube]\ninterval=20\n@h|480p\n')
+        self.assertEqual(rt.load_twitch_channels(), ['chan'])
+        self.assertEqual(rt.load_twitch_qualities(), {'chan': '720p60'})
+        self.assertEqual(rt.load_youtube_channels(), ['@h'])
+        self.assertEqual(rt.load_youtube_qualities(), {'@h': '480p'})
+
+
 class TestWeatherSettings(TmpConfigCase):
     def test_defaults(self):
         s = rt.load_weather_settings()
