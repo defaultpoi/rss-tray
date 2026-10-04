@@ -10,6 +10,7 @@ A minimal tray-based RSS/Atom reader for Linux, built with Python and GTK3 as a 
   - red: package updates available
 
   Live Twitch and YouTube channels are deliberately not counted in the badge.
+- **Offline indicator:** the app probes connectivity every 10 s (and when the popup opens); after two failed probes in a row a red "Offline" banner appears under the weather bar, and clicking a news item only dismisses it instead of opening it. It goes away on the first successful probe.
 - **Popup list** grouped by feed. Left-click a row to open it and mark it read, right-click a row to mark it read only, click a feed header to mark the whole feed read. The popup auto-opens on new items and closes on focus-out.
 - **Feeds:** per-feed check intervals, custom display names, mute phrases. Items older than 24 h are silently marked seen the first time they are seen.
 - **Weather** (Open-Meteo): today's temperature, high/low, wind and rain, with a 5-day forecast behind the `›` button.
