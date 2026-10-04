@@ -672,6 +672,53 @@ class TestNotificationSound(unittest.TestCase):
         popen.assert_not_called()
 
 
+class TestLauncher(TmpConfigCase):
+    def test_label_and_command_in_config_order(self):
+        self.conf('[launcher]\nFiles|thunar ~\nUpdate|xfce4-terminal -e "sudo xbps-install -Su"\n')
+        self.assertEqual(rt.load_launcher_entries(), [
+            ('Files', 'thunar ~'), ('Update', 'xfce4-terminal -e "sudo xbps-install -Su"')])
+
+    def test_command_may_contain_pipes_and_equals(self):
+        self.conf('[launcher]\nBusy|ps aux | grep -c FOO=1\n')
+        self.assertEqual(rt.load_launcher_entries(), [('Busy', 'ps aux | grep -c FOO=1')])
+
+    def test_bare_line_is_label_and_command(self):
+        self.conf('[launcher]\nmousepad\n')
+        self.assertEqual(rt.load_launcher_entries(), [('mousepad', 'mousepad')])
+
+    def test_empty_commands_and_comments_are_skipped(self):
+        self.conf('[launcher]\n# note\nNothing|\n\nReal|true\n')
+        self.assertEqual(rt.load_launcher_entries(), [('Real', 'true')])
+
+    def test_no_section_is_empty(self):
+        self.conf('[feeds]\n')
+        self.assertEqual(rt.load_launcher_entries(), [])
+
+    def test_run_command_is_detached_through_the_shell_from_home(self):
+        with mock.patch.object(rt.subprocess, 'Popen') as popen, mock.patch.object(rt.threading, 'Thread'):
+            self.assertTrue(rt.run_launcher_command('thunar ~ && echo hi'))
+        args, kwargs = popen.call_args
+        self.assertEqual(args[0], ['sh', '-c', 'thunar ~ && echo hi'])
+        self.assertTrue(kwargs['start_new_session'])
+        self.assertEqual(kwargs['cwd'], rt.os.path.expanduser('~'))
+        self.assertIs(kwargs['stdout'], rt.subprocess.DEVNULL)
+
+    def test_run_command_failure_is_reported_not_raised(self):
+        with mock.patch.object(rt.subprocess, 'Popen', side_effect=OSError('nope')), mock.patch.object(rt, '_log'):
+            self.assertFalse(rt.run_launcher_command('x'))
+
+    def test_popup_stays_open_while_the_launch_list_has_focus(self):
+        class Stub:
+            on_popup_focus_out = rt.RssTray.on_popup_focus_out
+            _launcher_open = True
+        win = mock.MagicMock()
+        Stub().on_popup_focus_out(win, None)
+        win.hide.assert_not_called()
+        Stub._launcher_open = False
+        Stub().on_popup_focus_out(win, None)
+        win.hide.assert_called_once()
+
+
 class TestMonoGlyph(unittest.TestCase):
     def test_markup(self):
         m = rt.mono_glyph_markup('\u2614')
