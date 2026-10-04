@@ -49,10 +49,7 @@ PRIVILEGE_CMD = ['sudo', '-n']  # -n: fail fast rather than hang if a password w
                           # updates run headlessly with no terminal/tty attached
 WINDOW_WIDTH = 471  # 380 * 1.2, +15px total
 UPDATE_TIMEOUT_SECONDS = 1800  # 30 minutes
-NOTIFICATION_SOUND_CANDIDATES = [
-    os.path.join(CONFIG_DIR, 'notification.wav'),  # QuiteRSS's notification sound, if present
-    '/usr/share/sounds/alsa/Front_Center.wav',      # fallback if the above is missing
-]
+NOTIFICATION_SOUND_FILE = os.path.join(CONFIG_DIR, 'notification.wav')  # no sound if absent
 
 def build_weather_api_url(lat, lon):
     return (
@@ -1110,19 +1107,20 @@ def open_youtube_stream(channel, quality='best', title=None):
 
 
 def play_notification_sound():
-    """Best-effort: play a notification sound using whichever player is available.
-    Silently does nothing if none are found."""
-    for path in NOTIFICATION_SOUND_CANDIDATES:
-        if not os.path.exists(path):
-            continue
-        for player in (['paplay'], ['aplay', '-q'],
-                       ['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet']):
-            if shutil.which(player[0]):
-                try:
-                    subprocess.Popen(player + [path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    return
-                except Exception:
-                    continue
+    """Best-effort: plays notification.wav from the config directory with
+    whichever player is available. Silently does nothing if the file or every
+    player is missing."""
+    if not os.path.exists(NOTIFICATION_SOUND_FILE):
+        return
+    for player in (['paplay'], ['aplay', '-q'],
+                   ['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet']):
+        if shutil.which(player[0]):
+            try:
+                subprocess.Popen(player + [NOTIFICATION_SOUND_FILE],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return
+            except Exception:
+                continue
 
 
 def is_fullscreen_active():
