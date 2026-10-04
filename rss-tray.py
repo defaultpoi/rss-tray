@@ -1485,7 +1485,7 @@ def temp_icon_layout(size, text_width, text_height):
 # background-color -- the whole news area then turns black/dark with the rows
 # sitting on top of it. The shorthand also resets the image. Text colour is
 # forced too, since a dark theme's light foreground would be invisible on white.
-OFFLINE_BANNER_TEXT = "Offline — news can't be opened, only dismissed"
+OFFLINE_BANNER_TEXT = "Offline"
 LAUNCHER_MAX_HEIGHT_PX = 300  # the Launch list scrolls beyond this
 LIST_BOTTOM_SPACE_PX = 85  # reserved under the last row for the timer slide
 
@@ -2873,6 +2873,9 @@ class RssTray:
         GLib.idle_add(self._end_install)
 
     def on_row_activated(self, _listbox, row):
+        if not self.online and (getattr(row, 'install_all_header', False)
+                                or hasattr(row, 'header_feed_url') or hasattr(row, 'entry_id')):
+            return  # offline: news items, feed headers and "install all" do nothing
         if getattr(row, 'install_all_header', False):
             self.install_all_updates()
             return
@@ -2895,7 +2898,7 @@ class RssTray:
             return
         item_id, link = row.entry_id, row.link
         self._remove_unread(item_id)
-        if link and self.online:  # offline: nothing can be opened, the click only dismisses
+        if link:
             webbrowser.open(link)
         self.update_icon()
         self.refresh_list()
