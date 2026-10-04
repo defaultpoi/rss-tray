@@ -642,6 +642,36 @@ class TestEmptyAreaClick(unittest.TestCase):
         stub.popup.hide.assert_not_called()
 
 
+class TestNotificationSound(unittest.TestCase):
+    def setUp(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        self.sound = os.path.join(d, 'notification.wav')
+        patcher = mock.patch.object(rt, 'NOTIFICATION_SOUND_FILE', self.sound)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_plays_the_config_dir_file_with_the_first_available_player(self):
+        open(self.sound, 'wb').close()
+        with mock.patch.object(rt.shutil, 'which', side_effect=lambda p: '/usr/bin/aplay' if p == 'aplay' else None), \
+                mock.patch.object(rt.subprocess, 'Popen') as popen:
+            rt.play_notification_sound()
+        self.assertEqual(popen.call_args[0][0], ['aplay', '-q', self.sound])
+
+    def test_silent_when_the_file_is_missing_no_system_fallback(self):
+        with mock.patch.object(rt.shutil, 'which', return_value='/usr/bin/paplay'), \
+                mock.patch.object(rt.subprocess, 'Popen') as popen:
+            rt.play_notification_sound()
+        popen.assert_not_called()
+
+    def test_no_player_installed_is_a_quiet_noop(self):
+        open(self.sound, 'wb').close()
+        with mock.patch.object(rt.shutil, 'which', return_value=None), \
+                mock.patch.object(rt.subprocess, 'Popen') as popen:
+            rt.play_notification_sound()
+        popen.assert_not_called()
+
+
 class TestMonoGlyph(unittest.TestCase):
     def test_markup(self):
         m = rt.mono_glyph_markup('\u2614')
