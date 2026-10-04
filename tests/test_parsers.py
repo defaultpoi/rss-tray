@@ -586,7 +586,7 @@ class TestPopupCss(unittest.TestCase):
 
     def test_list_area_background_uses_the_shorthand_that_resets_theme_images(self):
         rules = self._rules()
-        for selector in ('list', 'viewport', 'scrolledwindow', 'overlay', '.weather-bar', '.timer-bar'):
+        for selector in ('list', 'viewport', 'scrolledwindow', 'overlay', '.popup-content', '.weather-bar', '.timer-bar'):
             self.assertTrue(any('background:' in body for body in rules[selector]), selector)
 
     def test_no_plain_background_color_left_on_those_widgets(self):
@@ -622,6 +622,24 @@ class TestEditFileExternally(unittest.TestCase):
                 mock.patch.object(rt.subprocess, 'Popen') as popen:
             rt.edit_file_externally('/tmp/x.conf')
         popen.assert_called_once_with(['xfce4-terminal', '-e', 'nvim "/tmp/x.conf"'])
+
+
+class TestEmptyAreaClick(unittest.TestCase):
+    class Stub:
+        on_empty_area_button_press = rt.RssTray.on_empty_area_button_press
+
+        def __init__(self):
+            self.popup = mock.MagicMock()
+
+    def test_right_click_closes_the_popup(self):
+        stub = self.Stub()
+        self.assertTrue(stub.on_empty_area_button_press(None, mock.Mock(button=3)))
+        stub.popup.hide.assert_called_once()
+
+    def test_other_buttons_are_left_alone(self):
+        stub = self.Stub()
+        self.assertFalse(stub.on_empty_area_button_press(None, mock.Mock(button=1)))
+        stub.popup.hide.assert_not_called()
 
 
 class TestMonoGlyph(unittest.TestCase):
