@@ -9,7 +9,7 @@ A minimal tray-based RSS/Atom reader for Linux, built with Python and GTK3 as a 
   - orange: unread news
   - red: package updates available
 
-  Live Twitch channels are deliberately not counted in the badge.
+  Live Twitch and YouTube channels are deliberately not counted in the badge.
 - **Popup list** grouped by feed. Left-click a row to open it and mark it read, right-click a row to mark it read only, click a feed header to mark the whole feed read. The popup auto-opens on new items and closes on focus-out.
 - **Feeds:** per-feed check intervals, custom display names, mute phrases. Items older than 24 h are silently marked seen the first time they are seen.
 - **Weather** (Open-Meteo): today's temperature, high/low, wind and rain, with a 5-day forecast behind the `›` button.
@@ -17,7 +17,7 @@ A minimal tray-based RSS/Atom reader for Linux, built with Python and GTK3 as a 
 - **Twitch:** live channels are polled (every 15 minutes by default, `interval=` in `[twitch]`; optionally only during per-channel schedules, see below) through Twitch's unofficial GQL API (no app registration). Rows read `<user> - <category>` (the stream title is the tooltip), and the bullet turns into a play triangle on the channel that's playing. Click a row to play it with `streamlink` and `mpv` at the configured quality (default `best`); the popup closes, and a second click on another channel reuses the same maximized mpv window. If either binary isn't installed, or launching fails, it opens the channel in your browser instead.
 - **YouTube Live:** live channels are polled (every 15 minutes by default, `interval=` in `[youtube]`; same per-channel schedules) via `streamlink --json <channel>/live` per channel -- no API key, and the same extraction path used for actual playback, so the check can't disagree with what clicking the row does. There's no keyless batch API for YouTube, so this is one streamlink call per channel (heavier than Twitch's single batched request). Shares the same "Live now" list, quality config, and browser fallback as Twitch.
 - **Player window titles:** mpv's title is `<Site> · <user> · <stream title>` for both platforms.
-- **Timer:** a 0-2 h slider behind the "Timer" footer button. It keeps counting with the popup closed and plays the notification sound twice at zero.
+- **Timer:** a slider behind the "Timer" footer button (0 to 2 h in 1-minute steps by default; the maximum and the step are configurable with `max=<minutes>` and `step=<seconds>` in the `[timer]` section, see below). It counts down against a fixed deadline, keeps counting with the popup closed, and plays the notification sound twice at zero.
 - **Severe-weather alerts** (optional, `alerts=true` in `[weather]`): polls the MeteoAlarm feed for your country every 30 minutes, filtered to the region matching the configured coordinates (country and region are reverse-geocoded via OpenStreetMap once and then stored in `config.conf`; delete the `country=`/`region=` lines to resolve them again; Europe only, since MeteoAlarm only covers European countries; if your coordinates resolve to a country it doesn't cover, the app writes `alerts=false` into `config.conf` itself). An active alert is color-coded by severity (yellow/orange/red for moderate/severe/extreme) and pulses the matching weather value and the tray badge, faster for more severe alerts.
 
 ## Requirements
@@ -58,7 +58,7 @@ Everything lives in `~/.config/rss-tray/`:
 |------|---------|
 | `config.conf` | feeds, mute phrases, Twitch and YouTube channels |
 | `state.json` | read/unread state, timestamps, cached updates and live channels (safe to delete to reset) |
-| `notification.wav` | sound played on new items and when the timer ends |
+| `notification.wav` | sound played on new items and when the timer ends (no sound if the file is absent) |
 
 `config.conf` is INI-like:
 
@@ -116,7 +116,7 @@ A schedule limits live checks to the times a channel is expected to stream, so y
 - A schedule is one or more windows separated by `;`, each `[days] HH:MM[-HH:MM]` (`:` or `.` between hours and minutes).
 - Days: `mon`...`sun` (or full names), ranges such as `tue-sun` (they may wrap, `fri-mon`), lists such as `mon,wed,fri`, `daily`, `weekdays`, `weekends`. Leave the days out for every day; leave the time out for the whole day.
 - No end time means until midnight. An end earlier than the start runs past midnight into the next day (`fri 22:00-02:00`).
-- Times are the system's local time (DST included). The app reads the clock itself, so no NTP service or other dependency is needed, though keeping the clock correct (chrony or similar) obviously helps.
+- Times are the system's local time (DST included). The app reads the system clock itself, so it needs no extra service or dependency.
 - Inside a window the channel is checked at the normal `interval=`, and once right when the window opens. A channel that is live when its window ends keeps being checked until it goes offline. An unreadable schedule is ignored (the channel is then checked all the time).
 
 ## Passwordless updates (optional)
