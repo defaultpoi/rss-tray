@@ -719,6 +719,90 @@ class TestLauncher(TmpConfigCase):
         win.hide.assert_called_once()
 
 
+class TestConnectivityState(unittest.TestCase):
+    def test_success_is_online_immediately_and_resets_failures(self):
+        self.assertEqual(rt.next_connectivity(False, 5, True), (True, 0))
+
+    def test_one_failed_probe_does_not_go_offline(self):
+        self.assertEqual(rt.next_connectivity(True, 0, False), (True, 1))
+
+    def test_consecutive_failures_go_offline_and_stay_offline(self):
+        online, failures = True, 0
+        for _ in range(rt.OFFLINE_AFTER_FAILED_PROBES):
+            online, failures = rt.next_connectivity(online, failures, False)
+        self.assertFalse(online)
+        self.assertEqual(rt.next_connectivity(online, failures, False)[0], False)
+
+
+class TestOfflineBehavior(unittest.TestCase):
+    class Stub:
+        on_row_activated = rt.RssTray.on_row_activated
+        _on_probe_result = rt.RssTray._on_probe_result
+        _set_online = rt.RssTray._set_online
+        probe_connectivity = rt.RssTray.probe_connectivity
+
+        def __init__(self, online=True):
+            self.online = online
+            self._probe_failures = 0
+            self._probing = True
+            self.offline_banner = mock.MagicMock()
+            self.removed = []
+            self.updates = 0
+            self.refreshes = 0
+
+        def _remove_unread(self, item_id):
+            self.removed.append(item_id)
+
+        def update_icon(self):
+            self.updates += 1
+
+        def refresh_list(self):
+            self.refreshes += 1
+
+    def _news_row(self):
+        return mock.Mock(spec=['entry_id', 'link'], entry_id='id1', link='https://example.com/a')
+
+    def test_online_click_opens_and_marks_read(self):
+        stub = self.Stub(online=True)
+        with mock.patch.object(rt.webbrowser, 'open') as wb_open:
+            stub.on_row_activated(None, self._news_row())
+        wb_open.assert_called_once_with('https://example.com/a')
+        self.assertEqual(stub.removed, ['id1'])
+
+    def test_offline_click_only_dismisses(self):
+        stub = self.Stub(online=False)
+        with mock.patch.object(rt.webbrowser, 'open') as wb_open:
+            stub.on_row_activated(None, self._news_row())
+        wb_open.assert_not_called()
+        self.assertEqual(stub.removed, ['id1'])
+        self.assertEqual((stub.updates, stub.refreshes), (1, 1))
+
+    def test_probe_results_drive_the_banner(self):
+        stub = self.Stub(online=True)
+        stub._on_probe_result(False)
+        stub.offline_banner.set_visible.assert_not_called()   # first failure: still online
+        stub._on_probe_result(False)
+        self.assertFalse(stub.online)
+        stub.offline_banner.set_visible.assert_called_with(True)
+        stub._on_probe_result(True)
+        self.assertTrue(stub.online)
+        stub.offline_banner.set_visible.assert_called_with(False)
+
+    def test_probe_does_not_overlap_itself(self):
+        stub = self.Stub()
+        stub._probing = True
+        with mock.patch.object(rt.threading, 'Thread') as thread:
+            self.assertTrue(stub.probe_connectivity())
+        thread.assert_not_called()
+        stub._probing = False
+        with mock.patch.object(rt.threading, 'Thread') as thread:
+            stub.probe_connectivity()
+        thread.assert_called_once()
+
+    def test_banner_css_uses_the_shorthand(self):
+        self.assertIn('.offline-banner { background:', rt.POPUP_CSS)
+
+
 class TestMonoGlyph(unittest.TestCase):
     def test_markup(self):
         m = rt.mono_glyph_markup('\u2614')
