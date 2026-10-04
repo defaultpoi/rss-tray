@@ -39,6 +39,8 @@ SCHEDULER_TICK_SECONDS = 60  # how often we check whether any feed is due
 PENDING_CHECK_INTERVAL_SECONDS = 12 * 3600  # default: twice a day, for system-wide package updates
 TWITCH_CHECK_INTERVAL_SECONDS = 900  # how often to poll Twitch live status
 NETWORK_RETRY_SECONDS = 10  # how often to recheck connectivity if offline at startup
+OFFLINE_PROBE_SECONDS = 10  # how often the popup's offline indicator re-probes the network
+OFFLINE_AFTER_FAILED_PROBES = 2  # consecutive failed probes before showing 'offline' (ignores blips)
 MAX_LIST_ITEMS = 40
 MAX_TITLE_LEN = 60
 MAX_ITEM_AGE_SECONDS = 24 * 3600  # ignore entries older than this on first sight
@@ -613,6 +615,16 @@ def is_online():
         except OSError:
             continue
     return False
+
+
+def next_connectivity(online, failures, probe_ok):
+    """(online, failures) after one probe: a success means online at once, but
+    it takes OFFLINE_AFTER_FAILED_PROBES failures in a row to go offline, so
+    one dropped probe doesn't flash the indicator."""
+    if probe_ok:
+        return True, 0
+    failures += 1
+    return (online and failures < OFFLINE_AFTER_FAILED_PROBES), failures
 
 
 def load_state():
@@ -1473,6 +1485,7 @@ def temp_icon_layout(size, text_width, text_height):
 # background-color -- the whole news area then turns black/dark with the rows
 # sitting on top of it. The shorthand also resets the image. Text colour is
 # forced too, since a dark theme's light foreground would be invisible on white.
+OFFLINE_BANNER_TEXT = "Offline — news can't be opened, only dismissed"
 LAUNCHER_MAX_HEIGHT_PX = 300  # the Launch list scrolls beyond this
 LIST_BOTTOM_SPACE_PX = 85  # reserved under the last row for the timer slide
 
@@ -1482,6 +1495,7 @@ button { padding: 1px; }
 list, viewport, scrolledwindow, overlay, .popup-content { background: #ffffff; }
 list, list label { color: #000000; }
 .weather-bar { background: #e8eef5; }
+.offline-banner { background: #b3261e; color: #ffffff; padding: 3px 6px; font-weight: bold; }
 .weather-bar label, .timer-bar label { color: #000000; }
 .timer-bar { background: #ffffff; }
 """
@@ -1507,6 +1521,10 @@ class RssTray:
         self.listbox = None
         self.scroller = None
         self._launcher_open = False
+        self.online = True            # last known connectivity (see probe_connectivity)
+        self._probe_failures = 0
+        self._probing = False
+        self.offline_banner = None
         self.weather_data = None
         self.weather_box = None
         self.weather_view = 'today'
@@ -1541,6 +1559,8 @@ class RssTray:
         GLib.timeout_add_seconds(4, self.initial_youtube_check)
         GLib.timeout_add_seconds(load_youtube_check_interval(), self.periodic_youtube_check)
         GLib.timeout_add_seconds(1, self._timer_tick)
+        GLib.timeout_add_seconds(1, lambda: self.probe_connectivity() and False)
+        GLib.timeout_add_seconds(OFFLINE_PROBE_SECONDS, self.probe_connectivity)
         self._scheduled_active = self._current_scheduled_active()
         GLib.timeout_add_seconds(60, self._live_schedule_tick)
 
@@ -2226,6 +2246,30 @@ class RssTray:
         max_height = int(screen_height * 0.75)
         self.scroller.set_max_content_height(max_height)
 
+    def probe_connectivity(self):
+        """Background network probe feeding the popup's offline indicator.
+        Returns True so it can also be used directly as a repeating timer."""
+        if not self._probing:
+            self._probing = True
+
+            def work():
+                ok = is_online()
+                GLib.idle_add(self._on_probe_result, ok)
+            threading.Thread(target=work, daemon=True).start()
+        return True
+
+    def _on_probe_result(self, probe_ok):
+        self._probing = False
+        online, self._probe_failures = next_connectivity(self.online, self._probe_failures, probe_ok)
+        if online != self.online:
+            self._set_online(online)
+        return False
+
+    def _set_online(self, online):
+        self.online = online
+        if self.offline_banner is not None:
+            self.offline_banner.set_visible(not online)
+
     def on_popup_focus_out(self, win, _event):
         if self._launcher_open:
             return False  # the Launch list took focus; don't close under it
@@ -2301,6 +2345,15 @@ class RssTray:
         self.rebuild_weather_bar()
         outer.pack_start(weather_box, False, False, 0)
         outer.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 0)
+
+        banner = Gtk.Label(label=OFFLINE_BANNER_TEXT)
+        banner.get_style_context().add_class('offline-banner')
+        banner.set_line_wrap(True)
+        banner.set_justify(Gtk.Justification.CENTER)
+        banner.set_no_show_all(True)  # shown/hidden by _set_online, not by show_all()
+        banner.set_visible(not self.online)
+        self.offline_banner = banner
+        outer.pack_start(banner, False, False, 0)
 
         scroller = Gtk.ScrolledWindow()
         scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -2437,6 +2490,7 @@ class RssTray:
             self.timer_label = None
             self.timer_box = None
         self.weather_view = 'today'
+        self.probe_connectivity()  # fresh answer for the indicator while the popup is open
         self.build_popup_window()
         self._update_scroller_max_height()
         self.refresh_list()
@@ -2841,7 +2895,7 @@ class RssTray:
             return
         item_id, link = row.entry_id, row.link
         self._remove_unread(item_id)
-        if link:
+        if link and self.online:  # offline: nothing can be opened, the click only dismisses
             webbrowser.open(link)
         self.update_icon()
         self.refresh_list()
