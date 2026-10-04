@@ -746,6 +746,10 @@ class TestOfflineBehavior(unittest.TestCase):
             self._probe_failures = 0
             self._probing = True
             self.offline_banner = mock.MagicMock()
+            self.start_check_thread = mock.Mock()
+            self.start_weather_fetch = mock.Mock()
+            self.start_twitch_check = mock.Mock()
+            self.start_youtube_check = mock.Mock()
             self.removed = []
             self.updates = 0
             self.refreshes = 0
@@ -844,6 +848,201 @@ class TestOfflineBehavior(unittest.TestCase):
         self.assertIn('.offline-banner { background:', rt.POPUP_CSS)
 
 
+class TestRunWhenOnline(unittest.TestCase):
+    def test_waits_in_the_background_until_online_then_runs(self):
+        done = rt.threading.Event()
+        with mock.patch.object(rt, 'is_online', side_effect=[False, False, True]) as probe, \
+                mock.patch.object(rt.time_module, 'sleep') as sleep:
+            rt.run_when_online(done.set)
+            self.assertTrue(done.wait(timeout=5))
+        self.assertEqual(probe.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+        sleep.assert_called_with(rt.NETWORK_RETRY_SECONDS)
+
+    def test_main_thread_returns_immediately(self):
+        class Stub:
+            initial_check = rt.RssTray.initial_check
+            initial_twitch_check = rt.RssTray.initial_twitch_check
+            initial_youtube_check = rt.RssTray.initial_youtube_check
+            initial_weather_check = rt.RssTray.initial_weather_check
+        stub = Stub()
+        stub.start_check_thread = stub.start_twitch_check = stub.start_youtube_check = stub.start_weather_fetch = mock.Mock()
+        with mock.patch.object(rt, 'run_when_online') as run, mock.patch.object(rt, 'is_online') as probe:
+            for name in ('initial_check', 'initial_twitch_check', 'initial_youtube_check', 'initial_weather_check'):
+                self.assertFalse(getattr(stub, name)())
+        self.assertEqual(run.call_count, 4)
+        probe.assert_not_called()  # no blocking network probe on the calling (GTK) thread
+
+
+class TestReconnectCatchUp(unittest.TestCase):
+    def test_coming_back_online_triggers_every_refresh_once(self):
+        stub = TestOfflineBehavior.Stub(online=False)
+        stub._set_online(True)
+        for name in ('start_check_thread', 'start_weather_fetch', 'start_twitch_check', 'start_youtube_check'):
+            getattr(stub, name).assert_called_once()
+
+    def test_going_offline_or_staying_online_triggers_nothing(self):
+        stub = TestOfflineBehavior.Stub(online=True)
+        stub._set_online(True)
+        stub._set_online(False)
+        stub.start_check_thread.assert_not_called()
+        stub.start_weather_fetch.assert_not_called()
+
+
+class TestFeedCheckRobustness(TmpConfigCase):
+    class Stub:
+        check_feeds = rt.RssTray.check_feeds
+
+        def __init__(self, online=True):
+            self.online = online
+            self.lock = rt.threading.Lock()
+            self.state = {'seen': {}, 'unread': [], 'last_checked': {}}
+            self.on_new_items = mock.Mock()
+
+    def test_offline_unforced_check_does_nothing(self):
+        self.conf('[feeds]\nhttps://a.example/feed\n')
+        stub = self.Stub(online=False)
+        with mock.patch.object(rt.feedparser, 'parse') as parse, mock.patch.object(rt, 'save_state'):
+            stub.check_feeds()
+        parse.assert_not_called()
+        self.assertEqual(stub.state['last_checked'], {})
+
+    def test_forced_check_still_runs_offline(self):
+        self.conf('[feeds]\nhttps://a.example/feed\n')
+        stub = self.Stub(online=False)
+        parsed = mock.Mock(bozo=False, entries=[])
+        with mock.patch.object(rt.feedparser, 'parse', return_value=parsed) as parse, mock.patch.object(rt, 'save_state'):
+            stub.check_feeds(force=True)
+        parse.assert_called_once()
+
+    def test_failed_fetch_is_retried_soon_not_after_a_full_interval(self):
+        self.conf('[feeds]\nhttps://a.example/feed||30\n')  # 30 minute interval
+        stub = self.Stub()
+        failed = mock.Mock(bozo=True, entries=[])
+        with mock.patch.object(rt.feedparser, 'parse', return_value=failed), \
+                mock.patch.object(rt.time_module, 'time', return_value=1_000_000.0), \
+                mock.patch.object(rt, 'save_state'):
+            stub.check_feeds()
+        due_again_in = 30 * 60 - (1_000_000.0 - stub.state['last_checked']['https://a.example/feed'])
+        self.assertAlmostEqual(due_again_in, rt.FEED_RETRY_SECONDS, delta=1)
+
+    def test_successful_fetch_counts_as_checked_now(self):
+        self.conf('[feeds]\nhttps://a.example/feed\n')
+        stub = self.Stub()
+        ok = mock.Mock(bozo=False, entries=[])
+        with mock.patch.object(rt.feedparser, 'parse', return_value=ok), \
+                mock.patch.object(rt.time_module, 'time', return_value=1_000_000.0), \
+                mock.patch.object(rt, 'save_state'):
+            stub.check_feeds()
+        self.assertEqual(stub.state['last_checked']['https://a.example/feed'], 1_000_000.0)
+
+
+class TestPopupRebuildRules(unittest.TestCase):
+    class Stub:
+        show_popup = rt.RssTray.show_popup
+
+        def __init__(self, visible):
+            self.popup = mock.MagicMock()
+            self.popup.get_visible.return_value = visible
+            self.refresh_list = mock.Mock()
+            self.probe_connectivity = mock.Mock()
+            self.position_popup = mock.Mock()
+            self._update_scroller_max_height = mock.Mock()
+            self._launcher_open = True
+            self.old_popup = self.popup
+
+        def build_popup_window(self):
+            self.popup = mock.MagicMock()
+
+    def test_auto_show_on_a_visible_popup_only_refreshes_the_list(self):
+        stub = self.Stub(visible=True)
+        with mock.patch.object(rt, 'is_fullscreen_active', return_value=False):
+            stub.show_popup(auto=True)
+        stub.refresh_list.assert_called_once()
+        stub.old_popup.destroy.assert_not_called()
+        self.assertTrue(stub._launcher_open is True)
+
+    def test_manual_show_rebuilds_and_clears_the_launch_guard(self):
+        stub = self.Stub(visible=True)
+        with mock.patch.object(rt, 'is_fullscreen_active', return_value=False):
+            stub.show_popup()
+        stub.old_popup.destroy.assert_called_once()
+        self.assertFalse(stub._launcher_open)
+        stub.popup.show_all.assert_called_once()
+
+    def test_auto_show_on_a_hidden_popup_rebuilds(self):
+        stub = self.Stub(visible=False)
+        with mock.patch.object(rt, 'is_fullscreen_active', return_value=False):
+            stub.show_popup(auto=True)
+        stub.old_popup.destroy.assert_called_once()
+
+
+class TestPulseRedraws(unittest.TestCase):
+    class Stub:
+        _alert_pulse_tick = rt.RssTray._alert_pulse_tick
+        _pulse_signature = rt.RssTray._pulse_signature
+        _pulse_on_for = rt.RssTray._pulse_on_for
+        has_active_alerts = rt.RssTray.has_active_alerts
+
+        def __init__(self, colors):
+            self.active_alerts = [{'severity_color': c} for c in colors]
+            self._alert_pulse_counter = 0
+            self._last_pulse_signature = None
+            self.updates = 0
+            self.popup = None
+
+        def update_icon(self):
+            self.updates += 1
+
+    def test_yellow_redraws_only_when_its_phase_flips(self):
+        stub = self.Stub(['yellow'])
+        for _ in range(8):
+            stub._alert_pulse_tick()
+        self.assertEqual(stub.updates, 3)  # ticks 1, 4 and 8, not all eight
+
+    def test_red_flips_every_tick(self):
+        stub = self.Stub(['red'])
+        for _ in range(8):
+            stub._alert_pulse_tick()
+        self.assertEqual(stub.updates, 8)
+
+    def test_no_alerts_no_redraws(self):
+        stub = self.Stub([])
+        for _ in range(8):
+            stub._alert_pulse_tick()
+        self.assertEqual(stub.updates, 0)
+
+
+class TestTwitchBatching(unittest.TestCase):
+    def test_channels_are_split_into_batches(self):
+        sizes = []
+
+        def batch(channels):
+            sizes.append(len(channels))
+            return {c: {'title': '', 'category': ''} for c in channels[:1]}
+        with mock.patch.object(rt, '_check_twitch_batch', side_effect=batch):
+            live = rt.check_twitch_live_channels([f'c{i}' for i in range(45)])
+        self.assertEqual(sizes, [20, 20, 5])
+        self.assertEqual(set(live), {'c0', 'c20', 'c40'})
+
+    def test_any_failed_batch_means_no_result(self):
+        with mock.patch.object(rt, '_check_twitch_batch', side_effect=[{}, None, {}]):
+            self.assertIsNone(rt.check_twitch_live_channels([f'c{i}' for i in range(45)]))
+
+    def test_no_channels_is_an_empty_dict_without_a_request(self):
+        with mock.patch.object(rt, '_check_twitch_batch') as batch:
+            self.assertEqual(rt.check_twitch_live_channels([]), {})
+        batch.assert_not_called()
+
+
+class TestConfigEncoding(TmpConfigCase):
+    def test_non_utf8_bytes_do_not_crash_the_loaders(self):
+        with open(rt.CONFIG_FILE, 'wb') as f:
+            f.write(b'[feeds]\nhttps://a.example/feed|Caf\xe9\n')
+        feeds = rt.load_feeds()
+        self.assertEqual(feeds[0][0], 'https://a.example/feed')
+
+
 class TestMonoGlyph(unittest.TestCase):
     def test_markup(self):
         m = rt.mono_glyph_markup('\u2614')
@@ -881,6 +1080,7 @@ class TestUpdatesDue(TmpConfigCase):
 
         def __init__(self, last_checked):
             self.lock = rt.threading.Lock()
+            self._xbps_lock = rt.threading.Lock()
             self.state = {'updates_last_checked': last_checked}
 
     def _scans(self, last_checked_ago_hours, force=False):
@@ -1781,6 +1981,39 @@ class TestCheckYoutubeLiveChannels(unittest.TestCase):
             return result
         with mock.patch.object(rt.subprocess, 'run', side_effect=run):
             self.assertIsNone(rt.check_youtube_live_channels(['a']))
+
+
+class TestUpdateScanVsInstall(TestUpdatesDue):
+    def test_scan_is_skipped_while_an_install_holds_the_xbps_lock(self):
+        stub = self.Stub(0)
+        stub._xbps_lock.acquire()
+        with mock.patch.object(rt.time_module, 'time', return_value=1_000_000_000.0), \
+                mock.patch.object(rt, 'list_all_updates') as scan, mock.patch.object(rt, 'save_state'):
+            stub.check_updates_if_due(force=True)
+        scan.assert_not_called()
+        self.assertEqual(stub.state.get('updates_fail_count', 0), 0)  # skipped, not failed
+
+    def test_lock_is_released_after_a_scan(self):
+        stub = self.Stub(0)
+        with mock.patch.object(rt.time_module, 'time', return_value=1_000_000_000.0), \
+                mock.patch.object(rt, 'list_all_updates', return_value=[]), mock.patch.object(rt, 'save_state'):
+            stub.check_updates_if_due(force=True)
+        self.assertTrue(stub._xbps_lock.acquire(blocking=False))
+
+
+class TestInstallStatusUpdates(TestRunUpdateAll):
+    def test_repeated_phases_are_not_reported_again(self):
+        stub = self.Stub()
+        proc = mock.MagicMock()
+        proc.stdout = iter(['[*] Downloading packages\n', 'file line\n', '[*] Collecting package files\n',
+                            '[*] Unpacking packages\n', '[*] Configuring unpacked packages\n'])
+        proc.returncode = 0
+        with mock.patch.object(rt, 'get_installed_version', side_effect=['v1', 'v1', 'v2']), \
+                mock.patch.object(rt.subprocess, 'Popen', return_value=proc), \
+                mock.patch.object(rt.threading, 'Timer'), mock.patch.object(rt, 'PRIVILEGE_CMD', []):
+            stub._run_update_all(['pkg'])
+        statuses = [s for p, s in stub.statuses]
+        self.assertEqual(statuses, ['Installing…', 'Downloading…', 'Installing…', 'Done'])
 
 
 if __name__ == '__main__':
