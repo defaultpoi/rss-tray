@@ -769,13 +769,54 @@ class TestOfflineBehavior(unittest.TestCase):
         wb_open.assert_called_once_with('https://example.com/a')
         self.assertEqual(stub.removed, ['id1'])
 
-    def test_offline_click_only_dismisses(self):
+    def test_offline_left_click_on_a_news_item_does_nothing(self):
         stub = self.Stub(online=False)
         with mock.patch.object(rt.webbrowser, 'open') as wb_open:
             stub.on_row_activated(None, self._news_row())
         wb_open.assert_not_called()
+        self.assertEqual(stub.removed, [])
+        self.assertEqual((stub.updates, stub.refreshes), (0, 0))
+
+    def test_offline_feed_header_click_does_nothing(self):
+        stub = self.Stub(online=False)
+        stub.mark_feed_read = mock.Mock()
+        stub.on_row_activated(None, mock.Mock(spec=['header_feed_url'], header_feed_url='https://a'))
+        stub.mark_feed_read.assert_not_called()
+
+    def test_online_feed_header_click_marks_the_feed_read(self):
+        stub = self.Stub(online=True)
+        stub.mark_feed_read = mock.Mock()
+        stub.on_row_activated(None, mock.Mock(spec=['header_feed_url'], header_feed_url='https://a'))
+        stub.mark_feed_read.assert_called_once_with('https://a')
+
+    def test_offline_install_all_header_does_nothing(self):
+        stub = self.Stub(online=False)
+        stub.install_all_updates = mock.Mock()
+        stub.on_row_activated(None, mock.Mock(spec=['install_all_header'], install_all_header=True))
+        stub.install_all_updates.assert_not_called()
+
+    def test_online_install_all_header_installs(self):
+        stub = self.Stub(online=True)
+        stub.install_all_updates = mock.Mock()
+        stub.on_row_activated(None, mock.Mock(spec=['install_all_header'], install_all_header=True))
+        stub.install_all_updates.assert_called_once()
+
+    def test_offline_live_channel_rows_are_unaffected(self):
+        stub = self.Stub(online=False)
+        stub.popup = None
+        with mock.patch.object(rt, 'open_twitch_stream') as play:
+            stub.on_row_activated(None, mock.Mock(spec=['twitch_channel'], twitch_channel='chan'))
+        play.assert_called_once()
+
+    def test_offline_right_click_still_dismisses(self):
+        stub = self.Stub(online=False)
+        stub.on_listbox_button_press = rt.RssTray.on_listbox_button_press.__get__(stub)
+        stub.on_mark_read_clicked = rt.RssTray.on_mark_read_clicked.__get__(stub)
+        listbox = mock.Mock()
+        listbox.get_row_at_y.return_value = self._news_row()
+        event = mock.Mock(button=3, y=10.0)
+        self.assertTrue(stub.on_listbox_button_press(listbox, event))
         self.assertEqual(stub.removed, ['id1'])
-        self.assertEqual((stub.updates, stub.refreshes), (1, 1))
 
     def test_probe_results_drive_the_banner(self):
         stub = self.Stub(online=True)
