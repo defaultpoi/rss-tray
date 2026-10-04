@@ -41,6 +41,7 @@ TWITCH_CHECK_INTERVAL_SECONDS = 900  # how often to poll Twitch live status
 NETWORK_RETRY_SECONDS = 10  # how often to recheck connectivity if offline at startup
 OFFLINE_PROBE_SECONDS = 10  # how often the popup's offline indicator re-probes the network
 OFFLINE_AFTER_FAILED_PROBES = 2  # consecutive failed probes before showing 'offline' (ignores blips)
+FEED_RETRY_SECONDS = 120  # retry a feed this soon after a failed fetch (instead of a full interval)
 MAX_LIST_ITEMS = 40
 MAX_TITLE_LEN = 60
 MAX_ITEM_AGE_SECONDS = 24 * 3600  # ignore entries older than this on first sight
@@ -156,7 +157,7 @@ def _read_config_sections():
                 'updates': [], 'launcher': []}
     current = None
     if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE) as f:
+        with open(CONFIG_FILE, encoding='utf-8', errors='replace') as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith('#'):
@@ -617,6 +618,18 @@ def is_online():
     return False
 
 
+def run_when_online(fn):
+    """Calls fn() on a background thread as soon as the network is up (polling
+    every NETWORK_RETRY_SECONDS). is_online() blocks for up to a second per
+    probe target, so it must never run on the GTK main loop: while offline
+    that froze the tray for seconds at every retry."""
+    def work():
+        while not is_online():
+            time_module.sleep(NETWORK_RETRY_SECONDS)
+        fn()
+    threading.Thread(target=work, daemon=True).start()
+
+
 def next_connectivity(online, failures, probe_ok):
     """(online, failures) after one probe: a success means online at once, but
     it takes OFFLINE_AFTER_FAILED_PROBES failures in a row to go offline, so
@@ -758,17 +771,12 @@ def list_all_updates():
     return parse_xbps_updates(output)
 
 
-def check_twitch_live_channels(channels):
-    """Uses Twitch's internal (unofficial) GraphQL API — the same one twitch.tv
-    itself uses for logged-out visitors — so no app registration/secret is
-    needed. Undocumented; could break if Twitch changes their internal schema.
-    Batches every channel into a single POST request (Twitch's GQL endpoint
-    accepts a JSON array of operations) instead of one request per channel.
-    Returns {channel: {'title', 'category'}} for whichever channels are
-    currently live; a failed/offline channel is simply absent from the
-    result, not marked False."""
-    if not channels:
-        return {}
+TWITCH_BATCH_SIZE = 20  # operations per GQL request
+
+
+def _check_twitch_batch(channels):
+    """One batched GQL POST for `channels`; {channel: {'title', 'category'}}
+    for the live ones, or None if the request failed."""
     payload = json.dumps([
         {
             "operationName": "StreamMetadata",
@@ -806,6 +814,25 @@ def check_twitch_live_channels(channels):
                 'title': stream.get('title') or '',
                 'category': (stream.get('game') or {}).get('name') or '',
             }
+    return live
+
+
+def check_twitch_live_channels(channels):
+    """Uses Twitch's internal (unofficial) GraphQL API — the same one twitch.tv
+    itself uses for logged-out visitors — so no app registration/secret is
+    needed. Undocumented; could break if Twitch changes their internal schema.
+    Channels are batched into JSON-array POSTs of TWITCH_BATCH_SIZE (one
+    request per channel would be wasteful, one giant request risks rejection).
+    Returns {channel: {'title', 'category'}} for whichever channels are
+    currently live; a failed/offline channel is simply absent from the
+    result, not marked False. Returns None if any request failed, so the
+    caller keeps its last known state rather than acting on a partial view."""
+    live = {}
+    for start in range(0, len(channels), TWITCH_BATCH_SIZE):
+        batch = _check_twitch_batch(channels[start:start + TWITCH_BATCH_SIZE])
+        if batch is None:
+            return None
+        live.update(batch)
     return live
 
 
@@ -1530,6 +1557,7 @@ class RssTray:
         self.weather_view = 'today'
         self.active_alerts = []
         self._alert_pulse_counter = 0
+        self._last_pulse_signature = None
         self.active_installs = 0
         self.install_status = {}  # pkgname -> 'Waiting…'/'Downloading…'/'Installing…'/'Done'/'Failed'
         self.timer_remaining_seconds = 0
@@ -1591,10 +1619,7 @@ class RssTray:
         return False
 
     def initial_check(self):
-        if not is_online():
-            GLib.timeout_add_seconds(NETWORK_RETRY_SECONDS, self.initial_check)
-            return False
-        self.start_check_thread(force=True)
+        run_when_online(lambda: self.start_check_thread(force=True))
         return False
 
     def periodic_check(self):
@@ -1614,6 +1639,8 @@ class RssTray:
             self._check_lock.release()
 
     def check_feeds(self, force=False):
+        if not self.online and not force:
+            return  # offline: nothing could be fetched, and a failed fetch must not count as a check
         feeds = load_feeds()
         mute_phrases = load_mute_filters()
         new_items = []
@@ -1623,14 +1650,21 @@ class RssTray:
             last_checked = dict(self.state.get('last_checked', {}))
         newly_seen_ids = set()
         due_urls = []
+        intervals = {}
         for url, _custom_name, interval_seconds in feeds:
+            intervals[url] = interval_seconds
             last = last_checked.get(url, 0)
             if force or (now - last) >= interval_seconds:
                 due_urls.append(url)
         for url in due_urls:
+            retry_soon = now - intervals[url] + min(intervals[url], FEED_RETRY_SECONDS)
             try:
                 parsed = feedparser.parse(url)
             except Exception:
+                last_checked[url] = retry_soon
+                continue
+            if getattr(parsed, 'bozo', False) and not parsed.entries:
+                last_checked[url] = retry_soon  # fetch/parse failed
                 continue
             last_checked[url] = now
             for entry in parsed.entries:
@@ -1686,7 +1720,12 @@ class RssTray:
                 return
             if fails and (now - last_attempt) < min(300 * 2 ** (fails - 1), interval):
                 return  # backing off after failed scans
-        pkgnames = list_all_updates()
+        if not self._xbps_lock.acquire(blocking=False):
+            return  # an install is running: scanning mid-transaction would give a wrong list
+        try:
+            pkgnames = list_all_updates()
+        finally:
+            self._xbps_lock.release()
         if pkgnames is None:
             with self.lock:
                 self.state['updates_last_attempt'] = now
@@ -1720,10 +1759,7 @@ class RssTray:
         return False
 
     def initial_twitch_check(self):
-        if not is_online():
-            GLib.timeout_add_seconds(NETWORK_RETRY_SECONDS, self.initial_twitch_check)
-            return False
-        self.start_twitch_check()
+        run_when_online(self.start_twitch_check)
         return False
 
     def periodic_twitch_check(self):
@@ -1768,10 +1804,7 @@ class RssTray:
         return False
 
     def initial_youtube_check(self):
-        if not is_online():
-            GLib.timeout_add_seconds(NETWORK_RETRY_SECONDS, self.initial_youtube_check)
-            return False
-        self.start_youtube_check()
+        run_when_online(self.start_youtube_check)
         return False
 
     def periodic_youtube_check(self):
@@ -1814,7 +1847,7 @@ class RssTray:
         return False
 
     def initial_weather_check(self):
-        self.start_weather_fetch()
+        run_when_online(self.start_weather_fetch)
         return False
 
     def periodic_weather_check(self):
@@ -1895,12 +1928,21 @@ class RssTray:
             return (c % 4) < 2
         return (c % 8) < 4  # yellow
 
+    def _pulse_signature(self):
+        """Bright/dim phase of every alert colour in play; changes only when
+        something visible would actually change."""
+        colors = {a.get('severity_color', 'yellow') for a in self.active_alerts}
+        return tuple(self._pulse_on_for(c) for c in sorted(colors))
+
     def _alert_pulse_tick(self):
         self._alert_pulse_counter += 1
         if self.has_active_alerts():
-            self.update_icon()
-            if self.popup and self.popup.get_visible():
-                self.rebuild_weather_bar()
+            signature = self._pulse_signature()
+            if signature != self._last_pulse_signature:  # yellow/orange flip far less often than red
+                self._last_pulse_signature = signature
+                self.update_icon()
+                if self.popup and self.popup.get_visible():
+                    self.rebuild_weather_bar()
         return True
 
     def build_forecast_weather_segments(self):
@@ -2266,9 +2308,16 @@ class RssTray:
         return False
 
     def _set_online(self, online):
+        came_back = online and not self.online
         self.online = online
         if self.offline_banner is not None:
             self.offline_banner.set_visible(not online)
+        if came_back:
+            # don't wait out the remaining intervals after an outage
+            self.start_check_thread()
+            self.start_weather_fetch()
+            self.start_twitch_check()
+            self.start_youtube_check()
 
     def on_popup_focus_out(self, win, _event):
         if self._launcher_open:
@@ -2483,7 +2532,11 @@ class RssTray:
     def show_popup(self, auto=False):
         if auto and is_fullscreen_active():
             return  # don't interrupt a fullscreen video/game/presentation
+        if auto and self.popup is not None and self.popup.get_visible():
+            self.refresh_list()  # already open: update in place, keeping scroll position and any open Launch list
+            return
         if self.popup is not None:
+            self._launcher_open = False  # its Launch list (if open) dies with the window
             self.popup.destroy()
             self.popup = None
             self.timer_scale = None
@@ -2850,12 +2903,15 @@ class RssTray:
                     # "download" at all, so we key off these headers instead.
                     # Since we install one package at a time, every line in this
                     # stream belongs to the current package regardless of wording.
+                    shown = 'Installing…'
                     for line in proc.stdout:
                         stripped = line.strip()
-                        if stripped.startswith('[*] Downloading'):
-                            self._set_status(pkgname, 'Downloading…')
-                        elif stripped.startswith('[*]'):
-                            self._set_status(pkgname, 'Installing…')
+                        if not stripped.startswith('[*]'):
+                            continue
+                        status = 'Downloading…' if stripped.startswith('[*] Downloading') else 'Installing…'
+                        if status != shown:  # each change rebuilds the list; skip repeats
+                            shown = status
+                            self._set_status(pkgname, status)
                     proc.wait()
                     returncode = proc.returncode
                 except Exception:
@@ -2926,8 +2982,23 @@ class RssTray:
         self.refresh_list()
 
 
+def _install_quit_signal_handlers():
+    """SIGTERM (session logout, `kill`) and SIGINT (Ctrl+C) leave the GTK main
+    loop cleanly, so atexit hooks run and the local streamlink server isn't
+    left behind."""
+    def quit_loop():
+        Gtk.main_quit()
+        return GLib.SOURCE_REMOVE
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, quit_loop)
+        except (AttributeError, TypeError):
+            pass  # very old PyGObject: keep the default behaviour
+
+
 def main():
     RssTray()
+    _install_quit_signal_handlers()
     Gtk.main()
 
 
