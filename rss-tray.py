@@ -1440,10 +1440,12 @@ def temp_icon_layout(size, text_width, text_height):
 # background-color -- the whole news area then turns black/dark with the rows
 # sitting on top of it. The shorthand also resets the image. Text colour is
 # forced too, since a dark theme's light foreground would be invisible on white.
+LIST_BOTTOM_SPACE_PX = 85  # reserved under the last row for the timer slide
+
 POPUP_CSS = """
 list row { padding: 1px 3px; min-height: 0px; }
 button { padding: 1px; }
-list, viewport, scrolledwindow, overlay { background: #ffffff; }
+list, viewport, scrolledwindow, overlay, .popup-content { background: #ffffff; }
 list, list label { color: #000000; }
 .weather-bar { background: #e8eef5; }
 .weather-bar label, .timer-bar label { color: #000000; }
@@ -2221,11 +2223,26 @@ class RssTray:
         self.listbox.set_selection_mode(Gtk.SelectionMode.NONE)
         self.listbox.connect('row-activated', self.on_row_activated)
         self.listbox.connect('button-press-event', self.on_listbox_button_press)
-        self.listbox.set_margin_bottom(85)  # timer_box is 60px tall, valign END; the extra
-                                             # 25px keeps a visible gap above it instead of
-                                             # timer_box's top edge sitting flush against the
-                                             # last row
-        scroller.add(self.listbox)
+
+        # The list sits in a box together with a real spacer that reserves the
+        # strip the timer slides over (timer_box is 60px tall, valign END; the
+        # extra 25px keeps a gap above it instead of its top edge sitting flush
+        # against the last row). It must be actual content rather than a margin
+        # on the list: a margin lies outside every widget's paint area, so once
+        # the list was scrolled to its end that strip rendered as an unpainted
+        # black rectangle. An EventBox wraps it all so a right-click on any
+        # empty part -- including the strip behind a closed timer -- closes
+        # the popup.
+        spacer = Gtk.Box()
+        spacer.set_size_request(-1, LIST_BOTTOM_SPACE_PX)
+        list_content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        list_content.pack_start(self.listbox, False, False, 0)
+        list_content.pack_start(spacer, False, False, 0)
+        list_events = Gtk.EventBox()
+        list_events.get_style_context().add_class('popup-content')
+        list_events.connect('button-press-event', self.on_empty_area_button_press)
+        list_events.add(list_content)
+        scroller.add(list_events)
 
         content_overlay = Gtk.Overlay()
         content_overlay.add(scroller)
@@ -2597,6 +2614,12 @@ class RssTray:
         box.pack_start(label, True, True, 0)
         row.add(box)
         return row
+
+    def on_empty_area_button_press(self, _widget, event):
+        if event.button == 3 and self.popup:  # right-click on empty space: close
+            self.popup.hide()
+            return True
+        return False
 
     def on_listbox_button_press(self, listbox, event):
         if event.button == 3:  # right-click
