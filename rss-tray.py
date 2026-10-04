@@ -123,6 +123,12 @@ def ensure_config():
             "[updates]\n"
             "# interval=<hours> between package update scans (default 12, minimum 1).\n"
             "\n"
+            "[launcher]\n"
+            "# Commands for the popup's Launch button, one per line: Label|command\n"
+            "# (run through the shell, so ~, quotes and && work). Examples:\n"
+            "# Files|thunar ~\n"
+            "# Update system|xfce4-terminal -e \"sudo xbps-install -Su\"\n"
+            "\n"
             "[weather]\n"
             "# Coordinates for the weather bar: lat|lon (one line, decimal degrees).\n"
             "# Uses Open-Meteo, no account/key needed. The weather bar stays hidden\n"
@@ -145,7 +151,7 @@ def _read_config_sections():
     """Parses config.conf into {section: [lines]} for the known sections,
     each a list of raw non-comment, non-empty lines under that [section]."""
     sections = {'feeds': [], 'mute': [], 'twitch': [], 'weather': [], 'timer': [], 'youtube': [],
-                'updates': []}
+                'updates': [], 'launcher': []}
     current = None
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE) as f:
@@ -361,6 +367,35 @@ def scheduled_active_channels(schedules, now):
 MIN_TWITCH_CHECK_MINUTES = 1
 MIN_YOUTUBE_CHECK_MINUTES = 5  # each channel costs a full streamlink run
 MIN_UPDATES_CHECK_HOURS = 1
+
+
+def load_launcher_entries():
+    """[(label, command)] from the [launcher] section, config order. A line is
+    'Label|command' (the command may itself contain '|'); a line without '|'
+    is used as both label and command."""
+    entries = []
+    for line in _read_config_sections()['launcher']:
+        label, sep, command = line.partition('|')
+        label, command = label.strip(), command.strip()
+        if not sep:
+            command = label
+        if command:
+            entries.append((label or command, command))
+    return entries
+
+
+def run_launcher_command(command):
+    """Runs `command` through the shell, fully detached from the tray app
+    (own session, no stdio), from the home directory. True if it started."""
+    try:
+        proc = subprocess.Popen(
+            ['sh', '-c', command], cwd=os.path.expanduser('~'), start_new_session=True,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as e:
+        _log(f'could not run launcher command {command!r}: {e}')
+        return False
+    threading.Thread(target=proc.wait, daemon=True).start()  # reap it, no zombie
+    return True
 
 
 def _load_interval(section, default_seconds, minimum, unit_seconds):
@@ -1438,6 +1473,7 @@ def temp_icon_layout(size, text_width, text_height):
 # background-color -- the whole news area then turns black/dark with the rows
 # sitting on top of it. The shorthand also resets the image. Text colour is
 # forced too, since a dark theme's light foreground would be invisible on white.
+LAUNCHER_MAX_HEIGHT_PX = 300  # the Launch list scrolls beyond this
 LIST_BOTTOM_SPACE_PX = 85  # reserved under the last row for the timer slide
 
 POPUP_CSS = """
@@ -1470,6 +1506,7 @@ class RssTray:
         self.popup = None
         self.listbox = None
         self.scroller = None
+        self._launcher_open = False
         self.weather_data = None
         self.weather_box = None
         self.weather_view = 'today'
@@ -2189,6 +2226,58 @@ class RssTray:
         max_height = int(screen_height * 0.75)
         self.scroller.set_max_content_height(max_height)
 
+    def on_popup_focus_out(self, win, _event):
+        if self._launcher_open:
+            return False  # the Launch list took focus; don't close under it
+        win.hide()
+        return False
+
+    def on_launcher_button_clicked(self, button):
+        """Builds the Launch list fresh (so config edits show up immediately)
+        and pops it up above the button."""
+        entries = load_launcher_entries()
+        popover = Gtk.Popover.new(button)
+        popover.set_position(Gtk.PositionType.TOP)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        box.set_margin_start(4)
+        box.set_margin_end(4)
+        box.set_margin_top(4)
+        box.set_margin_bottom(4)
+        if not entries:
+            hint = Gtk.Label(label='No commands yet — add them under [launcher]\nin the config (Label|command).')
+            hint.set_margin_start(6)
+            hint.set_margin_end(6)
+            hint.set_margin_top(4)
+            hint.set_margin_bottom(4)
+            box.pack_start(hint, False, False, 0)
+        for label, command in entries:
+            item = Gtk.Button(label=label)
+            item.set_relief(Gtk.ReliefStyle.NONE)
+            item.get_child().set_xalign(0)
+            item.set_tooltip_text(command)
+            item.connect('clicked', self.on_launcher_item_clicked, command, popover)
+            box.pack_start(item, False, False, 0)
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroller.set_propagate_natural_height(True)
+        scroller.set_max_content_height(LAUNCHER_MAX_HEIGHT_PX)
+        scroller.add(box)
+        popover.add(scroller)
+        popover.connect('closed', self.on_launcher_closed)
+        self._launcher_open = True
+        scroller.show_all()
+        popover.popup()
+
+    def on_launcher_closed(self, popover):
+        self._launcher_open = False
+        GLib.idle_add(popover.destroy)
+
+    def on_launcher_item_clicked(self, _item, command, popover):
+        run_launcher_command(command)
+        popover.popdown()
+        if self.popup:
+            self.popup.hide()
+
     def build_popup_window(self):
         win = Gtk.Window(type=Gtk.WindowType.POPUP)
         win.set_decorated(False)
@@ -2197,7 +2286,7 @@ class RssTray:
         win.set_type_hint(Gdk.WindowTypeHint.POPUP_MENU)
         win.set_keep_above(True)
         win.set_default_size(WINDOW_WIDTH, -1)
-        win.connect('focus-out-event', lambda *_a: win.hide())
+        win.connect('focus-out-event', self.on_popup_focus_out)
         win.connect('key-press-event', self.on_popup_key)
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -2300,6 +2389,10 @@ class RssTray:
         footer.set_margin_end(6)
         footer.set_margin_top(4)
         footer.set_margin_bottom(4)
+        launch_btn = Gtk.Button(label='Launch')
+        launch_btn.set_tooltip_text('Run one of your [launcher] commands')
+        launch_btn.connect('clicked', self.on_launcher_button_clicked)
+        footer.pack_start(launch_btn, True, True, 0)
         timer_toggle_btn = Gtk.Button(label='Timer')
         timer_toggle_btn.set_tooltip_text('Show/hide countdown timer')
         timer_toggle_btn.connect('clicked', self.on_timer_toggle_clicked)
