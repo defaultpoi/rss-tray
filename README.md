@@ -32,7 +32,9 @@ A minimal tray-based RSS/Atom reader for Linux, built with Python and GTK3 as a 
 
 ### Tools
 
-- **Timer:** a slider behind the "Timer" footer button (0 to 2 h in 1-minute steps by default; the maximum and the step are configurable with `max=<minutes>` and `step=<seconds>` in the `[timer]` section, see below). It counts down against a fixed deadline, keeps counting with the popup closed, and plays the notification sound twice at zero.
+- **Timer:** a slide behind the "Timer" footer button with two modes, switched at its top left:
+  - **Countdown:** a slider (0 to 2 h in 1-minute steps by default; the maximum and the step are configurable with `max=<minutes>` and `step=<seconds>` in `[timer]`, see below). It counts down against a fixed deadline, keeps counting with the popup closed, and plays the notification sound twice at zero.
+  - **Schedule:** a recurring action instead of a sound, e.g. suspend the machine every night (see "Scheduled actions" below). Set the time, the days and the action right in the slide; it is stored in `config.conf`.
 - **Launcher:** a "Launch" footer button opens a list of your own commands (the `[launcher]` section, `Label|command` per line); clicking one runs it detached through the shell and closes the popup. The list is read when you open it, so edits apply immediately.
 
 ### Connectivity
@@ -123,6 +125,22 @@ alerts=true
 # interval=<hours> between package update scans (default 12, minimum 1)
 interval=12
 
+[actions]
+# Label|command lines the timer's Schedule mode can run (the built-in default,
+# used when this section is empty, is Suspend and Power off).
+Suspend|loginctl suspend
+Power off|loginctl poweroff
+
+[schedule]
+# Written by the popup's Timer > Schedule; you can edit it by hand too.
+enabled=false
+time=00:30
+days=daily
+action=Suspend
+warn=60
+snooze=30
+grace=120
+
 [launcher]
 # Label|command per line for the Launch button. Commands run through the
 # shell (so ~, quotes and && work), detached, from your home directory.
@@ -135,6 +153,18 @@ Update system|xfce4-terminal -e "sudo xbps-install -Su"
 max=120
 step=60
 ```
+
+### Scheduled actions
+
+Timer > Schedule runs one of your `[actions]` at a time of day, on the days you pick, with no cron job, `snooze` loop or other service involved (this replaces a script such as `snooze -H0 -M30 loginctl poweroff` in a `while` loop).
+
+- **Controls:** the "On" checkbox, the time (hours and minutes), the action (from `[actions]`), and a Mo..Su button per day. Changes are saved to `[schedule]` immediately. At least one day stays selected.
+- **Warning:** `warn=` seconds before the action (60 by default; `warn=0` for none) the notification sound plays, the popup opens, the tray icon flashes a red "!" and a red bar reads "Suspend in 42 s" with two buttons:
+  - **Cancel** drops this run (the next scheduled run still happens).
+  - **Snooze N min** postpones the run by `snooze=` minutes (30 by default). Pressing it again postpones further. The same button in the slide postpones the next run before the warning starts.
+- **Late runs are skipped:** the app only acts within `grace=` seconds (120 by default) of the scheduled time. If the machine was asleep or off at that moment, or you enabled or edited the schedule after the time had passed, that run is dropped instead of firing late. A run is never repeated after a wake-up.
+- **Time:** the system's local clock, DST included. A run that has been handled is recorded in `state.json`, so restarting the app doesn't repeat it.
+- **Actions:** any command works (`Lock screen|loginctl lock-session`, `Hibernate|systemctl hibernate`, ...); the schedule refers to it by label. A label that no longer exists is shown flagged in the slide and nothing runs.
 
 ### Channel schedules
 
