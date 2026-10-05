@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Minimal tray RSS/Atom reader with system-wide Void package-update detection
 and Twitch live-channel notifications."""
+import warnings
 import gi
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, GLib, Gdk, Gio, Pango
@@ -10,6 +11,10 @@ try:
 except Exception:
     Wnck = None  # fullscreen detection just no-ops if this isn't available
 import cairo
+
+# Gtk.StatusIcon is deprecated upstream but is what the XEMBED tray needs here;
+# silence the per-call warnings it would otherwise print on every icon update.
+warnings.filterwarnings('ignore', message=r'Gtk\.StatusIcon')
 import feedparser
 import json
 import math
@@ -43,6 +48,7 @@ OFFLINE_PROBE_SECONDS = 10  # how often the popup's offline indicator re-probes 
 OFFLINE_AFTER_FAILED_PROBES = 2  # consecutive failed probes before showing 'offline' (ignores blips)
 FEED_RETRY_SECONDS = 120  # retry a feed this soon after a failed fetch (instead of a full interval)
 MAX_LIST_ITEMS = 40
+MAX_UNREAD_ITEMS = 500  # stored unread items; the oldest beyond this are dropped (they stay 'seen')
 MAX_TITLE_LEN = 60
 MAX_ITEM_AGE_SECONDS = 24 * 3600  # ignore entries older than this on first sight
 SEEN_RETENTION_SECONDS = 30 * 24 * 3600  # prune seen-item records older than this
@@ -63,7 +69,7 @@ def build_weather_api_url(lat, lon):
         "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,precipitation_sum"
         "&forecast_days=6&timezone=auto"
     )
-WEATHER_REFRESH_SECONDS = 1800  # 30 minutes
+WEATHER_REFRESH_SECONDS = 1800  # default: 30 minutes (weather and alerts share this cycle)
 METEOALARM_FEED_URL_TEMPLATE = "https://feeds.meteoalarm.org/feeds/meteoalarm-legacy-atom-{country}"
 # ISO 3166-1 alpha-2 codes of the countries MeteoAlarm publishes feeds for.
 # Anywhere else (reverse-geocoded country_code not in here) alerts are
@@ -137,6 +143,7 @@ def ensure_config():
             "# Uses Open-Meteo, no account/key needed. The weather bar stays hidden\n"
             "# until this line is set, e.g.:\n"
             "# <latitude>|<longitude>\n"
+            "# interval=<minutes> between weather (and alert) refreshes (default 30, minimum 5).\n"
             "#\n"
             "# alerts=true enables MeteoAlarm severe-weather alerts (European\n"
             "# countries covered by MeteoAlarm) for the country/region matching the\n"
@@ -370,6 +377,7 @@ def scheduled_active_channels(schedules, now):
 MIN_TWITCH_CHECK_MINUTES = 1
 MIN_YOUTUBE_CHECK_MINUTES = 5  # each channel costs a full streamlink run
 MIN_UPDATES_CHECK_HOURS = 1
+MIN_WEATHER_REFRESH_MINUTES = 5
 
 
 def load_launcher_entries():
@@ -421,6 +429,11 @@ def load_twitch_check_interval():
 
 def load_youtube_check_interval():
     return _load_interval('youtube', YOUTUBE_CHECK_INTERVAL_SECONDS, MIN_YOUTUBE_CHECK_MINUTES, 60)
+
+
+def load_weather_refresh_interval():
+    """Seconds between weather (and alert) refreshes: 'interval=<minutes>' in [weather]."""
+    return _load_interval('weather', WEATHER_REFRESH_SECONDS, MIN_WEATHER_REFRESH_MINUTES, 60)
 
 
 def load_updates_check_interval():
@@ -1580,7 +1593,7 @@ class RssTray:
         GLib.timeout_add_seconds(SCHEDULER_TICK_SECONDS, self.periodic_check)
         GLib.timeout_add(800, self.maybe_auto_show_startup)
         GLib.timeout_add_seconds(2, self.initial_weather_check)
-        GLib.timeout_add_seconds(WEATHER_REFRESH_SECONDS, self.periodic_weather_check)
+        GLib.timeout_add_seconds(load_weather_refresh_interval(), self.periodic_weather_check)
         GLib.timeout_add(ALERT_PULSE_INTERVAL_MS, self._alert_pulse_tick)
         GLib.timeout_add_seconds(3, self.initial_twitch_check)
         GLib.timeout_add_seconds(load_twitch_check_interval(), self.periodic_twitch_check)
@@ -1703,7 +1716,7 @@ class RssTray:
                 existing_ids = {e['id'] for e in self.state.get('unread', [])}
                 new_items = [e for e in new_items if e['id'] not in existing_ids]
                 if new_items:
-                    self.state['unread'] = new_items + self.state.get('unread', [])
+                    self.state['unread'] = (new_items + self.state.get('unread', []))[:MAX_UNREAD_ITEMS]
             save_state(self.state)
         if new_items:
             GLib.idle_add(self.on_new_items)
@@ -1852,7 +1865,9 @@ class RssTray:
 
     def periodic_weather_check(self):
         self.start_weather_fetch()
-        return True
+        # re-arm with the interval currently in config.conf (edits apply without a restart)
+        GLib.timeout_add_seconds(load_weather_refresh_interval(), self.periodic_weather_check)
+        return False
 
     def start_weather_fetch(self):
         threading.Thread(target=self._fetch_weather_bg, daemon=True).start()
@@ -2930,8 +2945,9 @@ class RssTray:
 
     def on_row_activated(self, _listbox, row):
         if not self.online and (getattr(row, 'install_all_header', False)
-                                or hasattr(row, 'header_feed_url') or hasattr(row, 'entry_id')):
-            return  # offline: news items, feed headers and "install all" do nothing
+                                or hasattr(row, 'header_feed_url') or hasattr(row, 'entry_id')
+                                or hasattr(row, 'twitch_channel') or hasattr(row, 'youtube_channel')):
+            return  # offline: news, feed headers, "install all" and live channels do nothing
         if getattr(row, 'install_all_header', False):
             self.install_all_updates()
             return
