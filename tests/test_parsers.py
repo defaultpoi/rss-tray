@@ -1079,6 +1079,34 @@ class TestConfigEncoding(TmpConfigCase):
         self.assertEqual(feeds[0][0], 'https://a.example/feed')
 
 
+class TestUnixSignalAdd(unittest.TestCase):
+    def test_prefers_glibunix_signal_add(self):
+        unix = mock.Mock(spec=['signal_add', 'signal_add_full'])
+        with mock.patch.object(rt, 'GLibUnix', unix), mock.patch.object(rt.GLib, 'unix_signal_add') as old:
+            rt._unix_signal_add(15, print)
+        unix.signal_add.assert_called_once_with(rt.GLib.PRIORITY_DEFAULT, 15, print)
+        unix.signal_add_full.assert_not_called()
+        old.assert_not_called()
+
+    def test_uses_signal_add_full_where_plain_one_is_not_exposed(self):
+        unix = mock.Mock(spec=['signal_add_full'])
+        with mock.patch.object(rt, 'GLibUnix', unix), mock.patch.object(rt.GLib, 'unix_signal_add') as old:
+            rt._unix_signal_add(15, print)
+        unix.signal_add_full.assert_called_once_with(rt.GLib.PRIORITY_DEFAULT, 15, print)
+        old.assert_not_called()
+
+    def test_falls_back_to_the_old_glib_function(self):
+        with mock.patch.object(rt, 'GLibUnix', None), mock.patch.object(rt.GLib, 'unix_signal_add') as old:
+            rt._unix_signal_add(15, print)
+        old.assert_called_once_with(rt.GLib.PRIORITY_DEFAULT, 15, print)
+
+    def test_namespace_without_either_function_falls_back_too(self):
+        with mock.patch.object(rt, 'GLibUnix', mock.Mock(spec=[])), \
+                mock.patch.object(rt.GLib, 'unix_signal_add') as old:
+            rt._unix_signal_add(2, print)
+        old.assert_called_once()
+
+
 class TestMonoGlyph(unittest.TestCase):
     def test_markup(self):
         m = rt.mono_glyph_markup('\u2614')
