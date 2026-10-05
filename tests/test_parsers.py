@@ -805,12 +805,22 @@ class TestOfflineBehavior(unittest.TestCase):
         stub.on_row_activated(None, mock.Mock(spec=['install_all_header'], install_all_header=True))
         stub.install_all_updates.assert_called_once()
 
-    def test_offline_live_channel_rows_are_unaffected(self):
+    def test_offline_live_channel_rows_do_nothing(self):
         stub = self.Stub(online=False)
-        stub.popup = None
-        with mock.patch.object(rt, 'open_twitch_stream') as play:
+        stub.popup = mock.MagicMock()
+        with mock.patch.object(rt, 'open_twitch_stream') as twitch, mock.patch.object(rt, 'open_youtube_stream') as yt:
             stub.on_row_activated(None, mock.Mock(spec=['twitch_channel'], twitch_channel='chan'))
-        play.assert_called_once()
+            stub.on_row_activated(None, mock.Mock(spec=['youtube_channel'], youtube_channel='@h'))
+        twitch.assert_not_called()
+        yt.assert_not_called()
+        stub.popup.hide.assert_not_called()
+
+    def test_online_live_channel_rows_play(self):
+        stub = self.Stub(online=True)
+        stub.popup = mock.MagicMock()
+        with mock.patch.object(rt, 'open_twitch_stream') as twitch:
+            stub.on_row_activated(None, mock.Mock(spec=['twitch_channel'], twitch_channel='chan'))
+        twitch.assert_called_once()
 
     def test_offline_right_click_still_dismisses(self):
         stub = self.Stub(online=False)
@@ -977,6 +987,32 @@ class TestPopupRebuildRules(unittest.TestCase):
         stub.old_popup.destroy.assert_called_once()
 
 
+class TestUnreadCap(TmpConfigCase):
+    def test_oldest_unread_beyond_the_cap_are_dropped_but_stay_seen(self):
+        self.conf('[feeds]\nhttps://a.example/feed\n')
+
+        class Stub:
+            check_feeds = rt.RssTray.check_feeds
+
+            def __init__(self):
+                self.online = True
+                self.lock = rt.threading.Lock()
+                old = [{'id': f'old{i}', 'title': 't', 'link': '', 'feed_url': 'u'} for i in range(rt.MAX_UNREAD_ITEMS)]
+                self.state = {'seen': {}, 'unread': old, 'last_checked': {}}
+                self.on_new_items = mock.Mock()
+        stub = Stub()
+        entries = [{'id': f'new{i}', 'title': 'x', 'link': f'l{i}'} for i in range(3)]
+        parsed = mock.Mock(bozo=False, entries=entries)
+        with mock.patch.object(rt.feedparser, 'parse', return_value=parsed), \
+                mock.patch.object(rt, 'save_state'), mock.patch.object(rt.GLib, 'idle_add'):
+            stub.check_feeds()
+        unread = stub.state['unread']
+        self.assertEqual(len(unread), rt.MAX_UNREAD_ITEMS)
+        self.assertEqual([e['title'] for e in unread[:3]], ['x', 'x', 'x'])     # newest kept, at the front
+        self.assertNotIn(f'old{rt.MAX_UNREAD_ITEMS - 1}', [e['id'] for e in unread])  # oldest dropped
+        self.assertEqual(len(stub.state['seen']), 3)                             # and never resurfaces
+
+
 class TestPulseRedraws(unittest.TestCase):
     class Stub:
         _alert_pulse_tick = rt.RssTray._alert_pulse_tick
@@ -1060,6 +1096,19 @@ class TestMonoGlyph(unittest.TestCase):
 
 
 class TestIntervalDefaults(TmpConfigCase):
+    def test_weather_refresh_interval(self):
+        self.assertEqual(rt.load_weather_refresh_interval(), 30 * 60)
+        self.conf('[weather]\n10.0|20.0\ninterval=10\n')
+        self.assertEqual(rt.load_weather_refresh_interval(), 600)
+        self.conf('[weather]\ninterval=1\n')
+        self.assertEqual(rt.load_weather_refresh_interval(), rt.MIN_WEATHER_REFRESH_MINUTES * 60)
+        self.assertIsNone(rt.load_weather_settings()['lat'])  # the setting isn't mistaken for coordinates
+
+    def test_weather_interval_does_not_disturb_the_other_weather_settings(self):
+        self.conf('[weather]\n10.0|20.0\ninterval=10\nalerts=true\n')
+        s = rt.load_weather_settings()
+        self.assertEqual((s['lat'], s['lon'], s['alerts_enabled']), (10.0, 20.0, True))
+
     def test_documented_defaults(self):
         self.assertEqual(rt.load_twitch_check_interval(), 15 * 60)
         self.assertEqual(rt.load_youtube_check_interval(), 15 * 60)
