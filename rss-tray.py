@@ -38,7 +38,7 @@ import atexit
 import calendar
 import time as time_module
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 socket.setdefaulttimeout(15)  # avoid feed fetches hanging indefinitely on slow/broken servers
 
@@ -138,6 +138,26 @@ def ensure_config():
             "[updates]\n"
             "# interval=<hours> between package update scans (default 12, minimum 1).\n"
             "\n"
+            "[actions]\n"
+            "# Commands the timer's Schedule mode can run, one per line: Label|command\n"
+            "# (built-in defaults if this section is empty: Suspend and Power off).\n"
+            "Suspend|loginctl suspend\n"
+            "Power off|loginctl poweroff\n"
+            "\n"
+            "[schedule]\n"
+            "# Recurring action, set from the popup's Timer > Schedule (or here):\n"
+            "# enabled=true|false, time=HH:MM, days=daily|weekdays|weekends|mon,wed,..,\n"
+            "# action=<label from [actions]>, warn=<seconds of warning, 0 = none>,\n"
+            "# snooze=<minutes the Snooze button postpones>, grace=<seconds: skip the\n"
+            "# run if it was missed by more than this, e.g. the machine was asleep>.\n"
+            "enabled=false\n"
+            "time=00:30\n"
+            "days=daily\n"
+            "action=Suspend\n"
+            "warn=60\n"
+            "snooze=30\n"
+            "grace=120\n"
+            "\n"
             "[launcher]\n"
             "# Commands for the popup's Launch button, one per line: Label|command\n"
             "# (run through the shell, so ~, quotes and && work). Examples:\n"
@@ -167,7 +187,7 @@ def _read_config_sections():
     """Parses config.conf into {section: [lines]} for the known sections,
     each a list of raw non-comment, non-empty lines under that [section]."""
     sections = {'feeds': [], 'mute': [], 'twitch': [], 'weather': [], 'timer': [], 'youtube': [],
-                'updates': [], 'launcher': []}
+                'updates': [], 'launcher': [], 'actions': [], 'schedule': []}
     current = None
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, encoding='utf-8', errors='replace') as f:
@@ -451,6 +471,149 @@ DEFAULT_TIMER_MAX_MINUTES = 120
 DEFAULT_TIMER_STEP_SECONDS = 60
 
 
+# ---- timer "Schedule" mode: a recurring action (suspend, power off, ...) --------
+DEFAULT_ACTIONS = [('Suspend', 'loginctl suspend'), ('Power off', 'loginctl poweroff')]
+SCHEDULE_DEFAULTS = {
+    'enabled': False, 'minute': 30, 'days': _ALL_DAYS, 'action': 'Suspend',
+    'warn': 60, 'snooze': 30, 'grace': 120,
+}
+SCHEDULE_RESUME_GAP_SECONDS = 10  # a bigger wall-clock jump between ticks means the machine slept
+SCHEDULE_MISSING_ACTION_SUFFIX = ' (not in [actions])'
+
+
+def load_actions():
+    """[(label, command)] from [actions] (same 'Label|command' lines as the
+    launcher), or the built-in Suspend / Power off if the section is empty."""
+    entries = []
+    for line in _read_config_sections()['actions']:
+        label, sep, command = line.partition('|')
+        label, command = label.strip(), command.strip()
+        if not sep:
+            command = label
+        if command:
+            entries.append((label or command, command))
+    return entries or list(DEFAULT_ACTIONS)
+
+
+def format_days(days):
+    """Inverse of _parse_days for the config file: daily, weekdays, weekends
+    or a 'mon,wed,fri' list."""
+    days = frozenset(days)
+    if days == _ALL_DAYS:
+        return 'daily'
+    if days == frozenset(range(5)):
+        return 'weekdays'
+    if days == frozenset((5, 6)):
+        return 'weekends'
+    return ','.join(_DAY_NAMES[d][:3] for d in sorted(days))
+
+
+def load_schedule_settings():
+    """{'enabled', 'minute' (of the day), 'days', 'action', 'warn' (s),
+    'snooze' (min), 'grace' (s)} from [schedule]; anything missing or
+    unparsable keeps its default."""
+    settings = dict(SCHEDULE_DEFAULTS)
+    for line in _read_config_sections()['schedule']:
+        key, sep, val = line.partition('=')
+        if not sep:
+            continue
+        key, val = key.strip().lower(), val.split('#', 1)[0].strip()
+        try:
+            if key == 'enabled':
+                settings['enabled'] = val.lower() in ('1', 'true', 'yes', 'on')
+            elif key == 'time':
+                settings['minute'] = _parse_clock(val)
+                if settings['minute'] >= 24 * 60:
+                    settings['minute'] = SCHEDULE_DEFAULTS['minute']
+            elif key == 'days':
+                settings['days'] = _parse_days(val) or _ALL_DAYS
+            elif key == 'action':
+                settings['action'] = val or SCHEDULE_DEFAULTS['action']
+            elif key in ('warn', 'grace'):
+                settings[key] = max(0, int(val))
+            elif key == 'snooze':
+                settings['snooze'] = max(1, int(val))
+        except ValueError:
+            pass
+    return settings
+
+
+def save_schedule_settings(**changes):
+    """Writes the given settings (enabled, minute, days, action) back into
+    [schedule], replacing existing lines and keeping every other line."""
+    lines = {}
+    if 'enabled' in changes:
+        lines['enabled'] = 'true' if changes['enabled'] else 'false'
+    if 'minute' in changes:
+        lines['time'] = f"{changes['minute'] // 60:02d}:{changes['minute'] % 60:02d}"
+    if 'days' in changes:
+        lines['days'] = format_days(changes['days'])
+    if 'action' in changes:
+        lines['action'] = changes['action']
+
+    def transform(section):
+        kept = [l for l in section if l.partition('=')[0].strip().lower() not in lines]
+        return kept + [f'{k}={v}\n' for k, v in lines.items()]
+    _edit_config_section('schedule', transform)
+
+
+def _schedule_occurrences(now_ts, days, minute):
+    """(latest occurrence <= now, first occurrence > now) of 'HH:MM on these
+    weekdays', as timestamps in local time (DST handled by the C library)."""
+    base = datetime.fromtimestamp(now_ts).replace(hour=0, minute=0, second=0, microsecond=0)
+    previous = upcoming = None
+    for offset in range(-8, 9):
+        day = base + timedelta(days=offset)
+        if day.weekday() not in days:
+            continue
+        occurrence = day.replace(hour=minute // 60, minute=minute % 60).timestamp()
+        if occurrence <= now_ts:
+            previous = occurrence
+        elif upcoming is None:
+            upcoming = occurrence
+    return previous, upcoming
+
+
+def schedule_pending(now_ts, settings, fired_ts, override):
+    """[(occurrence, fire_time)] for the occurrences not handled yet (the
+    latest past one -- it may be snoozed -- and the next one). `override` is
+    {'occ', 'fire'}: a snooze that moved one occurrence's fire time."""
+    pending = []
+    for occurrence in _schedule_occurrences(now_ts, settings['days'], settings['minute']):
+        if occurrence is None or occurrence <= fired_ts:
+            continue
+        fire = override['fire'] if override and override.get('occ') == occurrence else occurrence
+        pending.append((occurrence, fire))
+    return pending
+
+
+def schedule_status(now_ts, settings, fired_ts, override):
+    """('idle'|'warn'|'fire'|'skip', occurrence, seconds_left): what the
+    scheduler should do right now. 'skip' = the fire time passed by more than
+    `grace` (e.g. the machine was asleep): drop it, don't run it late."""
+    for occurrence, fire in schedule_pending(now_ts, settings, fired_ts, override):
+        if fire <= now_ts:
+            if now_ts - fire <= settings['grace']:
+                return 'fire', occurrence, 0
+            return 'skip', occurrence, 0
+        if settings['warn'] > 0 and fire - now_ts <= settings['warn']:
+            return 'warn', occurrence, fire - now_ts
+    return 'idle', None, 0
+
+
+def schedule_snooze_override(now_ts, settings, fired_ts, override):
+    """The override that postpones the pending occurrence by `snooze` minutes
+    (counted from its current fire time, or from now if that has passed);
+    None if nothing is pending."""
+    # a stale past occurrence the tick hasn't dropped yet is not worth snoozing
+    pending = [p for p in schedule_pending(now_ts, settings, fired_ts, override)
+               if p[1] >= now_ts - settings['grace']]
+    if not pending:
+        return None
+    occurrence, fire = pending[0]
+    return {'occ': occurrence, 'fire': max(fire, now_ts) + settings['snooze'] * 60}
+
+
 def load_timer_settings():
     """Returns {'max_seconds', 'step_seconds'} from config.conf's [timer]
     section: 'max=<minutes>' and 'step=<seconds>' key=value lines, in any
@@ -517,41 +680,44 @@ def load_weather_settings():
     }
 
 
-def _edit_weather_section(transform):
+def _edit_config_section(name, transform):
     """Rewrites config.conf in place: `transform` receives the lines of the
-    [weather] section (without the header; the section is created at the end
-    of the file if it's somehow missing) and returns the replacement lines.
-    Every other line -- including comments and other sections -- is left
-    untouched. Best-effort: failures are swallowed (callers just redo the work
-    next poll)."""
+    [name] section (without the header; the section is created at the end of
+    the file if it's missing) and returns the replacement lines. Every other
+    line -- including comments and other sections -- is left untouched.
+    Best-effort: failures are swallowed (callers just redo the work later)."""
     try:
-        with open(CONFIG_FILE) as f:
+        with open(CONFIG_FILE, encoding='utf-8', errors='replace') as f:
             lines = f.readlines()
     except OSError:
         lines = []
 
-    def is_section(line, name=None):
-        s = line.strip()
-        if not (s.startswith('[') and s.endswith(']')):
+    def is_section(line, wanted=None):
+        stripped = line.strip()
+        if not (stripped.startswith('[') and stripped.endswith(']')):
             return False
-        return name is None or s[1:-1].strip().lower() == name
+        return wanted is None or stripped[1:-1].strip().lower() == wanted
 
-    start = next((i for i, l in enumerate(lines) if is_section(l, 'weather')), None)
+    start = next((i for i, l in enumerate(lines) if is_section(l, name)), None)
     if start is None:
         if lines and not lines[-1].endswith('\n'):
             lines.append('\n')
-        lines.append('[weather]\n')
+        lines.append(f'[{name}]\n')
         start = len(lines) - 1
     end = next((i for i in range(start + 1, len(lines)) if is_section(lines[i])), len(lines))
     lines[start + 1:end] = transform(lines[start + 1:end])
 
     try:
         tmp = CONFIG_FILE + '.tmp'
-        with open(tmp, 'w') as f:
+        with open(tmp, 'w', encoding='utf-8') as f:
             f.writelines(lines)
         os.replace(tmp, CONFIG_FILE)
     except OSError:
         pass
+
+
+def _edit_weather_section(transform):
+    _edit_config_section('weather', transform)
 
 
 _RESOLVED_LOCATION_KEYS = ('country=', 'region=')
@@ -1533,7 +1699,10 @@ def temp_icon_layout(size, text_width, text_height):
 # forced too, since a dark theme's light foreground would be invisible on white.
 OFFLINE_BANNER_TEXT = "Offline"
 LAUNCHER_MAX_HEIGHT_PX = 300  # the Launch list scrolls beyond this
-LIST_BOTTOM_SPACE_PX = 85  # reserved under the last row for the timer slide
+LIST_BOTTOM_SPACE_PX = 85  # reserved under the last row for the timer slide (countdown mode)
+TIMER_HEIGHT_COUNTDOWN_PX = 60
+TIMER_HEIGHT_SCHEDULE_PX = 104
+TIMER_SPACER_EXTRA_PX = 25  # gap kept above the slide
 
 POPUP_CSS = """
 list row { padding: 1px 3px; min-height: 0px; }
@@ -1542,6 +1711,9 @@ list, viewport, scrolledwindow, overlay, .popup-content { background: #ffffff; }
 list, list label { color: #000000; }
 .weather-bar { background: #e8eef5; }
 .offline-banner { background: #b3261e; color: #ffffff; padding: 3px 6px; font-weight: bold; }
+.schedule-warning { background: #b3261e; padding: 3px 6px; }
+.schedule-warning label { color: #ffffff; font-weight: bold; }
+.schedule-warning button label { color: #000000; font-weight: normal; }
 .weather-bar label, .timer-bar label { color: #000000; }
 .timer-bar { background: #ffffff; }
 """
@@ -1587,6 +1759,21 @@ class RssTray:
         self.timer_label = None
         self.timer_box = None
         self.timer_visible = False
+        self.timer_mode = 'countdown'     # or 'schedule' (the slide's two modes)
+        self._mode_updating = False
+        self.mode_buttons = {}
+        self.countdown_box = None
+        self.schedule_box = None
+        self.sched = None                 # widgets of the Schedule controls (per popup)
+        self._sched_updating = False
+        self.list_spacer = None
+        self.schedule_banner = None
+        self.schedule_banner_label = None
+        self.schedule_warning = None      # {'occ', 'left', 'action'} while the pre-action warning shows
+        self._schedule_flash_on = False
+        self._last_schedule_tick = None
+        self._schedule_cache = (None, None)
+        self._schedule_resync = True
 
         self._apply_compact_css()
 
@@ -2118,6 +2305,244 @@ class RssTray:
         self.active_installs = max(0, self.active_installs - 1)
         self.update_icon()
 
+    # ---- Schedule mode ------------------------------------------------------
+    def _schedule_settings(self):
+        """Settings, re-read only when config.conf changed (this runs every
+        second); a change also re-syncs so editing the time never fires an
+        occurrence that is already in the past."""
+        try:
+            stamp = os.stat(CONFIG_FILE).st_mtime_ns
+        except OSError:
+            stamp = None
+        if self._schedule_cache[1] is None or self._schedule_cache[0] != stamp:
+            self._schedule_cache = (stamp, load_schedule_settings())
+            self._schedule_resync = True
+        return self._schedule_cache[1]
+
+    def _mark_schedule_handled(self, occurrence):
+        with self.lock:
+            self.state['schedule_fired'] = max(self.state.get('schedule_fired', 0), occurrence)
+            self.state.pop('schedule_override', None)
+            save_state(self.state)
+
+    def _skip_missed_schedule(self, now_ts, settings):
+        """App start, wake from sleep or a settings change: a time that has
+        already passed is never acted on late (unless it was snoozed)."""
+        previous = _schedule_occurrences(now_ts, settings['days'], settings['minute'])[0]
+        with self.lock:
+            fired = self.state.get('schedule_fired', 0)
+            override = self.state.get('schedule_override')
+        if previous is None or previous <= fired:
+            return
+        if override and override.get('occ') == previous and override['fire'] > now_ts:
+            return  # still snoozed
+        self._mark_schedule_handled(previous)
+
+    def _schedule_tick(self):
+        now_ts = time_module.time()
+        last, self._last_schedule_tick = self._last_schedule_tick, now_ts
+        settings = self._schedule_settings()
+        if not settings['enabled']:
+            self._schedule_resync = True  # enabling later must not act on an older time
+            self._set_schedule_warning(None)
+            self._refresh_schedule_ui()
+            return
+        if self._schedule_resync or last is None or now_ts - last > SCHEDULE_RESUME_GAP_SECONDS:
+            self._schedule_resync = False
+            self._skip_missed_schedule(now_ts, settings)
+        with self.lock:
+            fired = self.state.get('schedule_fired', 0)
+            override = self.state.get('schedule_override')
+        kind, occurrence, left = schedule_status(now_ts, settings, fired, override)
+        if kind == 'warn':
+            self._set_schedule_warning({'occ': occurrence, 'left': math.ceil(left), 'action': settings['action']})
+        elif kind == 'fire':
+            self._fire_schedule(occurrence, settings)
+        else:
+            if kind == 'skip':
+                self._mark_schedule_handled(occurrence)
+            self._set_schedule_warning(None)
+        self._refresh_schedule_ui()
+
+    def _fire_schedule(self, occurrence, settings):
+        self._mark_schedule_handled(occurrence)
+        self._set_schedule_warning(None)
+        actions = load_actions()
+        command = next((c for label, c in actions if label == settings['action']), None) \
+            or next((c for label, c in actions if label.lower() == settings['action'].lower()), None)
+        if command:
+            run_launcher_command(command)
+        else:
+            _log(f"schedule: no action named {settings['action']!r} in [actions]")
+
+    def _set_schedule_warning(self, warning):
+        previous = self.schedule_warning
+        if warning is None and previous is None:
+            return
+        self.schedule_warning = warning
+        if warning is not None:
+            self._schedule_flash_on = not self._schedule_flash_on
+            if previous is None:  # the warning just started: be hard to miss
+                play_notification_sound()
+                if not (self.popup and self.popup.get_visible()):
+                    self.show_popup()
+        else:
+            self._schedule_flash_on = False
+        self.update_icon()
+
+    def on_schedule_cancel(self, _button=None):
+        warning = self.schedule_warning
+        if warning:
+            self._mark_schedule_handled(warning['occ'])
+            self._set_schedule_warning(None)
+            self._refresh_schedule_ui()
+
+    def on_schedule_snooze(self, _button=None):
+        settings = self._schedule_settings()
+        with self.lock:
+            fired = self.state.get('schedule_fired', 0)
+            override = self.state.get('schedule_override')
+            new = schedule_snooze_override(time_module.time(), settings, fired, override)
+            if new:
+                self.state['schedule_override'] = new
+                save_state(self.state)
+        self._set_schedule_warning(None)
+        self._refresh_schedule_ui()
+
+    def _schedule_summary(self, settings):
+        warning = self.schedule_warning
+        if warning:
+            return f"{warning['action']} in {warning['left']} s"
+        if not settings['enabled']:
+            return 'Schedule off'
+        with self.lock:
+            fired = self.state.get('schedule_fired', 0)
+            override = self.state.get('schedule_override')
+        now_ts = time_module.time()
+        pending = [p for p in schedule_pending(now_ts, settings, fired, override) if p[1] > now_ts]
+        if not pending:
+            return 'Schedule on'
+        occurrence, fire = pending[0]
+        when = datetime.fromtimestamp(fire)
+        text = f"Next: {_DAY_NAMES[when.weekday()][:3].title()} {when:%H:%M} {settings['action']}"
+        return text + (' (snoozed)' if fire != occurrence else '')
+
+    def _refresh_schedule_ui(self):
+        warning = self.schedule_warning
+        if self.schedule_banner is not None:
+            self.schedule_banner.set_visible(warning is not None)
+            if warning:
+                self.schedule_banner_label.set_text(f"{warning['action']} in {warning['left']} s")
+        if self.timer_label is not None and self.timer_mode == 'schedule':
+            self.timer_label.set_text(self._schedule_summary(self._schedule_settings()))
+        if self.sched is not None:
+            self.sched['snooze_btn'].set_sensitive(self._schedule_settings()['enabled'])
+
+    def _apply_timer_mode(self):
+        if self.timer_box is None:
+            return
+        schedule = self.timer_mode == 'schedule'
+        self.countdown_box.set_visible(not schedule)
+        self.schedule_box.set_visible(schedule)
+        height = TIMER_HEIGHT_SCHEDULE_PX if schedule else TIMER_HEIGHT_COUNTDOWN_PX
+        self.timer_box.set_size_request(-1, height)
+        if self.list_spacer is not None:
+            self.list_spacer.set_size_request(-1, height + TIMER_SPACER_EXTRA_PX)
+        if schedule:
+            self._refresh_schedule_ui()
+        else:
+            self.timer_label.set_text(format_timer_duration(self.timer_remaining_seconds))
+
+    def on_timer_mode_toggled(self, button, mode):
+        if self._mode_updating:
+            return
+        self._mode_updating = True
+        if not button.get_active():
+            button.set_active(True)  # clicking the active mode again keeps it selected
+        else:
+            self.timer_mode = mode
+            for name, other in self.mode_buttons.items():
+                other.set_active(name == mode)
+        self._mode_updating = False
+        self._apply_timer_mode()
+
+    def _on_schedule_control_changed(self, widget=None):
+        if self._sched_updating or self.sched is None:
+            return
+        days = frozenset(i for i, b in enumerate(self.sched['days']) if b.get_active())
+        if not days:  # at least one day must stay selected
+            self._sched_updating = True
+            widget.set_active(True)
+            self._sched_updating = False
+            return
+        action = self.sched['action'].get_active_text() or ''
+        changes = {
+            'enabled': self.sched['enabled'].get_active(),
+            'minute': int(self.sched['hour'].get_value()) * 60 + int(self.sched['minute'].get_value()),
+            'days': days,
+        }
+        if action and not action.endswith(SCHEDULE_MISSING_ACTION_SUFFIX):
+            changes['action'] = action
+        save_schedule_settings(**changes)
+        self._refresh_schedule_ui()
+
+    def _build_schedule_box(self):
+        settings = self._schedule_settings()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+
+        row1 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        enabled = Gtk.CheckButton(label='On')
+        enabled.set_active(settings['enabled'])
+        hour = Gtk.SpinButton.new_with_range(0, 23, 1)
+        minute = Gtk.SpinButton.new_with_range(0, 59, 1)
+        for spin, value in ((hour, settings['minute'] // 60), (minute, settings['minute'] % 60)):
+            spin.set_value(value)
+            spin.set_wrap(True)
+            spin.set_numeric(True)
+            spin.set_width_chars(2)
+            spin.connect('output', lambda s: (s.set_text(f'{int(s.get_value()):02d}'), True)[1])
+        action = Gtk.ComboBoxText()
+        labels = [label for label, _command in load_actions()]
+        for label in labels:
+            action.append_text(label)
+        if settings['action'] in labels:
+            action.set_active(labels.index(settings['action']))
+        else:  # configured action no longer exists: show it, flagged, so nothing silently changes
+            action.append_text(settings['action'] + SCHEDULE_MISSING_ACTION_SUFFIX)
+            action.set_active(len(labels))
+        row1.pack_start(enabled, False, False, 0)
+        row1.pack_start(Gtk.Label(label='at'), False, False, 0)
+        row1.pack_start(hour, False, False, 0)
+        row1.pack_start(Gtk.Label(label=':'), False, False, 0)
+        row1.pack_start(minute, False, False, 0)
+        row1.pack_start(action, True, True, 0)
+
+        row2 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+        day_buttons = []
+        for index, name in enumerate(_DAY_NAMES):
+            button = Gtk.ToggleButton(label=name[:2].title())
+            button.set_active(index in settings['days'])
+            button.set_tooltip_text(name.title())
+            day_buttons.append(button)
+            row2.pack_start(button, False, False, 0)
+        snooze_btn = Gtk.Button(label=f"Snooze {settings['snooze']} min")
+        snooze_btn.set_tooltip_text('Postpone the next run')
+        snooze_btn.connect('clicked', self.on_schedule_snooze)
+        row2.pack_end(snooze_btn, False, False, 0)
+
+        box.pack_start(row1, False, False, 0)
+        box.pack_start(row2, False, False, 0)
+
+        self.sched = {'enabled': enabled, 'hour': hour, 'minute': minute, 'action': action,
+                      'days': day_buttons, 'snooze_btn': snooze_btn}
+        enabled.connect('toggled', self._on_schedule_control_changed)
+        hour.connect('value-changed', self._on_schedule_control_changed)
+        minute.connect('value-changed', self._on_schedule_control_changed)
+        action.connect('changed', self._on_schedule_control_changed)
+        for button in day_buttons:
+            button.connect('toggled', self._on_schedule_control_changed)
+        return box
+
     def on_timer_toggle_clicked(self, _button):
         self.timer_visible = not self.timer_visible
         if self.timer_box is not None:
@@ -2132,6 +2557,7 @@ class RssTray:
                 self.timer_deadline = None
                 self._fire_timer_done()
             self._update_timer_widgets()
+        self._schedule_tick()
         return True
 
     def _fire_timer_done(self):
@@ -2148,7 +2574,8 @@ class RssTray:
         self._timer_updating_ui = True
         self.timer_scale.set_value(self.timer_remaining_seconds)
         self._timer_updating_ui = False
-        self.timer_label.set_text(format_timer_duration(self.timer_remaining_seconds))
+        if self.timer_mode == 'countdown':  # in Schedule mode the label shows the schedule summary
+            self.timer_label.set_text(format_timer_duration(self.timer_remaining_seconds))
 
     def on_timer_slider_changed(self, scale):
         if self._timer_updating_ui:
@@ -2190,7 +2617,10 @@ class RssTray:
     def update_icon(self):
         count = self.total_badge_count()
         self.status_icon.set_from_pixbuf(self.render_icon(count))
-        if self.has_active_alerts():
+        if self.schedule_warning:
+            tooltip = (f"{self.schedule_warning['action']} in {self.schedule_warning['left']} s "
+                       "\u2014 open the popup to cancel or snooze")
+        elif self.has_active_alerts():
             hazards = ', '.join(sorted({a['hazard'] for a in self.active_alerts}))
             tooltip = f"\u26a0 {hazards} warning"
         elif self._should_show_weather_icon(count):
@@ -2231,6 +2661,20 @@ class RssTray:
         size = 24
         surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
         ctx = cairo.Context(surface)
+
+        if self.schedule_warning is not None and self._schedule_flash_on:
+            # pending scheduled action: flash a red "!" every other second
+            ctx.set_source_rgba(0.82, 0.12, 0.12, 1)
+            ctx.arc(size / 2, size / 2, size / 2 - 1, 0, 2 * 3.14159265)
+            ctx.fill()
+            ctx.set_source_rgba(1, 1, 1, 1)
+            ctx.select_font_face('Sans', cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+            ctx.set_font_size(18)
+            xb, yb, w, h, _dx, _dy = ctx.text_extents('!')
+            ctx.move_to(size / 2 - w / 2 - xb, size / 2 - h / 2 - yb)
+            ctx.show_text('!')
+            surface.flush()
+            return Gdk.pixbuf_get_from_surface(surface, 0, 0, size, size)
 
         show_weather = self._should_show_weather_icon(count)
 
@@ -2425,6 +2869,27 @@ class RssTray:
         self.offline_banner = banner
         outer.pack_start(banner, False, False, 0)
 
+        warn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        warn_box.get_style_context().add_class('schedule-warning')
+        warn_label = Gtk.Label()
+        warn_label.set_xalign(0)
+        warn_label.set_hexpand(True)
+        cancel_btn = Gtk.Button(label='Cancel')
+        cancel_btn.connect('clicked', self.on_schedule_cancel)
+        warn_snooze_btn = Gtk.Button(label=f"Snooze {self._schedule_settings()['snooze']} min")
+        warn_snooze_btn.connect('clicked', self.on_schedule_snooze)
+        for widget in (warn_label, cancel_btn, warn_snooze_btn):
+            warn_box.pack_start(widget, widget is warn_label, widget is warn_label, 0)
+        warn_box.set_no_show_all(True)  # shown by _refresh_schedule_ui; children shown explicitly
+        for widget in (warn_label, cancel_btn, warn_snooze_btn):
+            widget.show()
+        if self.schedule_warning:
+            warn_label.set_text(f"{self.schedule_warning['action']} in {self.schedule_warning['left']} s")
+        warn_box.set_visible(self.schedule_warning is not None)
+        self.schedule_banner = warn_box
+        self.schedule_banner_label = warn_label
+        outer.pack_start(warn_box, False, False, 0)
+
         scroller = Gtk.ScrolledWindow()
         scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scroller.set_propagate_natural_height(True)
@@ -2445,6 +2910,7 @@ class RssTray:
         # the popup.
         spacer = Gtk.Box()
         spacer.set_size_request(-1, LIST_BOTTOM_SPACE_PX)
+        self.list_spacer = spacer
         list_content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         list_content.pack_start(self.listbox, False, False, 0)
         list_content.pack_start(spacer, False, False, 0)
@@ -2462,18 +2928,31 @@ class RssTray:
         timer_box.set_margin_end(8)
         timer_box.set_margin_top(3)
         timer_box.set_margin_bottom(4)
-        timer_box.set_size_request(-1, 60)
+        timer_box.set_size_request(-1, TIMER_HEIGHT_COUNTDOWN_PX)
         timer_box.set_halign(Gtk.Align.FILL)
         timer_box.set_valign(Gtk.Align.END)
         timer_box.get_style_context().add_class('timer-bar')
         timer_box.set_no_show_all(True)
         timer_box.set_visible(self.timer_visible)
 
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        mode_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        mode_row.get_style_context().add_class('linked')
+        self.mode_buttons = {}
+        for mode, title in (('countdown', 'Countdown'), ('schedule', 'Schedule')):
+            mode_button = Gtk.ToggleButton(label=title)
+            mode_button.set_active(self.timer_mode == mode)
+            mode_button.connect('toggled', self.on_timer_mode_toggled, mode)
+            self.mode_buttons[mode] = mode_button
+            mode_row.pack_start(mode_button, False, False, 0)
         timer_label = Gtk.Label()
-        timer_label.set_xalign(0.5)
+        timer_label.set_xalign(1)
+        timer_label.set_hexpand(True)
         timer_label.set_text(format_timer_duration(self.timer_remaining_seconds))
         self.timer_label = timer_label
-        timer_box.pack_start(timer_label, False, False, 0)
+        header.pack_start(mode_row, False, False, 0)
+        header.pack_start(timer_label, True, True, 0)
+        timer_box.pack_start(header, False, False, 0)
 
         timer_settings = load_timer_settings()
         max_seconds = timer_settings['max_seconds']
@@ -2490,7 +2969,13 @@ class RssTray:
         timer_scale.set_draw_value(False)
         timer_scale.connect('value-changed', self.on_timer_slider_changed)
         self.timer_scale = timer_scale
-        timer_box.pack_start(timer_scale, False, False, 0)
+        countdown_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        countdown_box.pack_start(timer_scale, False, False, 0)
+        timer_box.pack_start(countdown_box, False, False, 0)
+        self.sched = None
+        schedule_box = self._build_schedule_box()
+        timer_box.pack_start(schedule_box, False, False, 0)
+        self.countdown_box, self.schedule_box = countdown_box, schedule_box
 
         self.timer_box = timer_box
         content_overlay.add_overlay(timer_box)
@@ -2500,8 +2985,10 @@ class RssTray:
         # widget that has it set, however show_all() was invoked). So its
         # children must be shown individually with .show(), which no_show_all
         # does not affect, rather than via any show_all() call on the box.
-        timer_label.show()
-        timer_scale.show()
+        header.show_all()
+        countdown_box.show_all()
+        schedule_box.show_all()
+        self._apply_timer_mode()
 
         outer.pack_start(content_overlay, True, True, 0)
 
@@ -2563,6 +3050,9 @@ class RssTray:
             self.timer_scale = None
             self.timer_label = None
             self.timer_box = None
+            self.countdown_box = self.schedule_box = self.sched = None
+            self.list_spacer = self.schedule_banner = self.schedule_banner_label = None
+            self.mode_buttons = {}
         self.weather_view = 'today'
         self.probe_connectivity()  # fresh answer for the indicator while the popup is open
         self.build_popup_window()
