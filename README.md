@@ -4,23 +4,40 @@ A minimal tray-based RSS/Atom reader for Linux, built with Python and GTK3 as a 
 
 ## Features
 
+### Tray icon, popup and feeds
+
 - **Tray icon** with three states:
   - green: nothing unread (shows the current temperature)
   - orange: unread news
   - red: package updates available
 
   Live Twitch and YouTube channels are deliberately not counted in the badge.
-- **Offline indicator:** the app probes connectivity every 10 s (and when the popup opens); after two failed probes in a row a red "Offline" banner appears under the weather bar. While it shows, left-clicking news items, feed headers and the "Updates available" header does nothing; right-clicking a news item still dismisses it (as does "Mark all read"). It goes away on the first successful probe.
-- **Popup list** grouped by feed. Left-click a row to open it and mark it read, right-click a row to mark it read only, click a feed header to mark the whole feed read. The popup auto-opens on new items and closes on focus-out.
-- **Feeds:** per-feed check intervals, custom display names, mute phrases. Items older than 24 h are silently marked seen the first time they are seen.
-- **Weather** (Open-Meteo): today's temperature, high/low, wind and rain, with a 5-day forecast behind the `›` button.
-- **Void package updates:** a system-wide `xbps-install -Mn -u` dry run twice a day by default (`interval=<hours>` in `[updates]`). Click the "Updates available" header to install everything, one package at a time, with live status.
-- **Twitch:** live channels are polled (every 15 minutes by default, `interval=` in `[twitch]`; optionally only during per-channel schedules, see below) through Twitch's unofficial GQL API (no app registration). Rows read `<user> - <category>` (the stream title is the tooltip), and the bullet turns into a play triangle on the channel that's playing. Click a row to play it with `streamlink` and `mpv` at the configured quality (default `best`); the popup closes, and a second click on another channel reuses the same maximized mpv window. If either binary isn't installed, or launching fails, it opens the channel in your browser instead.
+- **Popup list** grouped by feed. Left-click a row to open it and mark it read, right-click a row to mark it read only, click a feed header to mark the whole feed read. The popup auto-opens on new items and closes on focus-out; if it is already open when something new arrives, the list is updated in place (scroll position and an open Launch list are kept).
+- **Feeds:** per-feed check intervals, custom display names, mute phrases. Items older than 24 h are silently marked seen the first time they are seen. A feed that fails to load is retried after 2 minutes rather than a full interval, and feeds are not polled while offline. At most 500 unread items are kept; the oldest beyond that are dropped (they stay marked as seen and never come back).
+
+### Package updates
+
+- **Void package updates:** a system-wide `xbps-install -Mn -u` dry run twice a day by default (`interval=<hours>` in `[updates]`). Click the "Updates available" header to install everything, one package at a time, with live status. A scan is skipped while an install is running.
+
+### Live streams
+
+- **Twitch:** live channels are polled (every 15 minutes by default, `interval=` in `[twitch]`; optionally only during per-channel schedules, see below) through Twitch's unofficial GQL API (no app registration), in batches of 20 channels. Rows read `<user> - <category>` (the stream title is the tooltip), and the bullet turns into a play triangle on the channel that's playing. Click a row to play it with `streamlink` and `mpv` at the configured quality (default `best`); the popup closes, and a second click on another channel reuses the same maximized mpv window. If either binary isn't installed, or launching fails, it opens the channel in your browser instead.
 - **YouTube Live:** live channels are polled (every 15 minutes by default, `interval=` in `[youtube]`; same per-channel schedules) via `streamlink --json <channel>/live` per channel -- no API key, and the same extraction path used for actual playback, so the check can't disagree with what clicking the row does. There's no keyless batch API for YouTube, so this is one streamlink call per channel (heavier than Twitch's single batched request). Shares the same "Live now" list, quality config, and browser fallback as Twitch.
 - **Player window titles:** mpv's title is `<Site> · <user> · <stream title>` for both platforms.
-- **Launcher:** a "Launch" footer button opens a list of your own commands (the `[launcher]` section, `Label|command` per line); clicking one runs it detached through the shell and closes the popup. The list is read when you open it, so edits apply immediately.
+
+### Weather
+
+- **Weather** (Open-Meteo): today's temperature, high/low, wind and rain, with a 5-day forecast behind the `›` button. Refreshed every 30 minutes by default (`interval=<minutes>` in `[weather]`, minimum 5).
+- **Severe-weather alerts** (optional, `alerts=true` in `[weather]`): polls the MeteoAlarm feed for your country on the same cycle as the weather, filtered to the region matching the configured coordinates (country and region are reverse-geocoded via OpenStreetMap once and then stored in `config.conf`; delete the `country=`/`region=` lines to resolve them again; Europe only, since MeteoAlarm only covers European countries; if your coordinates resolve to a country it doesn't cover, the app writes `alerts=false` into `config.conf` itself). An active alert is color-coded by severity (yellow/orange/red for moderate/severe/extreme) and pulses the matching weather value and the tray badge, faster for more severe alerts.
+
+### Tools
+
 - **Timer:** a slider behind the "Timer" footer button (0 to 2 h in 1-minute steps by default; the maximum and the step are configurable with `max=<minutes>` and `step=<seconds>` in the `[timer]` section, see below). It counts down against a fixed deadline, keeps counting with the popup closed, and plays the notification sound twice at zero.
-- **Severe-weather alerts** (optional, `alerts=true` in `[weather]`): polls the MeteoAlarm feed for your country every 30 minutes, filtered to the region matching the configured coordinates (country and region are reverse-geocoded via OpenStreetMap once and then stored in `config.conf`; delete the `country=`/`region=` lines to resolve them again; Europe only, since MeteoAlarm only covers European countries; if your coordinates resolve to a country it doesn't cover, the app writes `alerts=false` into `config.conf` itself). An active alert is color-coded by severity (yellow/orange/red for moderate/severe/extreme) and pulses the matching weather value and the tray badge, faster for more severe alerts.
+- **Launcher:** a "Launch" footer button opens a list of your own commands (the `[launcher]` section, `Label|command` per line); clicking one runs it detached through the shell and closes the popup. The list is read when you open it, so edits apply immediately.
+
+### Connectivity
+
+- **Offline indicator:** the app probes connectivity every 10 s (and when the popup opens); after two failed probes in a row a red "Offline" banner appears under the weather bar. While it shows, left-clicking news items, feed headers, live channels and the "Updates available" header does nothing; right-clicking a news item still dismisses it (as does "Mark all read"). On the first successful probe the banner goes away and feeds, weather and live channels refresh immediately instead of waiting out their intervals.
 
 ## Requirements
 
@@ -98,6 +115,8 @@ channel/UCxxxxxxxxxxxxxxxxxxxxxx|720p60
 # lat|lon for the weather bar (Open-Meteo, no key needed); the weather
 # bar stays hidden until this is set
 <latitude>|<longitude>
+# interval=<minutes> between weather (and alert) refreshes (default 30, minimum 5)
+interval=30
 alerts=true
 
 [updates]
@@ -145,7 +164,7 @@ The `zz-` prefix matters: sudoers uses the last matching rule, so this file must
 
 ## Design notes
 
-- The popup is a borderless `Gtk.Window` that is destroyed and rebuilt on every open. This avoids stuck-size bugs; do not make it persistent or call `resize()` on it.
+- The popup is a borderless `Gtk.Window` that is destroyed and rebuilt on every manual open (an auto-open while it is already showing just refreshes the list). This avoids stuck-size bugs; do not make it persistent or call `resize()` on it.
 - Package updates are system-wide rather than feed-based, because GitHub's atom feed is a sliding window and version bumps get missed.
 - Threading: `lock` guards state, `_check_lock` RSS cycles, `_xbps_lock` xbps scans and installs, `_twitch_lock`/`_youtube_lock` their respective live-channel checks. All GTK mutations from threads go through `GLib.idle_add`.
 - A failed xbps scan or Twitch request keeps the previous state; failed scans back off exponentially up to the normal update interval.
@@ -153,7 +172,7 @@ The `zz-` prefix matters: sudoers uses the last matching rule, so this file must
 
 ## Known limitations
 
-- `Gtk.StatusIcon` is deprecated upstream but still works on XFCE and most X11 panels.
+- `Gtk.StatusIcon` is deprecated upstream but still works on XFCE and most X11 panels; the app silences its deprecation warnings. If a future GTK drops it, the tray icon will need porting to an AppIndicator (which would replace the popup with a menu).
 - Twitch's GQL API is unofficial and undocumented; it can break without notice.
 - YouTube Live detection depends on streamlink's own YouTube plugin staying current with YouTube's changes; a channel's liveness check takes a few seconds (full streamlink extraction), unlike Twitch's near-instant batched check.
 - Update detection and installs are Void-specific.
