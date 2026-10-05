@@ -10,11 +10,17 @@ try:
     from gi.repository import Wnck
 except Exception:
     Wnck = None  # fullscreen detection just no-ops if this isn't available
+try:
+    gi.require_version('GLibUnix', '2.0')
+    from gi.repository import GLibUnix  # GLib >= 2.78: where the unix signal helpers moved
+except Exception:
+    GLibUnix = None
 import cairo
 
 # Gtk.StatusIcon is deprecated upstream but is what the XEMBED tray needs here;
 # silence the per-call warnings it would otherwise print on every icon update.
 warnings.filterwarnings('ignore', message=r'Gtk\.StatusIcon')
+warnings.filterwarnings('ignore', message=r'GLib\.unix_signal_add')  # older-GLib fallback path
 import feedparser
 import json
 import math
@@ -2998,6 +3004,18 @@ class RssTray:
         self.refresh_list()
 
 
+def _unix_signal_add(signum, callback):
+    """Runs `callback` on the GLib main loop when `signum` arrives. Newer GLib
+    moved this to GLibUnix (GLib.unix_signal_add is deprecated there and warns
+    on every call); older ones only have the GLib version."""
+    if GLibUnix is not None:
+        for name in ('signal_add', 'signal_add_full'):
+            add = getattr(GLibUnix, name, None)
+            if add is not None:
+                return add(GLib.PRIORITY_DEFAULT, signum, callback)
+    return GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signum, callback)
+
+
 def _install_quit_signal_handlers():
     """SIGTERM (session logout, `kill`) and SIGINT (Ctrl+C) leave the GTK main
     loop cleanly, so atexit hooks run and the local streamlink server isn't
@@ -3007,7 +3025,7 @@ def _install_quit_signal_handlers():
         return GLib.SOURCE_REMOVE
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, quit_loop)
+            _unix_signal_add(sig, quit_loop)
         except (AttributeError, TypeError):
             pass  # very old PyGObject: keep the default behaviour
 
