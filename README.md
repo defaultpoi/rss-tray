@@ -39,7 +39,11 @@ A minimal tray-based RSS/Atom reader for Linux, built with Python and GTK3 as a 
 
 ### Connectivity
 
-- **Offline indicator:** the app probes connectivity every 10 s (and when the popup opens); after two failed probes in a row a red "Offline" banner appears under the weather bar. While it shows, left-clicking news items, feed headers, live channels and the "Updates available" header does nothing; right-clicking a news item still dismisses it (as does "Mark all read"). On the first successful probe the banner goes away and feeds, weather and live channels refresh immediately instead of waiting out their intervals.
+- **Offline indicator:** a red "Offline" banner appears under the weather bar when the internet stops working, and goes away when it is back.
+  - **Detection:** a probe runs every 10 s and when the popup opens. It checks that a public address accepts a connection **and** that a hostname resolves, so a DNS-only outage (the link looks fine, but nothing with a name works) counts too. A failed probe is re-checked after 3 s, and a failing feed, weather or live-channel request triggers a probe at once (at most one every 5 s), so the banner shows up within seconds. It takes two failed probes in a row to go offline, so one dropped probe doesn't flash it.
+  - **Cause:** hover the banner for what failed and since when: DNS lookups failing, the router answering but the internet being unreachable (provider or upstream), the router not answering, or no default route (the link is down). The same line goes to the debug log (`RSS_TRAY_DEBUG=1`).
+  - **Reset network button:** if `reset=<command>` is set in `[network]` (for example `reset=~/.local/bin/reset-network.sh`), the banner gets a "Reset network" button that runs it. It only runs when you click it; the button is disabled for 20 s while the connection comes back.
+  - **While it shows:** left-clicking news items, feed headers, live channels and the "Updates available" header does nothing; right-clicking a news item still dismisses it (as does "Mark all read"). On the first successful probe the banner goes away and feeds, weather and live channels refresh immediately instead of waiting out their intervals.
 
 ## Requirements
 
@@ -120,6 +124,11 @@ channel/UCxxxxxxxxxxxxxxxxxxxxxx|720p60
 # interval=<minutes> between weather (and alert) refreshes (default 30, minimum 5)
 interval=30
 alerts=true
+
+[network]
+# Command behind the "Reset network" button on the Offline banner (no button if
+# empty). It runs only when you click the button.
+reset=~/.local/bin/reset-network.sh
 
 [updates]
 # interval=<hours> between package update scans (default 12, minimum 1)
