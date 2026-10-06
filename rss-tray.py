@@ -52,6 +52,9 @@ TWITCH_CHECK_INTERVAL_SECONDS = 900  # how often to poll Twitch live status
 NETWORK_RETRY_SECONDS = 10  # how often to recheck connectivity if offline at startup
 OFFLINE_PROBE_SECONDS = 10  # how often the popup's offline indicator re-probes the network
 OFFLINE_AFTER_FAILED_PROBES = 2  # consecutive failed probes before showing 'offline' (ignores blips)
+CONFIRM_PROBE_SECONDS = 3  # a failed probe is re-checked this soon instead of waiting for the next tick
+PROBE_REQUEST_MIN_GAP_SECONDS = 5  # throttle for probes triggered by failing requests
+NETWORK_RESET_COOLDOWN_SECONDS = 20
 FEED_RETRY_SECONDS = 120  # retry a feed this soon after a failed fetch (instead of a full interval)
 MAX_LIST_ITEMS = 40
 MAX_UNREAD_ITEMS = 500  # stored unread items; the oldest beyond this are dropped (they stay 'seen')
@@ -138,6 +141,10 @@ def ensure_config():
             "[updates]\n"
             "# interval=<hours> between package update scans (default 12, minimum 1).\n"
             "\n"
+            "[network]\n"
+            "# reset=<command>: shows a \"Reset network\" button on the Offline banner,\n"
+            "# e.g. reset=~/.local/bin/reset-network.sh (runs only when you click it).\n"
+            "\n"
             "[actions]\n"
             "# Commands the timer's Schedule mode can run, one per line: Label|command\n"
             "# (built-in defaults if this section is empty: Suspend and Power off).\n"
@@ -186,7 +193,7 @@ def _read_config_sections():
     """Parses config.conf into {section: [lines]} for the known sections,
     each a list of raw non-comment, non-empty lines under that [section]."""
     sections = {'feeds': [], 'mute': [], 'twitch': [], 'weather': [], 'timer': [], 'youtube': [],
-                'updates': [], 'launcher': [], 'actions': [], 'schedule': []}
+                'updates': [], 'launcher': [], 'actions': [], 'schedule': [], 'network': []}
     current = None
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, encoding='utf-8', errors='replace') as f:
@@ -476,6 +483,16 @@ SCHEDULE_GLOBAL_DEFAULTS = {'warn': 60, 'snooze': 30, 'grace': 120}
 NEW_SCHEDULE = {'enabled': False, 'minute': 30, 'days': _ALL_DAYS, 'action': 'Suspend'}
 SCHEDULE_RESUME_GAP_SECONDS = 10  # a bigger wall-clock jump between ticks means the machine slept
 SCHEDULE_MISSING_ACTION_SUFFIX = ' (not in [actions])'
+
+
+def load_network_reset_command():
+    """The command behind the Offline banner's "Reset network" button
+    ('reset=' in [network]); '' if none is configured (then there is no button)."""
+    for line in _read_config_sections()['network']:
+        key, sep, val = line.partition('=')
+        if sep and key.strip().lower() == 'reset':
+            return val.strip()
+    return ''
 
 
 def load_actions():
@@ -833,14 +850,15 @@ ONLINE_PROBE_TARGETS = [
 ]
 
 
-def is_online():
-    """Quick check for basic network connectivity: True if ANY of several
-    independent, well-known public endpoints accepts a TCP connection on the
-    HTTPS port. Raw IPs (no DNS lookup involved), port 443 rather than 53
-    (some networks block outbound DNS to arbitrary servers but allow HTTPS),
-    and deliberately NOT tied to any of this app's own feature dependencies
-    (weather, Twitch, feed hosts) — an outage of one of those shouldn't get
-    misread as 'the network isn't up' and stall unrelated startup polling."""
+PROBE_HOSTNAMES = ('cloudflare.com', 'google.com')  # resolved to catch DNS-only outages
+DNS_TIMEOUT_SECONDS = 3
+GATEWAY_PORTS = (443, 80, 53)
+
+
+def _tcp_reachable():
+    """True if ANY public endpoint accepts a TCP connection on the HTTPS port
+    -- raw IPs, so no DNS involved, and nothing tied to this app's own
+    dependencies (weather, Twitch, feed hosts)."""
     for host, port in ONLINE_PROBE_TARGETS:
         try:
             with socket.create_connection((host, port), timeout=1):
@@ -848,6 +866,84 @@ def is_online():
         except OSError:
             continue
     return False
+
+
+def _dns_ok(timeout=DNS_TIMEOUT_SECONDS):
+    """True if one of PROBE_HOSTNAMES resolves within `timeout` seconds.
+    getaddrinfo can't be given a timeout, so it runs on a helper thread that
+    is simply abandoned if the resolver hangs."""
+    result = []
+
+    def lookup():
+        for hostname in PROBE_HOSTNAMES:
+            try:
+                socket.getaddrinfo(hostname, 443, type=socket.SOCK_STREAM)
+                result.append(True)
+                return
+            except OSError:
+                continue
+    worker = threading.Thread(target=lookup, daemon=True)
+    worker.start()
+    worker.join(timeout)
+    return bool(result)
+
+
+def _parse_default_gateway(route_table):
+    """The default route's gateway from the text of /proc/net/route, as a
+    dotted quad, or None if there is no default route."""
+    for line in route_table.splitlines()[1:]:
+        fields = line.split()
+        if len(fields) >= 3 and fields[1] == '00000000' and int(fields[3], 16) & 2:
+            raw = bytes.fromhex(fields[2])[::-1]  # stored little-endian
+            return '.'.join(str(b) for b in raw)
+    return None
+
+
+def _default_gateway():
+    try:
+        with open('/proc/net/route') as f:
+            return _parse_default_gateway(f.read())
+    except (OSError, ValueError):
+        return None
+
+
+def _gateway_answers(gateway):
+    """True if the router is alive: it accepts a connection or actively
+    refuses one (either proves something answered); silence means it doesn't
+    answer, though a firewalled router can also look silent."""
+    for port in GATEWAY_PORTS:
+        try:
+            with socket.create_connection((gateway, port), timeout=1):
+                return True
+        except ConnectionRefusedError:
+            return True
+        except OSError:
+            continue
+    return False
+
+
+def diagnose_connectivity():
+    """{'online': bool, 'cause': str, 'detail': str}. Online means the
+    internet is reachable AND hostnames resolve (an outage of either breaks
+    every feed). When it isn't, `cause` says which stage failed:
+    'dns', 'no-route', 'gateway' or 'internet'."""
+    if _tcp_reachable():
+        if _dns_ok():
+            return {'online': True, 'cause': 'ok', 'detail': ''}
+        return {'online': False, 'cause': 'dns',
+                'detail': 'DNS lookups fail (the internet is reachable by IP address)'}
+    gateway = _default_gateway()
+    if gateway is None:
+        return {'online': False, 'cause': 'no-route', 'detail': 'no default route (the link is down)'}
+    if _gateway_answers(gateway):
+        return {'online': False, 'cause': 'internet',
+                'detail': f'the router ({gateway}) answers, but the internet is unreachable '
+                          '(provider or upstream)'}
+    return {'online': False, 'cause': 'gateway', 'detail': f'the router ({gateway}) does not answer'}
+
+
+def is_online():
+    return diagnose_connectivity()['online']
 
 
 def run_when_online(fn):
@@ -1758,6 +1854,8 @@ list, viewport, scrolledwindow, overlay, .popup-content { background: #ffffff; }
 list, list label { color: #000000; }
 .weather-bar { background: #e8eef5; }
 .offline-banner { background: #b3261e; color: #ffffff; padding: 3px 6px; font-weight: bold; }
+.offline-banner label { color: #ffffff; font-weight: bold; }
+.offline-banner button label { color: #000000; font-weight: normal; }
 .schedule-warning { background: #b3261e; padding: 3px 6px; }
 .schedule-warning label { color: #ffffff; font-weight: bold; }
 .schedule-warning button label { color: #000000; font-weight: normal; }
@@ -1789,7 +1887,13 @@ class RssTray:
         self.online = True            # last known connectivity (see probe_connectivity)
         self._probe_failures = 0
         self._probing = False
+        self._last_probe_request = 0.0
+        self._confirm_pending = False
+        self.offline_detail = ''
+        self.offline_since = None
         self.offline_banner = None
+        self.offline_banner_label = None
+        self.reset_btn = None
         self.weather_data = None
         self.weather_box = None
         self.weather_view = 'today'
@@ -1916,9 +2020,11 @@ class RssTray:
                 parsed = feedparser.parse(url)
             except Exception:
                 last_checked[url] = retry_soon
+                self.note_request_failure()
                 continue
             if getattr(parsed, 'bozo', False) and not parsed.entries:
                 last_checked[url] = retry_soon  # fetch/parse failed
+                self.note_request_failure()
                 continue
             last_checked[url] = now
             for entry in parsed.entries:
@@ -2038,6 +2144,8 @@ class RssTray:
                 live_now = check_twitch_live_channels(due)
                 if live_now is not None:  # failed check: keep last known live state
                     GLib.idle_add(self._on_twitch_checked, live_now)
+                else:
+                    self.note_request_failure()
         finally:
             self._twitch_lock.release()
 
@@ -2116,6 +2224,8 @@ class RssTray:
     def _fetch_weather_bg(self):
         data = fetch_weather()
         alerts = self._fetch_alerts_bg()
+        if data is None and load_weather_settings()['lat'] is not None:
+            self.note_request_failure()  # configured, yet nothing came back
         GLib.idle_add(self._on_weather_fetched, data, alerts)
 
     def _fetch_alerts_bg(self):
@@ -2958,29 +3068,86 @@ class RssTray:
             self._probing = True
 
             def work():
-                ok = is_online()
-                GLib.idle_add(self._on_probe_result, ok)
+                GLib.idle_add(self._on_probe_result, diagnose_connectivity())
             threading.Thread(target=work, daemon=True).start()
         return True
 
-    def _on_probe_result(self, probe_ok):
+    def request_probe(self):
+        """Probe now (throttled) -- called when a real request fails, so the
+        indicator doesn't wait for the next 10 s tick. Main thread only."""
+        now = time_module.monotonic()
+        if now - self._last_probe_request >= PROBE_REQUEST_MIN_GAP_SECONDS:
+            self._last_probe_request = now
+            self.probe_connectivity()
+        return False
+
+    def note_request_failure(self):
+        """Safe from any thread."""
+        GLib.idle_add(self.request_probe)
+
+    def _confirm_probe(self):
+        self._confirm_pending = False
+        self.probe_connectivity()
+        return False
+
+    def _on_probe_result(self, result):
         self._probing = False
-        online, self._probe_failures = next_connectivity(self.online, self._probe_failures, probe_ok)
+        self.offline_detail = result['detail']
+        online, self._probe_failures = next_connectivity(self.online, self._probe_failures, result['online'])
         if online != self.online:
             self._set_online(online)
+        elif self.offline_banner is not None and not online:
+            self.offline_banner.set_tooltip_text(self._offline_tooltip())  # the cause may have changed
+        if not result['online'] and self.online and not self._confirm_pending:
+            # first failure while still "online": confirm quickly rather than in 10 s
+            self._confirm_pending = True
+            GLib.timeout_add_seconds(CONFIRM_PROBE_SECONDS, self._confirm_probe)
         return False
+
+    def _offline_tooltip(self):
+        text = self.offline_detail or 'no connection'
+        if self.offline_since:
+            text += f"\noffline since {datetime.fromtimestamp(self.offline_since):%H:%M}"
+        return text
 
     def _set_online(self, online):
         came_back = online and not self.online
         self.online = online
+        if not online:
+            self.offline_since = time_module.time()
+            _log(f'offline: {self.offline_detail}')
+        elif came_back:
+            _log('back online')
+            self.offline_since = None
         if self.offline_banner is not None:
             self.offline_banner.set_visible(not online)
+            self.offline_banner.set_tooltip_text(None if online else self._offline_tooltip())
         if came_back:
             # don't wait out the remaining intervals after an outage
             self.start_check_thread()
             self.start_weather_fetch()
             self.start_twitch_check()
             self.start_youtube_check()
+
+    def on_network_reset_clicked(self, _button):
+        command = load_network_reset_command()
+        if not command:
+            return
+        run_launcher_command(command)
+        self.reset_btn.set_sensitive(False)
+        self.offline_banner_label.set_text('Resetting network\u2026')
+        GLib.timeout_add_seconds(6, self._probe_after_reset)
+        GLib.timeout_add_seconds(NETWORK_RESET_COOLDOWN_SECONDS, self._end_network_reset)
+
+    def _probe_after_reset(self):
+        self.probe_connectivity()
+        return False
+
+    def _end_network_reset(self):
+        if self.offline_banner_label is not None:
+            self.offline_banner_label.set_text(OFFLINE_BANNER_TEXT)
+            self.reset_btn.set_sensitive(True)
+        return False
 
     def on_popup_focus_out(self, win, _event):
         if self._launcher_open:
@@ -3058,13 +3225,23 @@ class RssTray:
         outer.pack_start(weather_box, False, False, 0)
         outer.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 0)
 
-        banner = Gtk.Label(label=OFFLINE_BANNER_TEXT)
+        banner = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         banner.get_style_context().add_class('offline-banner')
-        banner.set_line_wrap(True)
-        banner.set_justify(Gtk.Justification.CENTER)
-        banner.set_no_show_all(True)  # shown/hidden by _set_online, not by show_all()
+        banner_label = Gtk.Label(label=OFFLINE_BANNER_TEXT)
+        banner_label.set_hexpand(True)
+        reset_btn = Gtk.Button(label='Reset network')
+        reset_btn.set_tooltip_text(load_network_reset_command())
+        reset_btn.connect('clicked', self.on_network_reset_clicked)
+        banner.pack_start(banner_label, True, True, 0)
+        banner.pack_start(reset_btn, False, False, 0)
+        banner.set_no_show_all(True)  # shown/hidden by _set_online; children are shown explicitly
+        banner_label.show()
+        reset_btn.set_visible(bool(load_network_reset_command()))  # no command configured: no button
         banner.set_visible(not self.online)
+        banner.set_tooltip_text(None if self.online else self._offline_tooltip())
         self.offline_banner = banner
+        self.offline_banner_label = banner_label
+        self.reset_btn = reset_btn
         outer.pack_start(banner, False, False, 0)
 
         warn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
@@ -3247,6 +3424,7 @@ class RssTray:
             self.timer_scale = None
             self.timer_label = None
             self.timer_box = None
+            self.offline_banner = self.offline_banner_label = self.reset_btn = None
             self.countdown_box = self.schedule_box = self.sched = None
             self.list_spacer = self.schedule_banner = self.schedule_banner_label = None
             self.mode_buttons = {}
