@@ -739,12 +739,16 @@ class TestOfflineBehavior(unittest.TestCase):
         on_row_activated = rt.RssTray.on_row_activated
         _on_probe_result = rt.RssTray._on_probe_result
         _set_online = rt.RssTray._set_online
+        _offline_tooltip = rt.RssTray._offline_tooltip
         probe_connectivity = rt.RssTray.probe_connectivity
 
         def __init__(self, online=True):
             self.online = online
             self._probe_failures = 0
             self._probing = True
+            self._confirm_pending = True   # no real timers in unit tests
+            self.offline_detail = ''
+            self.offline_since = None
             self.offline_banner = mock.MagicMock()
             self.start_check_thread = mock.Mock()
             self.start_weather_fetch = mock.Mock()
@@ -832,14 +836,18 @@ class TestOfflineBehavior(unittest.TestCase):
         self.assertTrue(stub.on_listbox_button_press(listbox, event))
         self.assertEqual(stub.removed, ['id1'])
 
+    @staticmethod
+    def probe(ok, detail=''):
+        return {'online': ok, 'cause': 'ok' if ok else 'internet', 'detail': detail}
+
     def test_probe_results_drive_the_banner(self):
         stub = self.Stub(online=True)
-        stub._on_probe_result(False)
+        stub._on_probe_result(self.probe(False, 'no route'))
         stub.offline_banner.set_visible.assert_not_called()   # first failure: still online
-        stub._on_probe_result(False)
+        stub._on_probe_result(self.probe(False, 'no route'))
         self.assertFalse(stub.online)
         stub.offline_banner.set_visible.assert_called_with(True)
-        stub._on_probe_result(True)
+        stub._on_probe_result(self.probe(True))
         self.assertTrue(stub.online)
         stub.offline_banner.set_visible.assert_called_with(False)
 
@@ -908,6 +916,7 @@ class TestFeedCheckRobustness(TmpConfigCase):
             self.lock = rt.threading.Lock()
             self.state = {'seen': {}, 'unread': [], 'last_checked': {}}
             self.on_new_items = mock.Mock()
+            self.note_request_failure = mock.Mock()
 
     def test_offline_unforced_check_does_nothing(self):
         self.conf('[feeds]\nhttps://a.example/feed\n')
@@ -1505,6 +1514,283 @@ class TestScheduleIconAndCss(unittest.TestCase):
             self.assertEqual(s['schedules'], [])
             self.assertEqual((s['warn'], s['snooze'], s['grace']), (60, 30, 120))
             self.assertEqual([a[0] for a in rt.load_actions()], ['Suspend', 'Power off'])
+
+
+class TestConnectivityDiagnosis(unittest.TestCase):
+    def diagnose(self, tcp=True, dns=True, gateway='192.168.1.1', answers=True):
+        with mock.patch.object(rt, '_tcp_reachable', return_value=tcp), \
+                mock.patch.object(rt, '_dns_ok', return_value=dns), \
+                mock.patch.object(rt, '_default_gateway', return_value=gateway), \
+                mock.patch.object(rt, '_gateway_answers', return_value=answers):
+            return rt.diagnose_connectivity()
+
+    def test_everything_works(self):
+        self.assertEqual(self.diagnose(), {'online': True, 'cause': 'ok', 'detail': ''})
+
+    def test_dns_only_outage_counts_as_offline(self):
+        result = self.diagnose(tcp=True, dns=False)
+        self.assertFalse(result['online'])
+        self.assertEqual(result['cause'], 'dns')
+        self.assertIn('DNS', result['detail'])
+
+    def test_router_answers_but_the_internet_is_down(self):
+        result = self.diagnose(tcp=False, answers=True)
+        self.assertEqual((result['online'], result['cause']), (False, 'internet'))
+        self.assertIn('192.168.1.1', result['detail'])
+
+    def test_router_not_answering(self):
+        result = self.diagnose(tcp=False, answers=False)
+        self.assertEqual(result['cause'], 'gateway')
+        self.assertIn('does not answer', result['detail'])
+
+    def test_no_default_route_means_the_link_is_down(self):
+        result = self.diagnose(tcp=False, gateway=None)
+        self.assertEqual(result['cause'], 'no-route')
+
+    def test_dns_is_not_even_tried_when_nothing_is_reachable(self):
+        with mock.patch.object(rt, '_tcp_reachable', return_value=False), \
+                mock.patch.object(rt, '_dns_ok') as dns, \
+                mock.patch.object(rt, '_default_gateway', return_value=None):
+            rt.diagnose_connectivity()
+        dns.assert_not_called()
+
+    def test_is_online_follows_the_diagnosis(self):
+        with mock.patch.object(rt, 'diagnose_connectivity', return_value={'online': False, 'cause': 'dns', 'detail': ''}):
+            self.assertFalse(rt.is_online())
+
+
+class TestConnectivityProbes(unittest.TestCase):
+    ROUTE = ('Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\n'
+             'wlan0\t00000000\t0101A8C0\t0003\t0\t0\t600\t00000000\n'
+             'wlan0\t0001A8C0\t00000000\t0001\t0\t0\t600\t00FFFFFF\n')
+
+    def test_default_gateway_is_decoded_from_the_route_table(self):
+        self.assertEqual(rt._parse_default_gateway(self.ROUTE), '192.168.1.1')
+
+    def test_no_default_route(self):
+        table = self.ROUTE.splitlines()[0] + '\n' + self.ROUTE.splitlines()[2] + '\n'
+        self.assertIsNone(rt._parse_default_gateway(table))
+
+    def test_down_default_route_is_ignored(self):
+        self.assertIsNone(rt._parse_default_gateway(self.ROUTE.replace('0003', '0001', 1)))
+
+    def test_dns_ok_when_a_hostname_resolves(self):
+        with mock.patch.object(rt.socket, 'getaddrinfo', side_effect=[OSError(), [('x',)]]):
+            self.assertTrue(rt._dns_ok())  # the first name failing is fine, the second resolves
+
+    def test_dns_fails_when_nothing_resolves(self):
+        with mock.patch.object(rt.socket, 'getaddrinfo', side_effect=OSError()):
+            self.assertFalse(rt._dns_ok())
+
+    def test_a_hanging_resolver_gives_up_after_the_timeout(self):
+        release = rt.threading.Event()
+        self.addCleanup(release.set)
+        with mock.patch.object(rt.socket, 'getaddrinfo', side_effect=lambda *a, **k: release.wait(10)):
+            started = rt.time_module.monotonic()
+            self.assertFalse(rt._dns_ok(timeout=0.2))
+        self.assertLess(rt.time_module.monotonic() - started, 2)
+
+    def test_gateway_that_refuses_connections_is_alive(self):
+        with mock.patch.object(rt.socket, 'create_connection', side_effect=ConnectionRefusedError()):
+            self.assertTrue(rt._gateway_answers('192.168.1.1'))
+
+    def test_gateway_that_times_out_everywhere_does_not_answer(self):
+        with mock.patch.object(rt.socket, 'create_connection', side_effect=OSError('timed out')) as connect:
+            self.assertFalse(rt._gateway_answers('192.168.1.1'))
+        self.assertEqual(connect.call_count, len(rt.GATEWAY_PORTS))
+
+    def test_tcp_probe_succeeds_on_any_target(self):
+        calls = []
+
+        def connect(addr, timeout):
+            calls.append(addr)
+            if len(calls) < 3:
+                raise OSError()
+            return mock.MagicMock()
+        with mock.patch.object(rt.socket, 'create_connection', side_effect=connect):
+            self.assertTrue(rt._tcp_reachable())
+        self.assertEqual(len(calls), 3)
+
+
+class TestImmediateProbes(unittest.TestCase):
+    class Stub:
+        request_probe = rt.RssTray.request_probe
+        note_request_failure = rt.RssTray.note_request_failure
+        _on_probe_result = rt.RssTray._on_probe_result
+        _confirm_probe = rt.RssTray._confirm_probe
+        _set_online = rt.RssTray._set_online
+        _offline_tooltip = rt.RssTray._offline_tooltip
+
+        def __init__(self, online=True):
+            self.online = online
+            self._probe_failures = 0
+            self._probing = False
+            self._confirm_pending = False
+            self._last_probe_request = 0.0
+            self.offline_detail = ''
+            self.offline_since = None
+            self.offline_banner = None
+            self.probes = 0
+
+        def probe_connectivity(self):
+            self.probes += 1
+            return True
+
+    def test_request_failure_probes_right_away_on_the_main_loop(self):
+        stub = self.Stub()
+        with mock.patch.object(rt.GLib, 'idle_add') as idle:
+            stub.note_request_failure()
+        idle.assert_called_once_with(stub.request_probe)
+
+    def test_failure_probes_are_throttled(self):
+        stub = self.Stub()
+        with mock.patch.object(rt.time_module, 'monotonic', side_effect=[100.0, 101.0, 106.0]):
+            stub.request_probe()
+            stub.request_probe()   # 1 s later: ignored
+            stub.request_probe()   # 6 s after the first: allowed
+        self.assertEqual(stub.probes, 2)
+
+    def test_a_failed_probe_while_online_schedules_one_quick_confirmation(self):
+        stub = self.Stub(online=True)
+        failure = {'online': False, 'cause': 'internet', 'detail': 'x'}
+        with mock.patch.object(rt.GLib, 'timeout_add_seconds') as timer:
+            stub._on_probe_result(failure)
+            stub._on_probe_result(failure)   # already pending: not scheduled twice
+        timer.assert_called_once_with(rt.CONFIRM_PROBE_SECONDS, stub._confirm_probe)
+        # (a second failure flipped it offline)
+        self.assertFalse(stub.online)
+
+    def test_confirmation_runs_a_probe_and_clears_the_pending_flag(self):
+        stub = self.Stub()
+        stub._confirm_pending = True
+        stub._confirm_probe()
+        self.assertEqual(stub.probes, 1)
+        self.assertFalse(stub._confirm_pending)
+
+    def test_no_confirmation_needed_for_a_healthy_probe(self):
+        stub = self.Stub()
+        with mock.patch.object(rt.GLib, 'timeout_add_seconds') as timer:
+            stub._on_probe_result({'online': True, 'cause': 'ok', 'detail': ''})
+        timer.assert_not_called()
+
+    def test_tooltip_shows_the_cause_and_since_when(self):
+        stub = self.Stub(online=True)
+        stub.offline_banner = mock.MagicMock()
+        stub.offline_detail = 'DNS lookups fail'
+        with mock.patch.object(rt.time_module, 'time', return_value=rt.datetime(2026, 10, 5, 3, 14).timestamp()), \
+                mock.patch.object(rt, '_log') as log:
+            stub._set_online(False)
+        text = stub.offline_banner.set_tooltip_text.call_args[0][0]
+        self.assertIn('DNS lookups fail', text)
+        self.assertIn('03:14', text)
+        self.assertIn('DNS lookups fail', log.call_args[0][0])   # also in the debug log
+
+    def test_tooltip_is_cleared_when_back_online(self):
+        stub = self.Stub(online=False)
+        stub.offline_banner = mock.MagicMock()
+        for name in ('start_check_thread', 'start_weather_fetch', 'start_twitch_check', 'start_youtube_check'):
+            setattr(stub, name, mock.Mock())
+        with mock.patch.object(rt, '_log'):
+            stub._set_online(True)
+        stub.offline_banner.set_tooltip_text.assert_called_with(None)
+        self.assertIsNone(stub.offline_since)
+
+
+class TestFailureTriggers(TmpConfigCase):
+    def test_a_failed_twitch_check_asks_for_a_probe(self):
+        self.conf('[twitch]\nchan\n')
+
+        class Stub:
+            _check_twitch_guarded = rt.RssTray._check_twitch_guarded
+
+            def __init__(self):
+                self.lock = rt.threading.Lock()
+                self.state = {}
+                self._twitch_lock = rt.threading.Lock()
+                self._twitch_lock.acquire()
+                self.note_request_failure = mock.Mock()
+                self._on_twitch_checked = mock.Mock()
+        stub = Stub()
+        with mock.patch.object(rt, 'check_twitch_live_channels', return_value=None):
+            stub._check_twitch_guarded()
+        stub.note_request_failure.assert_called_once()
+
+    def test_a_successful_twitch_check_does_not(self):
+        self.conf('[twitch]\nchan\n')
+
+        class Stub:
+            _check_twitch_guarded = rt.RssTray._check_twitch_guarded
+
+            def __init__(self):
+                self.lock = rt.threading.Lock()
+                self.state = {}
+                self._twitch_lock = rt.threading.Lock()
+                self._twitch_lock.acquire()
+                self.note_request_failure = mock.Mock()
+                self._on_twitch_checked = mock.Mock()
+        stub = Stub()
+        with mock.patch.object(rt, 'check_twitch_live_channels', return_value={}), mock.patch.object(rt.GLib, 'idle_add'):
+            stub._check_twitch_guarded()
+        stub.note_request_failure.assert_not_called()
+
+    def test_weather_failure_only_counts_when_weather_is_configured(self):
+        class Stub:
+            _fetch_weather_bg = rt.RssTray._fetch_weather_bg
+
+            def __init__(self):
+                self.note_request_failure = mock.Mock()
+                self._fetch_alerts_bg = lambda: []
+                self._on_weather_fetched = mock.Mock()
+        self.conf('[weather]\n10.0|20.0\n')
+        configured = Stub()
+        with mock.patch.object(rt, 'fetch_weather', return_value=None), mock.patch.object(rt.GLib, 'idle_add'):
+            configured._fetch_weather_bg()
+        configured.note_request_failure.assert_called_once()
+        self.conf('[feeds]\n')
+        unconfigured = Stub()
+        with mock.patch.object(rt, 'fetch_weather', return_value=None), mock.patch.object(rt.GLib, 'idle_add'):
+            unconfigured._fetch_weather_bg()
+        unconfigured.note_request_failure.assert_not_called()
+
+
+class TestNetworkReset(TmpConfigCase):
+    def test_reset_command_from_config(self):
+        self.assertEqual(rt.load_network_reset_command(), '')
+        self.conf('[network]\nreset = ~/.local/bin/reset-network.sh --force\n')
+        self.assertEqual(rt.load_network_reset_command(), '~/.local/bin/reset-network.sh --force')
+
+    def test_click_runs_the_command_and_locks_the_button_for_a_while(self):
+        self.conf('[network]\nreset=reset-network.sh\n')
+
+        class Stub:
+            on_network_reset_clicked = rt.RssTray.on_network_reset_clicked
+            _end_network_reset = rt.RssTray._end_network_reset
+            _probe_after_reset = rt.RssTray._probe_after_reset
+
+            def __init__(self):
+                self.reset_btn = mock.MagicMock()
+                self.offline_banner_label = mock.MagicMock()
+                self.probe_connectivity = mock.Mock()
+        stub = Stub()
+        with mock.patch.object(rt, 'run_launcher_command') as run, mock.patch.object(rt.GLib, 'timeout_add_seconds') as timer:
+            stub.on_network_reset_clicked(None)
+        run.assert_called_once_with('reset-network.sh')
+        stub.reset_btn.set_sensitive.assert_called_with(False)
+        self.assertIn('Resetting', stub.offline_banner_label.set_text.call_args[0][0])
+        self.assertEqual({c.args[0] for c in timer.call_args_list}, {6, rt.NETWORK_RESET_COOLDOWN_SECONDS})
+        stub._end_network_reset()
+        stub.reset_btn.set_sensitive.assert_called_with(True)
+        stub.offline_banner_label.set_text.assert_called_with(rt.OFFLINE_BANNER_TEXT)
+
+    def test_without_a_command_the_click_does_nothing(self):
+        class Stub:
+            on_network_reset_clicked = rt.RssTray.on_network_reset_clicked
+        with mock.patch.object(rt, 'run_launcher_command') as run:
+            Stub().on_network_reset_clicked(None)
+        run.assert_not_called()
+
+    def test_offline_banner_css_keeps_button_text_dark(self):
+        self.assertIn('.offline-banner button label { color: #000000', rt.POPUP_CSS)
 
 
 class TestMonoGlyph(unittest.TestCase):
