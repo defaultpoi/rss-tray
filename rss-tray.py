@@ -145,15 +145,14 @@ def ensure_config():
             "Power off|loginctl poweroff\n"
             "\n"
             "[schedule]\n"
-            "# Recurring action, set from the popup's Timer > Schedule (or here):\n"
-            "# enabled=true|false, time=HH:MM, days=daily|weekdays|weekends|mon,wed,..,\n"
-            "# action=<label from [actions]>, warn=<seconds of warning, 0 = none>,\n"
-            "# snooze=<minutes the Snooze button postpones>, grace=<seconds: skip the\n"
-            "# run if it was missed by more than this, e.g. the machine was asleep>.\n"
-            "enabled=false\n"
-            "time=00:30\n"
-            "days=daily\n"
-            "action=Suspend\n"
+            "# Recurring actions, managed from the popup's Timer > Schedule (or here),\n"
+            "# one per line: on|off | HH:MM | days | action label from [actions]\n"
+            "# days: daily, weekdays, weekends or e.g. mon,wed,fri. Examples:\n"
+            "# on|00:30|daily|Suspend\n"
+            "# off|07:00|weekdays|Lock screen\n"
+            "# Shared settings: warn=<seconds of warning, 0 = none>, snooze=<minutes the\n"
+            "# Snooze button postpones>, grace=<seconds: a run missed by more than this,\n"
+            "# e.g. while the machine was asleep, is skipped instead of run late>.\n"
             "warn=60\n"
             "snooze=30\n"
             "grace=120\n"
@@ -473,10 +472,8 @@ DEFAULT_TIMER_STEP_SECONDS = 60
 
 # ---- timer "Schedule" mode: a recurring action (suspend, power off, ...) --------
 DEFAULT_ACTIONS = [('Suspend', 'loginctl suspend'), ('Power off', 'loginctl poweroff')]
-SCHEDULE_DEFAULTS = {
-    'enabled': False, 'minute': 30, 'days': _ALL_DAYS, 'action': 'Suspend',
-    'warn': 60, 'snooze': 30, 'grace': 120,
-}
+SCHEDULE_GLOBAL_DEFAULTS = {'warn': 60, 'snooze': 30, 'grace': 120}
+NEW_SCHEDULE = {'enabled': False, 'minute': 30, 'days': _ALL_DAYS, 'action': 'Suspend'}
 SCHEDULE_RESUME_GAP_SECONDS = 10  # a bigger wall-clock jump between ticks means the machine slept
 SCHEDULE_MISSING_ACTION_SUFFIX = ' (not in [actions])'
 
@@ -508,53 +505,103 @@ def format_days(days):
     return ','.join(_DAY_NAMES[d][:3] for d in sorted(days))
 
 
+def schedule_key(entry):
+    """Stable identity of a schedule (its state -- last handled run, snooze --
+    is filed under it); editing a schedule therefore starts it afresh."""
+    return f"{entry['minute']:04d}|{format_days(entry['days'])}|{entry['action']}"
+
+
+def format_schedule_line(entry):
+    return (f"{'on' if entry['enabled'] else 'off'}|{entry['minute'] // 60:02d}:{entry['minute'] % 60:02d}"
+            f"|{format_days(entry['days'])}|{entry['action']}\n")
+
+
+def _parse_schedule_line(line):
+    """'on|00:30|weekdays|Suspend' -> entry dict, or None if unreadable."""
+    fields = [f.strip() for f in line.split('|', 3)]
+    if len(fields) < 2:
+        return None
+    try:
+        minute = _parse_clock(fields[1])
+        days = _parse_days(fields[2]) if len(fields) > 2 and fields[2] else _ALL_DAYS
+    except ValueError:
+        return None
+    if minute >= 24 * 60:
+        return None
+    return {
+        'enabled': fields[0].lower() in ('on', 'true', 'yes', '1'),
+        'minute': minute,
+        'days': days,
+        'action': fields[3] if len(fields) > 3 and fields[3] else NEW_SCHEDULE['action'],
+    }
+
+
+def _is_schedule_entry_line(line):
+    return '|' in line and '=' not in line.split('|', 1)[0]
+
+
 def load_schedule_settings():
-    """{'enabled', 'minute' (of the day), 'days', 'action', 'warn' (s),
-    'snooze' (min), 'grace' (s)} from [schedule]; anything missing or
-    unparsable keeps its default."""
-    settings = dict(SCHEDULE_DEFAULTS)
+    """{'warn' (s), 'snooze' (min), 'grace' (s), 'schedules': [entry, ...]}
+    from [schedule]. Entries are 'on|HH:MM|days|action' lines, key=value lines
+    hold the shared warn/snooze/grace. A section that still uses the original
+    single-schedule keys (enabled=/time=/days=/action=) is read as one entry."""
+    settings = dict(SCHEDULE_GLOBAL_DEFAULTS)
+    entries, legacy, legacy_seen = [], dict(NEW_SCHEDULE), False
     for line in _read_config_sections()['schedule']:
+        if _is_schedule_entry_line(line):
+            entry = _parse_schedule_line(line)
+            if entry is not None:
+                entries.append(entry)
+            continue
         key, sep, val = line.partition('=')
         if not sep:
             continue
         key, val = key.strip().lower(), val.split('#', 1)[0].strip()
         try:
-            if key == 'enabled':
-                settings['enabled'] = val.lower() in ('1', 'true', 'yes', 'on')
-            elif key == 'time':
-                settings['minute'] = _parse_clock(val)
-                if settings['minute'] >= 24 * 60:
-                    settings['minute'] = SCHEDULE_DEFAULTS['minute']
-            elif key == 'days':
-                settings['days'] = _parse_days(val) or _ALL_DAYS
-            elif key == 'action':
-                settings['action'] = val or SCHEDULE_DEFAULTS['action']
-            elif key in ('warn', 'grace'):
+            if key in ('warn', 'grace'):
                 settings[key] = max(0, int(val))
             elif key == 'snooze':
                 settings['snooze'] = max(1, int(val))
+            elif key == 'enabled':
+                legacy['enabled'], legacy_seen = val.lower() in ('1', 'true', 'yes', 'on'), True
+            elif key == 'time':
+                minute = _parse_clock(val)
+                if minute < 24 * 60:
+                    legacy['minute'] = minute
+                legacy_seen = True
+            elif key == 'days':
+                legacy['days'], legacy_seen = _parse_days(val), True
+            elif key == 'action' and val:
+                legacy['action'], legacy_seen = val, True
         except ValueError:
             pass
+    if not entries and legacy_seen:
+        entries.append(legacy)
+    seen, unique = set(), []
+    for entry in entries:  # identical lines would share one identity: keep the first
+        if schedule_key(entry) not in seen:
+            seen.add(schedule_key(entry))
+            unique.append(entry)
+    settings['schedules'] = unique
     return settings
 
 
-def save_schedule_settings(**changes):
-    """Writes the given settings (enabled, minute, days, action) back into
-    [schedule], replacing existing lines and keeping every other line."""
-    lines = {}
-    if 'enabled' in changes:
-        lines['enabled'] = 'true' if changes['enabled'] else 'false'
-    if 'minute' in changes:
-        lines['time'] = f"{changes['minute'] // 60:02d}:{changes['minute'] % 60:02d}"
-    if 'days' in changes:
-        lines['days'] = format_days(changes['days'])
-    if 'action' in changes:
-        lines['action'] = changes['action']
-
+def save_schedules(entries):
+    """Rewrites the schedule entry lines of [schedule] (and drops the
+    original single-schedule keys); comments and the warn/snooze/grace
+    settings are kept."""
     def transform(section):
-        kept = [l for l in section if l.partition('=')[0].strip().lower() not in lines]
-        return kept + [f'{k}={v}\n' for k, v in lines.items()]
+        kept = [l for l in section
+                if not _is_schedule_entry_line(l.strip())
+                and l.partition('=')[0].strip().lower() not in ('enabled', 'time', 'days', 'action')]
+        return kept + [format_schedule_line(e) for e in entries]
     _edit_config_section('schedule', transform)
+
+
+def schedule_settings_for(settings, entry):
+    """One schedule's entry merged with the shared warn/snooze/grace, the
+    shape the scheduling functions below take."""
+    return dict(entry, warn=settings['warn'], snooze=settings['snooze'], grace=settings['grace'])
 
 
 def _schedule_occurrences(now_ts, days, minute):
@@ -1701,7 +1748,7 @@ OFFLINE_BANNER_TEXT = "Offline"
 LAUNCHER_MAX_HEIGHT_PX = 300  # the Launch list scrolls beyond this
 LIST_BOTTOM_SPACE_PX = 85  # reserved under the last row for the timer slide (countdown mode)
 TIMER_HEIGHT_COUNTDOWN_PX = 60
-TIMER_HEIGHT_SCHEDULE_PX = 104
+TIMER_HEIGHT_SCHEDULE_PX = 134
 TIMER_SPACER_EXTRA_PX = 25  # gap kept above the slide
 
 POPUP_CSS = """
@@ -1765,6 +1812,7 @@ class RssTray:
         self.countdown_box = None
         self.schedule_box = None
         self.sched = None                 # widgets of the Schedule controls (per popup)
+        self.sched_index = 0              # which schedule the controls show
         self._sched_updating = False
         self.list_spacer = None
         self.schedule_banner = None
@@ -2308,65 +2356,97 @@ class RssTray:
     # ---- Schedule mode ------------------------------------------------------
     def _schedule_settings(self):
         """Settings, re-read only when config.conf changed (this runs every
-        second); a change also re-syncs so editing the time never fires an
-        occurrence that is already in the past."""
+        second). A change also re-syncs, so editing a time never runs an
+        occurrence that is already in the past, and drops the state of
+        schedules that no longer exist."""
         try:
             stamp = os.stat(CONFIG_FILE).st_mtime_ns
         except OSError:
             stamp = None
         if self._schedule_cache[1] is None or self._schedule_cache[0] != stamp:
-            self._schedule_cache = (stamp, load_schedule_settings())
+            settings = load_schedule_settings()
+            self._schedule_cache = (stamp, settings)
             self._schedule_resync = True
+            self._prune_schedule_state({schedule_key(e) for e in settings['schedules']})
         return self._schedule_cache[1]
 
-    def _mark_schedule_handled(self, occurrence):
+    def _prune_schedule_state(self, keys):
         with self.lock:
-            self.state['schedule_fired'] = max(self.state.get('schedule_fired', 0), occurrence)
-            self.state.pop('schedule_override', None)
+            changed = False
+            for name in ('schedule_fired', 'schedule_override'):
+                current = self.state.get(name)
+                if not isinstance(current, dict):
+                    if name in self.state:
+                        del self.state[name]
+                        changed = True
+                    continue
+                for key in [k for k in current if k not in keys]:
+                    del current[key]
+                    changed = True
+            if changed:
+                save_state(self.state)
+
+    def _schedule_state(self):
+        with self.lock:
+            fired, override = self.state.get('schedule_fired'), self.state.get('schedule_override')
+            return (dict(fired) if isinstance(fired, dict) else {},
+                    dict(override) if isinstance(override, dict) else {})
+
+    def _mark_schedule_handled(self, key, occurrence):
+        with self.lock:
+            fired = self.state.setdefault('schedule_fired', {})
+            if not isinstance(fired, dict):
+                fired = self.state['schedule_fired'] = {}
+            fired[key] = max(fired.get(key, 0), occurrence)
+            overrides = self.state.get('schedule_override')
+            if isinstance(overrides, dict):
+                overrides.pop(key, None)
             save_state(self.state)
 
-    def _skip_missed_schedule(self, now_ts, settings):
+    def _skip_missed_schedule(self, now_ts, key, settings):
         """App start, wake from sleep or a settings change: a time that has
         already passed is never acted on late (unless it was snoozed)."""
         previous = _schedule_occurrences(now_ts, settings['days'], settings['minute'])[0]
-        with self.lock:
-            fired = self.state.get('schedule_fired', 0)
-            override = self.state.get('schedule_override')
-        if previous is None or previous <= fired:
+        fired, overrides = self._schedule_state()
+        if previous is None or previous <= fired.get(key, 0):
             return
+        override = overrides.get(key)
         if override and override.get('occ') == previous and override['fire'] > now_ts:
             return  # still snoozed
-        self._mark_schedule_handled(previous)
+        self._mark_schedule_handled(key, previous)
 
     def _schedule_tick(self):
         now_ts = time_module.time()
         last, self._last_schedule_tick = self._last_schedule_tick, now_ts
         settings = self._schedule_settings()
-        if not settings['enabled']:
+        active = [(schedule_key(e), schedule_settings_for(settings, e))
+                  for e in settings['schedules'] if e['enabled']]
+        if not active:
             self._schedule_resync = True  # enabling later must not act on an older time
             self._set_schedule_warning(None)
             self._refresh_schedule_ui()
             return
         if self._schedule_resync or last is None or now_ts - last > SCHEDULE_RESUME_GAP_SECONDS:
             self._schedule_resync = False
-            self._skip_missed_schedule(now_ts, settings)
-        with self.lock:
-            fired = self.state.get('schedule_fired', 0)
-            override = self.state.get('schedule_override')
-        kind, occurrence, left = schedule_status(now_ts, settings, fired, override)
-        if kind == 'warn':
-            self._set_schedule_warning({'occ': occurrence, 'left': math.ceil(left), 'action': settings['action']})
-        elif kind == 'fire':
-            self._fire_schedule(occurrence, settings)
-        else:
-            if kind == 'skip':
-                self._mark_schedule_handled(occurrence)
-            self._set_schedule_warning(None)
+            for key, entry in active:
+                self._skip_missed_schedule(now_ts, key, entry)
+        fired, overrides = self._schedule_state()
+        warnings, to_fire = [], []
+        for key, entry in active:
+            kind, occurrence, left = schedule_status(now_ts, entry, fired.get(key, 0), overrides.get(key))
+            if kind == 'warn':
+                warnings.append({'key': key, 'occ': occurrence, 'left': math.ceil(left), 'action': entry['action']})
+            elif kind == 'fire':
+                to_fire.append((key, occurrence, entry))
+            elif kind == 'skip':
+                self._mark_schedule_handled(key, occurrence)
+        for key, occurrence, entry in to_fire:
+            self._fire_schedule(key, occurrence, entry)
+        self._set_schedule_warning(min(warnings, key=lambda w: w['left']) if warnings else None)
         self._refresh_schedule_ui()
 
-    def _fire_schedule(self, occurrence, settings):
-        self._mark_schedule_handled(occurrence)
-        self._set_schedule_warning(None)
+    def _fire_schedule(self, key, occurrence, settings):
+        self._mark_schedule_handled(key, occurrence)
         actions = load_actions()
         command = next((c for label, c in actions if label == settings['action']), None) \
             or next((c for label, c in actions if label.lower() == settings['action'].lower()), None)
@@ -2393,38 +2473,66 @@ class RssTray:
     def on_schedule_cancel(self, _button=None):
         warning = self.schedule_warning
         if warning:
-            self._mark_schedule_handled(warning['occ'])
+            self._mark_schedule_handled(warning['key'], warning['occ'])
             self._set_schedule_warning(None)
             self._refresh_schedule_ui()
 
-    def on_schedule_snooze(self, _button=None):
+    def _snooze_schedule(self, key):
         settings = self._schedule_settings()
-        with self.lock:
-            fired = self.state.get('schedule_fired', 0)
-            override = self.state.get('schedule_override')
-            new = schedule_snooze_override(time_module.time(), settings, fired, override)
+        entry = next((schedule_settings_for(settings, e) for e in settings['schedules']
+                      if schedule_key(e) == key), None)
+        if entry is not None:
+            fired, overrides = self._schedule_state()
+            new = schedule_snooze_override(time_module.time(), entry, fired.get(key, 0), overrides.get(key))
             if new:
-                self.state['schedule_override'] = new
-                save_state(self.state)
-        self._set_schedule_warning(None)
+                with self.lock:
+                    store = self.state.get('schedule_override')
+                    if not isinstance(store, dict):
+                        store = self.state['schedule_override'] = {}
+                    store[key] = new
+                    save_state(self.state)
+        warning = self.schedule_warning
+        if warning and warning['key'] == key:
+            self._set_schedule_warning(None)
         self._refresh_schedule_ui()
+
+    def on_schedule_snooze(self, _button=None):
+        """Snooze button of the warning bar: postpones the schedule that is warning."""
+        if self.schedule_warning:
+            self._snooze_schedule(self.schedule_warning['key'])
+
+    def on_schedule_snooze_selected(self, _button=None):
+        """Snooze button of the slide: postpones the next run of the selected schedule."""
+        entry = self._selected_schedule()
+        if entry is not None:
+            self._snooze_schedule(schedule_key(entry))
+
+    def _selected_schedule(self):
+        entries = self._schedule_settings()['schedules']
+        if not entries:
+            return None
+        self.sched_index = min(max(self.sched_index, 0), len(entries) - 1)
+        return entries[self.sched_index]
 
     def _schedule_summary(self, settings):
         warning = self.schedule_warning
         if warning:
             return f"{warning['action']} in {warning['left']} s"
-        if not settings['enabled']:
-            return 'Schedule off'
-        with self.lock:
-            fired = self.state.get('schedule_fired', 0)
-            override = self.state.get('schedule_override')
         now_ts = time_module.time()
-        pending = [p for p in schedule_pending(now_ts, settings, fired, override) if p[1] > now_ts]
-        if not pending:
-            return 'Schedule on'
-        occurrence, fire = pending[0]
+        fired, overrides = self._schedule_state()
+        upcoming = []
+        for entry in settings['schedules']:
+            if not entry['enabled']:
+                continue
+            key = schedule_key(entry)
+            for occurrence, fire in schedule_pending(now_ts, entry, fired.get(key, 0), overrides.get(key)):
+                if fire > now_ts:
+                    upcoming.append((fire, occurrence, entry['action']))
+        if not upcoming:
+            return 'Schedule on' if any(e['enabled'] for e in settings['schedules']) else 'Schedule off'
+        fire, occurrence, action = min(upcoming)
         when = datetime.fromtimestamp(fire)
-        text = f"Next: {_DAY_NAMES[when.weekday()][:3].title()} {when:%H:%M} {settings['action']}"
+        text = f"Next: {_DAY_NAMES[when.weekday()][:3].title()} {when:%H:%M} {action}"
         return text + (' (snoozed)' if fire != occurrence else '')
 
     def _refresh_schedule_ui(self):
@@ -2436,7 +2544,8 @@ class RssTray:
         if self.timer_label is not None and self.timer_mode == 'schedule':
             self.timer_label.set_text(self._schedule_summary(self._schedule_settings()))
         if self.sched is not None:
-            self.sched['snooze_btn'].set_sensitive(self._schedule_settings()['enabled'])
+            entry = self._selected_schedule()
+            self.sched['snooze_btn'].set_sensitive(entry is not None and entry['enabled'])
 
     def _apply_timer_mode(self):
         if self.timer_box is None:
@@ -2466,6 +2575,78 @@ class RssTray:
         self._mode_updating = False
         self._apply_timer_mode()
 
+    # -- the Schedule controls: a selector for the list, and the selected schedule's fields
+    @staticmethod
+    def _schedule_label(entry):
+        text = f"{entry['minute'] // 60:02d}:{entry['minute'] % 60:02d} {format_days(entry['days'])} \u00b7 {entry['action']}"
+        return text if entry['enabled'] else text + ' (off)'
+
+    def _save_schedule_entries(self, entries):
+        save_schedules(entries)
+        self._schedule_cache = (None, None)  # re-read (and re-sync) on next use
+
+    def _populate_schedule_selector(self):
+        entries = self._schedule_settings()['schedules']
+        select = self.sched['select']
+        self._sched_updating = True
+        select.remove_all()
+        for entry in entries:
+            select.append_text(self._schedule_label(entry))
+        if entries:
+            self.sched_index = min(max(self.sched_index, 0), len(entries) - 1)
+            select.set_active(self.sched_index)
+        self._sched_updating = False
+        self._load_selected_schedule_into_controls()
+
+    def _load_selected_schedule_into_controls(self):
+        entry = self._selected_schedule()
+        sched = self.sched
+        sched['fields'].set_sensitive(entry is not None)
+        sched['remove'].set_sensitive(entry is not None)
+        self._sched_updating = True
+        if entry is not None:
+            sched['enabled'].set_active(entry['enabled'])
+            sched['hour'].set_value(entry['minute'] // 60)
+            sched['minute'].set_value(entry['minute'] % 60)
+            for index, button in enumerate(sched['days']):
+                button.set_active(index in entry['days'])
+            action = sched['action']
+            action.remove_all()
+            labels = [label for label, _command in load_actions()]
+            for label in labels:
+                action.append_text(label)
+            if entry['action'] in labels:
+                action.set_active(labels.index(entry['action']))
+            else:  # the action no longer exists: show it, flagged, so nothing silently changes
+                action.append_text(entry['action'] + SCHEDULE_MISSING_ACTION_SUFFIX)
+                action.set_active(len(labels))
+        self._sched_updating = False
+        self._refresh_schedule_ui()
+
+    def _on_schedule_selected(self, select):
+        if self._sched_updating:
+            return
+        self.sched_index = max(select.get_active(), 0)
+        self._load_selected_schedule_into_controls()
+
+    def _on_schedule_add(self, _button):
+        entries = [dict(e) for e in self._schedule_settings()['schedules']]
+        new = dict(NEW_SCHEDULE)
+        while any(schedule_key(e) == schedule_key(new) for e in entries):
+            new['minute'] = (new['minute'] + 30) % (24 * 60)  # identities must differ
+        entries.append(new)
+        self._save_schedule_entries(entries)
+        self.sched_index = len(entries) - 1
+        self._populate_schedule_selector()
+
+    def _on_schedule_remove(self, _button):
+        entries = [dict(e) for e in self._schedule_settings()['schedules']]
+        if entries:
+            del entries[min(self.sched_index, len(entries) - 1)]
+            self._save_schedule_entries(entries)
+            self.sched_index = max(0, min(self.sched_index, len(entries) - 1))
+            self._populate_schedule_selector()
+
     def _on_schedule_control_changed(self, widget=None):
         if self._sched_updating or self.sched is None:
             return
@@ -2475,41 +2656,52 @@ class RssTray:
             widget.set_active(True)
             self._sched_updating = False
             return
+        entries = [dict(e) for e in self._schedule_settings()['schedules']]
+        if not entries:
+            return
+        index = min(self.sched_index, len(entries) - 1)
+        entry = entries[index]
+        entry['enabled'] = self.sched['enabled'].get_active()
+        entry['minute'] = int(self.sched['hour'].get_value()) * 60 + int(self.sched['minute'].get_value())
+        entry['days'] = days
         action = self.sched['action'].get_active_text() or ''
-        changes = {
-            'enabled': self.sched['enabled'].get_active(),
-            'minute': int(self.sched['hour'].get_value()) * 60 + int(self.sched['minute'].get_value()),
-            'days': days,
-        }
         if action and not action.endswith(SCHEDULE_MISSING_ACTION_SUFFIX):
-            changes['action'] = action
-        save_schedule_settings(**changes)
+            entry['action'] = action
+        if any(i != index and schedule_key(e) == schedule_key(entry) for i, e in enumerate(entries)):
+            return  # would duplicate another schedule; ignore this change
+        self._save_schedule_entries(entries)
+        select = self.sched['select']
+        self._sched_updating = True
+        select.remove(index)
+        select.insert_text(index, self._schedule_label(entry))
+        select.set_active(index)
+        self._sched_updating = False
         self._refresh_schedule_ui()
 
     def _build_schedule_box(self):
-        settings = self._schedule_settings()
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
 
+        row0 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        select = Gtk.ComboBoxText()
+        add_btn = Gtk.Button(label='+')
+        add_btn.set_tooltip_text('Add a schedule')
+        remove_btn = Gtk.Button(label='\u2212')
+        remove_btn.set_tooltip_text('Remove the selected schedule')
+        row0.pack_start(select, True, True, 0)
+        row0.pack_start(add_btn, False, False, 0)
+        row0.pack_start(remove_btn, False, False, 0)
+
+        fields = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
         row1 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         enabled = Gtk.CheckButton(label='On')
-        enabled.set_active(settings['enabled'])
         hour = Gtk.SpinButton.new_with_range(0, 23, 1)
         minute = Gtk.SpinButton.new_with_range(0, 59, 1)
-        for spin, value in ((hour, settings['minute'] // 60), (minute, settings['minute'] % 60)):
-            spin.set_value(value)
+        for spin in (hour, minute):
             spin.set_wrap(True)
             spin.set_numeric(True)
             spin.set_width_chars(2)
             spin.connect('output', lambda s: (s.set_text(f'{int(s.get_value()):02d}'), True)[1])
         action = Gtk.ComboBoxText()
-        labels = [label for label, _command in load_actions()]
-        for label in labels:
-            action.append_text(label)
-        if settings['action'] in labels:
-            action.set_active(labels.index(settings['action']))
-        else:  # configured action no longer exists: show it, flagged, so nothing silently changes
-            action.append_text(settings['action'] + SCHEDULE_MISSING_ACTION_SUFFIX)
-            action.set_active(len(labels))
         row1.pack_start(enabled, False, False, 0)
         row1.pack_start(Gtk.Label(label='at'), False, False, 0)
         row1.pack_start(hour, False, False, 0)
@@ -2521,26 +2713,32 @@ class RssTray:
         day_buttons = []
         for index, name in enumerate(_DAY_NAMES):
             button = Gtk.ToggleButton(label=name[:2].title())
-            button.set_active(index in settings['days'])
             button.set_tooltip_text(name.title())
             day_buttons.append(button)
             row2.pack_start(button, False, False, 0)
-        snooze_btn = Gtk.Button(label=f"Snooze {settings['snooze']} min")
-        snooze_btn.set_tooltip_text('Postpone the next run')
-        snooze_btn.connect('clicked', self.on_schedule_snooze)
+        snooze_btn = Gtk.Button(label=f"Snooze {self._schedule_settings()['snooze']} min")
+        snooze_btn.set_tooltip_text('Postpone the next run of this schedule')
+        snooze_btn.connect('clicked', self.on_schedule_snooze_selected)
         row2.pack_end(snooze_btn, False, False, 0)
 
-        box.pack_start(row1, False, False, 0)
-        box.pack_start(row2, False, False, 0)
+        fields.pack_start(row1, False, False, 0)
+        fields.pack_start(row2, False, False, 0)
+        box.pack_start(row0, False, False, 0)
+        box.pack_start(fields, False, False, 0)
 
-        self.sched = {'enabled': enabled, 'hour': hour, 'minute': minute, 'action': action,
+        self.sched = {'select': select, 'add': add_btn, 'remove': remove_btn, 'fields': fields,
+                      'enabled': enabled, 'hour': hour, 'minute': minute, 'action': action,
                       'days': day_buttons, 'snooze_btn': snooze_btn}
+        select.connect('changed', self._on_schedule_selected)
+        add_btn.connect('clicked', self._on_schedule_add)
+        remove_btn.connect('clicked', self._on_schedule_remove)
         enabled.connect('toggled', self._on_schedule_control_changed)
         hour.connect('value-changed', self._on_schedule_control_changed)
         minute.connect('value-changed', self._on_schedule_control_changed)
         action.connect('changed', self._on_schedule_control_changed)
         for button in day_buttons:
             button.connect('toggled', self._on_schedule_control_changed)
+        self._populate_schedule_selector()
         return box
 
     def on_timer_toggle_clicked(self, _button):
@@ -2936,8 +3134,7 @@ class RssTray:
         timer_box.set_visible(self.timer_visible)
 
         header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        mode_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-        mode_row.get_style_context().add_class('linked')
+        mode_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.mode_buttons = {}
         for mode, title in (('countdown', 'Countdown'), ('schedule', 'Schedule')):
             mode_button = Gtk.ToggleButton(label=title)
