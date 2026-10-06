@@ -1112,62 +1112,8 @@ def ts(weekday, hour, minute=0, second=0):
     return rt.datetime(2026, 10, 5 + weekday, hour, minute, second).timestamp()
 
 
-class TestActionsAndScheduleConfig(TmpConfigCase):
-    def test_actions_default_to_suspend_and_power_off(self):
-        self.assertEqual([a[0] for a in rt.load_actions()], ['Suspend', 'Power off'])
-        self.assertEqual(dict(rt.load_actions())['Suspend'], 'loginctl suspend')
-
-    def test_actions_from_config(self):
-        self.conf('[actions]\nHibernate|loginctl hibernate\nLock|loginctl lock-session\n')
-        self.assertEqual(rt.load_actions(), [('Hibernate', 'loginctl hibernate'), ('Lock', 'loginctl lock-session')])
-
-    def test_format_days(self):
-        self.assertEqual(rt.format_days(range(7)), 'daily')
-        self.assertEqual(rt.format_days(range(5)), 'weekdays')
-        self.assertEqual(rt.format_days({5, 6}), 'weekends')
-        self.assertEqual(rt.format_days({0, 2, 4}), 'mon,wed,fri')
-        for days in ({0, 2, 4}, {6}, set(range(7)), set(range(5))):  # round-trips through the parser
-            self.assertEqual(set(rt._parse_days(rt.format_days(days))), days)
-
-    def test_schedule_defaults(self):
-        s = rt.load_schedule_settings()
-        self.assertEqual((s['enabled'], s['minute'], s['action'], s['warn'], s['snooze'], s['grace']),
-                         (False, 30, 'Suspend', 60, 30, 120))
-        self.assertEqual(set(s['days']), set(range(7)))
-
-    def test_schedule_parsing(self):
-        self.conf('[schedule]\nenabled=true\ntime=23.15\ndays=mon,wed\naction=Power off\nwarn=0\nsnooze=45 # min\ngrace=30\n')
-        s = rt.load_schedule_settings()
-        self.assertEqual((s['enabled'], s['minute'], set(s['days']), s['action'], s['warn'], s['snooze'], s['grace']),
-                         (True, 23 * 60 + 15, {0, 2}, 'Power off', 0, 45, 30))
-
-    def test_bad_values_keep_defaults(self):
-        self.conf('[schedule]\ntime=25:99\ndays=funday\nwarn=lots\nsnooze=0\n')
-        s = rt.load_schedule_settings()
-        self.assertEqual((s['minute'], s['warn']), (30, 60))
-        self.assertEqual(set(s['days']), set(range(7)))
-        self.assertEqual(s['snooze'], 1)  # floor
-
-    def test_save_replaces_only_the_given_keys_and_keeps_the_rest(self):
-        self.conf('[feeds]\nhttps://a\n[schedule]\n# my note\nenabled=false\ntime=00:30\nsnooze=45\n[twitch]\nchan\n')
-        rt.save_schedule_settings(enabled=True, minute=7 * 60 + 5, days={0, 1})
-        s = rt.load_schedule_settings()
-        self.assertEqual((s['enabled'], s['minute'], set(s['days']), s['snooze']), (True, 425, {0, 1}, 45))
-        with open(rt.CONFIG_FILE) as f:
-            text = f.read()
-        self.assertIn('# my note', text)
-        self.assertEqual(text.count('enabled='), 1)
-        self.assertEqual(rt.load_twitch_channels(), ['chan'])
-
-    def test_save_creates_the_section(self):
-        self.conf('[feeds]\nhttps://a\n')
-        rt.save_schedule_settings(enabled=True, action='Power off')
-        s = rt.load_schedule_settings()
-        self.assertEqual((s['enabled'], s['action']), (True, 'Power off'))
-
-
 class TestScheduleLogic(unittest.TestCase):
-    S = dict(rt.SCHEDULE_DEFAULTS, enabled=True, minute=30, warn=60, snooze=30, grace=120)
+    S = dict(rt.NEW_SCHEDULE, enabled=True, minute=30, warn=60, snooze=30, grace=120)
 
     def status(self, now, fired=None, override=None, **settings):
         settings = dict(self.S, **settings)
@@ -1246,9 +1192,89 @@ class TestScheduleLogic(unittest.TestCase):
         self.assertIsNone(rt.schedule_snooze_override(ts(2, 12), s, 0, None))
 
 
+class TestActionsAndScheduleConfig(TmpConfigCase):
+    def test_actions_default_to_suspend_and_power_off(self):
+        self.assertEqual([a[0] for a in rt.load_actions()], ['Suspend', 'Power off'])
+        self.assertEqual(dict(rt.load_actions())['Suspend'], 'loginctl suspend')
+
+    def test_actions_from_config(self):
+        self.conf('[actions]\nHibernate|loginctl hibernate\nLock|loginctl lock-session\n')
+        self.assertEqual(rt.load_actions(), [('Hibernate', 'loginctl hibernate'), ('Lock', 'loginctl lock-session')])
+
+    def test_format_days(self):
+        self.assertEqual(rt.format_days(range(7)), 'daily')
+        self.assertEqual(rt.format_days(range(5)), 'weekdays')
+        self.assertEqual(rt.format_days({5, 6}), 'weekends')
+        self.assertEqual(rt.format_days({0, 2, 4}), 'mon,wed,fri')
+        for days in ({0, 2, 4}, {6}, set(range(7)), set(range(5))):  # round-trips through the parser
+            self.assertEqual(set(rt._parse_days(rt.format_days(days))), days)
+
+    def test_defaults_without_a_section(self):
+        s = rt.load_schedule_settings()
+        self.assertEqual((s['warn'], s['snooze'], s['grace'], s['schedules']), (60, 30, 120, []))
+
+    def test_several_schedules_and_shared_settings(self):
+        self.conf('[schedule]\nwarn=0\nsnooze=45 # min\ngrace=30\n'
+                  'on|00:30|daily|Suspend\noff|07:00|weekdays|Lock screen\non|23.15|mon,wed|Power off\n')
+        s = rt.load_schedule_settings()
+        self.assertEqual((s['warn'], s['snooze'], s['grace']), (0, 45, 30))
+        self.assertEqual([(e['enabled'], e['minute'], rt.format_days(e['days']), e['action']) for e in s['schedules']],
+                         [(True, 30, 'daily', 'Suspend'), (False, 420, 'weekdays', 'Lock screen'),
+                          (True, 23 * 60 + 15, 'mon,wed', 'Power off')])
+
+    def test_unreadable_lines_are_skipped_and_missing_fields_defaulted(self):
+        self.conf('[schedule]\nnonsense\non|25:99|daily|Suspend\non|funday|x\non|08:00\n')
+        entries = rt.load_schedule_settings()['schedules']
+        self.assertEqual(len(entries), 1)
+        self.assertEqual((entries[0]['minute'], entries[0]['action'], set(entries[0]['days'])), (480, 'Suspend', set(range(7))))
+
+    def test_identical_lines_are_collapsed(self):
+        self.conf('[schedule]\non|00:30|daily|Suspend\noff|00:30|daily|Suspend\n')
+        self.assertEqual(len(rt.load_schedule_settings()['schedules']), 1)
+
+    def test_original_single_schedule_keys_are_still_read(self):
+        self.conf('[schedule]\nenabled=true\ntime=00:30\ndays=weekdays\naction=Power off\nwarn=20\n')
+        s = rt.load_schedule_settings()
+        self.assertEqual(s['warn'], 20)
+        self.assertEqual(len(s['schedules']), 1)
+        e = s['schedules'][0]
+        self.assertEqual((e['enabled'], e['minute'], rt.format_days(e['days']), e['action']), (True, 30, 'weekdays', 'Power off'))
+
+    def test_save_replaces_entries_keeps_comments_settings_and_other_sections_and_drops_old_keys(self):
+        self.conf('[feeds]\nhttps://a\n[schedule]\n# my note\nwarn=20\nenabled=true\ntime=00:30\n'
+                  'on|01:00|daily|Suspend\n[twitch]\nchan\n')
+        entries = [dict(rt.NEW_SCHEDULE, enabled=True, minute=7 * 60 + 5, days=frozenset({0, 1}), action='Lock screen'),
+                   dict(rt.NEW_SCHEDULE)]
+        rt.save_schedules(entries)
+        with open(rt.CONFIG_FILE) as f:
+            text = f.read()
+        self.assertIn('# my note', text)
+        self.assertIn('warn=20', text)
+        self.assertNotIn('enabled=true', text)
+        self.assertNotIn('time=00:30', text)
+        self.assertNotIn('01:00', text)
+        s = rt.load_schedule_settings()
+        self.assertEqual([(e['enabled'], e['minute'], rt.format_days(e['days']), e['action']) for e in s['schedules']],
+                         [(True, 425, 'mon,tue', 'Lock screen'), (False, 30, 'daily', 'Suspend')])
+        self.assertEqual(rt.load_twitch_channels(), ['chan'])
+
+    def test_save_creates_the_section(self):
+        self.conf('[feeds]\nhttps://a\n')
+        rt.save_schedules([dict(rt.NEW_SCHEDULE, enabled=True)])
+        self.assertEqual(len(rt.load_schedule_settings()['schedules']), 1)
+
+    def test_schedule_key_changes_when_the_schedule_does(self):
+        a = dict(rt.NEW_SCHEDULE)
+        self.assertEqual(rt.schedule_key(a), rt.schedule_key(dict(a, enabled=True)))  # on/off keeps identity
+        self.assertNotEqual(rt.schedule_key(a), rt.schedule_key(dict(a, minute=31)))
+        self.assertNotEqual(rt.schedule_key(a), rt.schedule_key(dict(a, action='Power off')))
+
+
 class TestScheduleRuntime(TmpConfigCase):
     class Stub:
         _schedule_settings = rt.RssTray._schedule_settings
+        _prune_schedule_state = rt.RssTray._prune_schedule_state
+        _schedule_state = rt.RssTray._schedule_state
         _schedule_tick = rt.RssTray._schedule_tick
         _mark_schedule_handled = rt.RssTray._mark_schedule_handled
         _skip_missed_schedule = rt.RssTray._skip_missed_schedule
@@ -1256,6 +1282,9 @@ class TestScheduleRuntime(TmpConfigCase):
         _set_schedule_warning = rt.RssTray._set_schedule_warning
         on_schedule_cancel = rt.RssTray.on_schedule_cancel
         on_schedule_snooze = rt.RssTray.on_schedule_snooze
+        on_schedule_snooze_selected = rt.RssTray.on_schedule_snooze_selected
+        _snooze_schedule = rt.RssTray._snooze_schedule
+        _selected_schedule = rt.RssTray._selected_schedule
         _schedule_summary = rt.RssTray._schedule_summary
         _refresh_schedule_ui = rt.RssTray._refresh_schedule_ui
 
@@ -1269,6 +1298,7 @@ class TestScheduleRuntime(TmpConfigCase):
             self._schedule_resync = True
             self.timer_mode = 'countdown'
             self.timer_label = self.schedule_banner = self.sched = None
+            self.sched_index = 0
             self.popup = None
             self.shown = 0
             self.icon_updates = 0
@@ -1279,9 +1309,11 @@ class TestScheduleRuntime(TmpConfigCase):
         def update_icon(self):
             self.icon_updates += 1
 
+    NIGHT = '[schedule]\nwarn=60\nsnooze=30\ngrace=120\non|00:30|daily|Suspend\n'
+
     def setUp(self):
         super().setUp()
-        self.conf('[schedule]\nenabled=true\ntime=00:30\ndays=daily\naction=Suspend\nwarn=60\nsnooze=30\ngrace=120\n')
+        self.conf(self.NIGHT)
         self.stub = self.Stub()
         patches = [
             mock.patch.object(rt, 'save_state'),
@@ -1292,6 +1324,11 @@ class TestScheduleRuntime(TmpConfigCase):
         for p in patches:
             self.addCleanup(p.stop)
 
+    def edit_config(self, text):
+        self.conf(text)
+        st = rt.os.stat(rt.CONFIG_FILE)
+        rt.os.utime(rt.CONFIG_FILE, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))  # a visible edit
+
     def tick(self, now):
         with mock.patch.object(rt.time_module, 'time', return_value=now):
             self.stub._schedule_tick()
@@ -1300,11 +1337,13 @@ class TestScheduleRuntime(TmpConfigCase):
         for now in range(int(start), int(end) + 1):  # one tick per second, like the real timer
             self.tick(now)
 
+    KEY = '0030|daily|Suspend'
+
     def test_runs_the_configured_action_exactly_once_at_the_time(self):
         occurrence = ts(2, 0, 30)
         self.walk(occurrence - 90, occurrence + 30)
         self.run.assert_called_once_with('loginctl suspend')
-        self.assertEqual(self.stub.state['schedule_fired'], occurrence)
+        self.assertEqual(self.stub.state['schedule_fired'][self.KEY], occurrence)
 
     def test_warning_flow_sound_popup_and_seconds_left(self):
         occurrence = ts(2, 0, 30)
@@ -1334,12 +1373,19 @@ class TestScheduleRuntime(TmpConfigCase):
         self.walk(occurrence - 90, occurrence - 30)
         with mock.patch.object(rt.time_module, 'time', return_value=occurrence - 30):
             self.stub.on_schedule_snooze()
-        self.assertEqual(self.stub.state['schedule_override'], {'occ': occurrence, 'fire': occurrence + 1800})
+        self.assertEqual(self.stub.state['schedule_override'][self.KEY], {'occ': occurrence, 'fire': occurrence + 1800})
         self.walk(occurrence - 29, occurrence + 1800 - 61)
         self.run.assert_not_called()
         self.walk(occurrence + 1800 - 60, occurrence + 1800 + 5)
         self.run.assert_called_once()
-        self.assertNotIn('schedule_override', self.stub.state)   # consumed
+        self.assertNotIn(self.KEY, self.stub.state['schedule_override'])   # consumed
+
+    def test_slide_snooze_postpones_the_selected_schedule_before_the_warning(self):
+        occurrence = ts(2, 0, 30)
+        self.walk(occurrence - 7200, occurrence - 7190)
+        with mock.patch.object(rt.time_module, 'time', return_value=occurrence - 7190):
+            self.stub.on_schedule_snooze_selected()
+        self.assertEqual(self.stub.state['schedule_override'][self.KEY]['fire'], occurrence + 1800)
 
     def test_a_missed_time_is_not_run_late_after_waking_from_sleep(self):
         occurrence = ts(2, 0, 30)
@@ -1353,25 +1399,73 @@ class TestScheduleRuntime(TmpConfigCase):
         self.walk(occurrence + 20, occurrence + 60)
         self.run.assert_not_called()
 
-    def test_disabled_schedule_never_runs(self):
-        self.conf('[schedule]\nenabled=false\ntime=00:30\n')
+    def test_off_schedules_never_run(self):
+        self.conf('[schedule]\noff|00:30|daily|Suspend\n')
         occurrence = ts(2, 0, 30)
         self.walk(occurrence - 90, occurrence + 30)
         self.run.assert_not_called()
         self.assertIsNone(self.stub.schedule_warning)
 
-    def test_enabling_after_the_time_has_passed_does_not_run_it(self):
-        self.conf('[schedule]\nenabled=false\ntime=00:30\n')
+    def test_turning_a_schedule_on_after_its_time_passed_does_not_run_it(self):
+        self.conf('[schedule]\noff|00:30|daily|Suspend\n')
         occurrence = ts(2, 0, 30)
         self.walk(occurrence + 10, occurrence + 20)
-        self.conf('[schedule]\nenabled=true\ntime=00:30\ndays=daily\nwarn=60\ngrace=120\n')
-        os_stat = rt.os.stat(rt.CONFIG_FILE)
-        rt.os.utime(rt.CONFIG_FILE, ns=(os_stat.st_atime_ns, os_stat.st_mtime_ns + 10**9))  # a visible edit
+        self.edit_config('[schedule]\nwarn=60\ngrace=120\non|00:30|daily|Suspend\n')
         self.walk(occurrence + 21, occurrence + 60)
         self.run.assert_not_called()
 
+    def test_two_schedules_each_run_their_own_action_at_their_own_time(self):
+        self.edit_config('[schedule]\nwarn=0\non|00:30|daily|Suspend\non|07:00|weekdays|Power off\n')
+        self.walk(ts(2, 0, 29), ts(2, 0, 31))
+        self.run.assert_called_once_with('loginctl suspend')
+        self.run.reset_mock()
+        self.walk(ts(2, 6, 59), ts(2, 7, 1))
+        self.run.assert_called_once_with('loginctl poweroff')
+
+    def test_weekday_only_schedule_does_not_run_on_the_weekend(self):
+        self.edit_config('[schedule]\nwarn=0\non|07:00|weekdays|Power off\n')
+        self.walk(ts(5, 6, 59), ts(5, 7, 1))   # Saturday
+        self.run.assert_not_called()
+        self.walk(ts(7, 6, 59), ts(7, 7, 1))   # the following Monday
+        self.run.assert_called_once()
+
+    def test_two_schedules_at_the_same_time_both_run(self):
+        self.edit_config('[schedule]\nwarn=0\non|00:30|daily|Suspend\non|00:30|mon,tue,wed|Power off\n')
+        self.walk(ts(2, 0, 29), ts(2, 0, 31))
+        self.assertEqual(sorted(c.args[0] for c in self.run.call_args_list), ['loginctl poweroff', 'loginctl suspend'])
+
+    def test_the_soonest_warning_is_the_one_shown(self):
+        self.edit_config('[schedule]\nwarn=60\non|00:30|daily|Suspend\non|00:31|daily|Power off\n')
+        self.walk(ts(2, 0, 29, 40), ts(2, 0, 29, 45))
+        self.assertEqual(self.stub.schedule_warning['action'], 'Suspend')   # 20 s away beats 80 s away
+        self.assertEqual(self.sound.call_count, 1)
+
+    def test_cancel_only_affects_the_schedule_that_was_warning(self):
+        self.edit_config('[schedule]\nwarn=60\non|00:30|daily|Suspend\non|00:45|daily|Power off\n')
+        self.walk(ts(2, 0, 29, 10), ts(2, 0, 29, 30))
+        self.stub.on_schedule_cancel()
+        self.walk(ts(2, 0, 29, 31), ts(2, 0, 31))
+        self.run.assert_not_called()                                   # 00:30 cancelled
+        self.walk(ts(2, 0, 44), ts(2, 0, 46))
+        self.run.assert_called_once_with('loginctl poweroff')          # 00:45 untouched
+
+    def test_state_of_removed_schedules_is_pruned(self):
+        occurrence = ts(2, 0, 30)
+        self.walk(occurrence - 5, occurrence + 5)
+        self.assertIn(self.KEY, self.stub.state['schedule_fired'])
+        self.edit_config('[schedule]\non|08:00|daily|Suspend\n')
+        self.tick(occurrence + 10)
+        self.assertNotIn(self.KEY, self.stub.state['schedule_fired'])
+
+    def test_state_from_the_single_schedule_version_is_discarded(self):
+        self.stub.state = {'schedule_fired': 1234.5, 'schedule_override': {'occ': 1, 'fire': 2}}
+        occurrence = ts(2, 0, 30)
+        self.walk(occurrence - 5, occurrence + 5)
+        self.run.assert_called_once()
+        self.assertIsInstance(self.stub.state['schedule_fired'], dict)
+
     def test_unknown_action_is_logged_and_runs_nothing(self):
-        self.conf('[schedule]\nenabled=true\ntime=00:30\naction=Nonsense\nwarn=0\n')
+        self.conf('[schedule]\nwarn=0\non|00:30|daily|Nonsense\n')
         occurrence = ts(2, 0, 30)
         with mock.patch.object(rt, '_log') as log:
             self.walk(occurrence - 5, occurrence + 5)
@@ -1379,29 +1473,37 @@ class TestScheduleRuntime(TmpConfigCase):
         self.assertIn('Nonsense', log.call_args[0][0])
 
     def test_action_label_match_ignores_case(self):
-        self.conf('[schedule]\nenabled=true\ntime=00:30\naction=power off\nwarn=0\n')
+        self.conf('[schedule]\nwarn=0\non|00:30|daily|power off\n')
         occurrence = ts(2, 0, 30)
         self.walk(occurrence - 5, occurrence + 5)
         self.run.assert_called_once_with('loginctl poweroff')
 
-    def test_summary_text(self):
+    def test_summary_shows_the_soonest_of_all_schedules(self):
+        self.conf('[schedule]\non|07:00|daily|Power off\non|00:30|daily|Suspend\noff|01:00|daily|Suspend\n')
         with mock.patch.object(rt.time_module, 'time', return_value=ts(2, 12)):
             self.assertEqual(self.stub._schedule_summary(rt.load_schedule_settings()), 'Next: Thu 00:30 Suspend')
-        self.stub.schedule_warning = {'occ': 1, 'left': 42, 'action': 'Suspend'}
+        self.stub.schedule_warning = {'key': 'k', 'occ': 1, 'left': 42, 'action': 'Suspend'}
         self.assertEqual(self.stub._schedule_summary(rt.load_schedule_settings()), 'Suspend in 42 s')
+
+    def test_summary_when_everything_is_off_or_empty(self):
+        self.conf('[schedule]\noff|00:30|daily|Suspend\n')
+        self.assertEqual(self.stub._schedule_summary(rt.load_schedule_settings()), 'Schedule off')
+        self.conf('[feeds]\n')
+        self.assertEqual(self.stub._schedule_summary(rt.load_schedule_settings()), 'Schedule off')
 
 
 class TestScheduleIconAndCss(unittest.TestCase):
     def test_warning_css_keeps_button_text_dark(self):
         self.assertIn('.schedule-warning button label { color: #000000', rt.POPUP_CSS)
 
-    def test_template_config_parses_and_is_disabled_by_default(self):
+    def test_template_config_parses_with_no_schedules_by_default(self):
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d, ignore_errors=True)
         with mock.patch.object(rt, 'CONFIG_DIR', d), mock.patch.object(rt, 'CONFIG_FILE', os.path.join(d, 'config.conf')):
             rt.ensure_config()
             s = rt.load_schedule_settings()
-            self.assertFalse(s['enabled'])
+            self.assertEqual(s['schedules'], [])
+            self.assertEqual((s['warn'], s['snooze'], s['grace']), (60, 30, 120))
             self.assertEqual([a[0] for a in rt.load_actions()], ['Suspend', 'Power off'])
 
 
