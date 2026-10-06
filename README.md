@@ -15,10 +15,6 @@ A minimal tray-based RSS/Atom reader for Linux, built with Python and GTK3 as a 
 - **Popup list** grouped by feed. Left-click a row to open it and mark it read, right-click a row to mark it read only, click a feed header to mark the whole feed read. The popup auto-opens on new items and closes on focus-out; if it is already open when something new arrives, the list is updated in place (scroll position and an open Launch list are kept).
 - **Feeds:** per-feed check intervals, custom display names, mute phrases. Items older than 24 h are silently marked seen the first time they are seen. A feed that fails to load is retried after 2 minutes rather than a full interval, and feeds are not polled while offline. At most 500 unread items are kept; the oldest beyond that are dropped (they stay marked as seen and never come back).
 
-### Package updates
-
-- **Void package updates:** a system-wide `xbps-install -Mn -u` dry run twice a day by default (`interval=<hours>` in `[updates]`). Click the "Updates available" header to install everything, one package at a time, with live status. A scan is skipped while an install is running.
-
 ### Live streams
 
 - **Twitch:** live channels are polled (every 15 minutes by default, `interval=` in `[twitch]`; optionally only during per-channel schedules, see below) through Twitch's unofficial GQL API (no app registration), in batches of 20 channels. Rows read `<user> - <category>` (the stream title is the tooltip), and the bullet turns into a play triangle on the channel that's playing. Click a row to play it with `streamlink` and `mpv` at the configured quality (default `best`); the popup closes, and a second click on another channel reuses the same maximized mpv window. If either binary isn't installed, or launching fails, it opens the channel in your browser instead.
@@ -30,11 +26,15 @@ A minimal tray-based RSS/Atom reader for Linux, built with Python and GTK3 as a 
 - **Weather** (Open-Meteo): today's temperature, high/low, wind and rain, with a 5-day forecast behind the `›` button. Refreshed every 30 minutes by default (`interval=<minutes>` in `[weather]`, minimum 5).
 - **Severe-weather alerts** (optional, `alerts=true` in `[weather]`): polls the MeteoAlarm feed for your country on the same cycle as the weather, filtered to the region matching the configured coordinates (country and region are reverse-geocoded via OpenStreetMap once and then stored in `config.conf`; delete the `country=`/`region=` lines to resolve them again; Europe only, since MeteoAlarm only covers European countries; if your coordinates resolve to a country it doesn't cover, the app writes `alerts=false` into `config.conf` itself). An active alert is color-coded by severity (yellow/orange/red for moderate/severe/extreme) and pulses the matching weather value and the tray badge, faster for more severe alerts.
 
+### Package updates
+
+- **Void package updates:** a system-wide `xbps-install -Mn -u` dry run twice a day by default (`interval=<hours>` in `[updates]`). Click the "Updates available" header to install everything, one package at a time, with live status. A scan is skipped while an install is running.
+
 ### Tools
 
 - **Timer:** a slide behind the "Timer" footer button with two modes, switched at its top left:
   - **Countdown:** a slider (0 to 2 h in 1-minute steps by default; the maximum and the step are configurable with `max=<minutes>` and `step=<seconds>` in `[timer]`, see below). It counts down against a fixed deadline, keeps counting with the popup closed, and plays the notification sound twice at zero.
-  - **Schedule:** a recurring action instead of a sound, e.g. suspend the machine every night (see "Scheduled actions" below). Set the time, the days and the action right in the slide; it is stored in `config.conf`.
+  - **Schedule:** recurring actions instead of a sound, e.g. suspend the machine every night and lock the screen on weekday mornings (see "Scheduled actions" below). Add as many schedules as you like; each has its own time, days and action, set right in the slide and stored in `config.conf`.
 - **Launcher:** a "Launch" footer button opens a list of your own commands (the `[launcher]` section, `Label|command` per line); clicking one runs it detached through the shell and closes the popup. The list is read when you open it, so edits apply immediately.
 
 ### Connectivity
@@ -132,11 +132,13 @@ Suspend|loginctl suspend
 Power off|loginctl poweroff
 
 [schedule]
-# Written by the popup's Timer > Schedule; you can edit it by hand too.
-enabled=false
-time=00:30
-days=daily
-action=Suspend
+# Managed by the popup's Timer > Schedule; you can edit it by hand too.
+# One schedule per line: on|off, HH:MM, days, action label from [actions]
+# (days: daily, weekdays, weekends or e.g. mon,wed,fri).
+on|00:30|daily|Suspend
+off|07:00|weekdays|Lock screen
+# Shared by all schedules: seconds of warning (0 = none), minutes the Snooze
+# button postpones, and the seconds after which a missed run is skipped.
 warn=60
 snooze=30
 grace=120
@@ -158,13 +160,16 @@ step=60
 
 Timer > Schedule runs one of your `[actions]` at a time of day, on the days you pick, with no cron job, `snooze` loop or other service involved (this replaces a script such as `snooze -H0 -M30 loginctl poweroff` in a `while` loop).
 
-- **Controls:** the "On" checkbox, the time (hours and minutes), the action (from `[actions]`), and a Mo..Su button per day. Changes are saved to `[schedule]` immediately. At least one day stays selected.
-- **Warning:** `warn=` seconds before the action (60 by default; `warn=0` for none) the notification sound plays, the popup opens, the tray icon flashes a red "!" and a red bar reads "Suspend in 42 s" with two buttons:
-  - **Cancel** drops this run (the next scheduled run still happens).
-  - **Snooze N min** postpones the run by `snooze=` minutes (30 by default). Pressing it again postpones further. The same button in the slide postpones the next run before the warning starts.
+- **Several schedules:** the selector at the top of the slide lists them (`00:30 daily · Suspend`, with "(off)" on disabled ones); `+` adds one (off by default, so it can't surprise you) and `−` removes the selected one. A schedule is one line in `[schedule]`: `on|00:30|daily|Suspend`.
+- **Controls** (for the selected schedule): the "On" checkbox, the time (hours and minutes), the action (from `[actions]`), and a Mo..Su button per day (at least one stays selected). Changes are saved to `config.conf` immediately, and edits made to the file by hand are picked up within a second.
+- **Warning:** `warn=` seconds before a run (60 by default; `warn=0` for none) the notification sound plays, the popup opens, the tray icon flashes a red "!" and a red bar reads "Suspend in 42 s" with two buttons:
+  - **Cancel** drops that run (the schedule's next run still happens).
+  - **Snooze N min** postpones that run by `snooze=` minutes (30 by default). Pressing it again postpones further. The Snooze button in the slide does the same for the selected schedule before the warning starts.
+  - If two schedules warn at once, the one that is due first is shown; each is handled separately.
 - **Late runs are skipped:** the app only acts within `grace=` seconds (120 by default) of the scheduled time. If the machine was asleep or off at that moment, or you enabled or edited the schedule after the time had passed, that run is dropped instead of firing late. A run is never repeated after a wake-up.
-- **Time:** the system's local clock, DST included. A run that has been handled is recorded in `state.json`, so restarting the app doesn't repeat it.
-- **Actions:** any command works (`Lock screen|loginctl lock-session`, `Hibernate|systemctl hibernate`, ...); the schedule refers to it by label. A label that no longer exists is shown flagged in the slide and nothing runs.
+- **Time:** the system's local clock, DST included. Every handled run is recorded in `state.json`, so restarting the app doesn't repeat it. Editing a schedule's time, days or action starts it afresh.
+- **Actions:** any command works (`Lock screen|loginctl lock-session`, `Hibernate|systemctl hibernate`, ...); a schedule refers to it by label. A label that no longer exists is shown flagged in the slide and nothing runs.
+- **From the first single-schedule version:** a `[schedule]` section with `enabled=`, `time=`, `days=` and `action=` lines is still read as one schedule, and is rewritten in the new format the first time you change anything in the slide.
 
 ### Channel schedules
 
