@@ -102,6 +102,10 @@ sponsored
 # interval=<minutes> sets how often to check for live channels (default 15,
 # minimum 1).
 interval=15
+# quality=<streamlink quality> for channels without their own; a comma-
+# separated list is a fallback chain (first one that exists wins), e.g. 720p60
+# if the stream has it, else 720p, else the best there is. Default: best.
+quality=720p60,720p,best
 somechannel
 somechannel2|720p60
 weeklychannel||wed 18:00-23:00
@@ -114,6 +118,7 @@ dailychannel|720p60|tue-sun 13:00-; sat 10:00-12:00
 # interval=<minutes> between live checks (default 15, minimum 5 -- each
 # channel costs a full streamlink run).
 interval=15
+quality=720p,480p,best
 @somehandle
 channel/UCxxxxxxxxxxxxxxxxxxxxxx|720p60
 
