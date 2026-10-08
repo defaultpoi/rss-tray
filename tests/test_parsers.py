@@ -1793,6 +1793,41 @@ class TestNetworkReset(TmpConfigCase):
         self.assertIn('.offline-banner button label { color: #000000', rt.POPUP_CSS)
 
 
+class TestDefaultStreamQuality(TmpConfigCase):
+    def test_best_when_nothing_is_configured(self):
+        self.assertEqual(rt.load_twitch_default_quality(), 'best')
+        self.assertEqual(rt.load_youtube_default_quality(), 'best')
+
+    def test_section_default_quality_with_fallbacks_and_comment(self):
+        self.conf('[twitch]\nquality=720p60,720p,best # laptop screen\nchan\n[youtube]\nquality = 720p,480p,best\n@h\n')
+        self.assertEqual(rt.load_twitch_default_quality(), '720p60,720p,best')
+        self.assertEqual(rt.load_youtube_default_quality(), '720p,480p,best')
+
+    def test_empty_value_means_best(self):
+        self.conf('[twitch]\nquality=\n')
+        self.assertEqual(rt.load_twitch_default_quality(), 'best')
+
+    def test_the_setting_line_is_not_a_channel_and_does_not_leak_into_qualities(self):
+        self.conf('[twitch]\nquality=720p\nchan\nother|1080p60\n')
+        self.assertEqual(rt.load_twitch_channels(), ['chan', 'other'])
+        self.assertEqual(rt.load_twitch_qualities(), {'other': '1080p60'})
+
+    def test_rows_use_their_own_quality_else_the_section_default(self):
+        self.conf('[twitch]\nquality=720p,best\nplain\nown|480p\n[youtube]\nquality=360p,best\n@a\n@b|1080p\n')
+
+        class Stub:
+            build_twitch_row = rt.RssTray.build_twitch_row
+            build_youtube_row = rt.RssTray.build_youtube_row
+
+            def _build_live_row(self, entry, site, color):
+                return mock.Mock()
+        stub = Stub()
+        self.assertEqual(stub.build_twitch_row({'channel': 'plain'}).twitch_quality, '720p,best')
+        self.assertEqual(stub.build_twitch_row({'channel': 'own'}).twitch_quality, '480p')
+        self.assertEqual(stub.build_youtube_row({'channel': '@a'}).youtube_quality, '360p,best')
+        self.assertEqual(stub.build_youtube_row({'channel': '@b'}).youtube_quality, '1080p')
+
+
 class TestMonoGlyph(unittest.TestCase):
     def test_markup(self):
         m = rt.mono_glyph_markup('\u2614')
