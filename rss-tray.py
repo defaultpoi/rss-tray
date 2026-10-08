@@ -126,6 +126,8 @@ def ensure_config():
             "# Uses Twitch's own internal (unofficial) API — no account/app needed.\n"
             "# Clicking a live channel plays it (streamlink + mpv, one shared maximized window).\n"
             "# interval=<minutes> sets how often to check (default 15, minimum 1).\n"
+            "# quality=<streamlink quality> for channels without their own, e.g.\n"
+            "# quality=720p60,720p,best (fallbacks, first available wins; default best).\n"
             "# A schedule limits checking to when the channel is expected to stream\n"
             "# (system local time): [days] HH:MM[-HH:MM], several separated by ;\n"
             "# Days: mon..sun, ranges (tue-sun), lists (mon,wed), daily, weekdays,\n"
@@ -136,7 +138,7 @@ def ensure_config():
             "\n"
             "[youtube]\n"
             "# Same format as [twitch]; identifiers are @handle or channel/UC... and\n"
-            "# case-sensitive. interval=<minutes>: default 15, minimum 5.\n"
+            "# case-sensitive. interval=<minutes>: default 15, minimum 5; quality= as above.\n"
             "\n"
             "[updates]\n"
             "# interval=<hours> between package update scans (default 12, minimum 1).\n"
@@ -276,6 +278,28 @@ def _entry_schedules(entries):
 def load_twitch_channels():
     """Lowercase Twitch login names to watch, in config order."""
     return [e[0] for e in _load_live_entries('twitch', True)]
+
+
+DEFAULT_STREAM_QUALITY = 'best'
+
+
+def _load_live_default_quality(section):
+    """The section's 'quality=<streamlink quality>' line: what channels
+    without their own quality use (a comma-separated fallback list such as
+    720p60,720p,best works); 'best' if there is none."""
+    for line in _read_config_sections()[section]:
+        key, sep, val = line.partition('=')
+        if sep and key.strip().lower() == 'quality' and val.split('#', 1)[0].strip():
+            return val.split('#', 1)[0].strip()
+    return DEFAULT_STREAM_QUALITY
+
+
+def load_twitch_default_quality():
+    return _load_live_default_quality('twitch')
+
+
+def load_youtube_default_quality():
+    return _load_live_default_quality('youtube')
 
 
 def load_twitch_qualities():
@@ -3615,13 +3639,13 @@ class RssTray:
     def build_twitch_row(self, entry):
         row = self._build_live_row(entry, 'Twitch', '#9146FF')
         row.twitch_channel = entry['channel']
-        row.twitch_quality = load_twitch_qualities().get(entry['channel'], 'best')
+        row.twitch_quality = load_twitch_qualities().get(entry['channel']) or load_twitch_default_quality()
         return row
 
     def build_youtube_row(self, entry):
         row = self._build_live_row(entry, 'YouTube', '#FF0000')
         row.youtube_channel = entry['channel']
-        row.youtube_quality = load_youtube_qualities().get(entry['channel'], 'best')
+        row.youtube_quality = load_youtube_qualities().get(entry['channel']) or load_youtube_default_quality()
         return row
 
     def build_info_row(self, entry):
